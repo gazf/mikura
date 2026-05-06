@@ -1,0 +1,41 @@
+name: server-quality
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "server/**"
+      - ".github/workflows/server-quality.yml"
+  pull_request:
+    paths:
+      - "server/**"
+      - ".github/workflows/server-quality.yml"
+
+defaults:
+  run:
+    working-directory: server
+
+jobs:
+  fmt:
+    name: deno fmt
+    runs-on: ubuntu-latest
+    container: denoland/deno:2.7.1
+    steps:
+      - uses: actions/checkout@v4
+      - run: deno fmt --check
+
+  lint:
+    name: deno lint
+    runs-on: ubuntu-latest
+    container: denoland/deno:2.7.1
+    steps:
+      - uses: actions/checkout@v4
+      - run: deno lint
+
+  test:
+    name: deno test
+    runs-on: ubuntu-latest
+    container: denoland/deno:2.7.1
+    steps:
+      - uses: actions/checkout@v4
+      - run: deno task test

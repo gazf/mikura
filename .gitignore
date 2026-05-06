@@ -1,0 +1,30 @@
+# Deno KV storage
+*.sqlite3
+
+# Server
+server/data/
+server/staging/
+server/mikura-server.log
+
+# Client build output
+client/src/*/bin/
+client/src/*/obj/
+client/tests/*/bin/
+client/tests/*/obj/
+client/spike/*/bin/
+client/spike/*/obj/
+
+# IDE
+.vs/
+.vscode/
+.claude/
+*.user
+*.suo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local

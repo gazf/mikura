@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows10.0.17763.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <RootNamespace>WinFsp.Interop</RootNamespace>
+    <AssemblyName>WinFsp.Interop</AssemblyName>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <WinFspBin Condition="'$(WinFspBin)' == '' AND '$(OS)' == 'Windows_NT'">$(MSBuildProgramFiles32)\WinFsp\bin\</WinFspBin>
+    <WinFspBin Condition="'$(WinFspBin)' == '' AND '$(OS)' != 'Windows_NT'">/mnt/c/Program Files (x86)/WinFsp/bin/</WinFspBin>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="winfsp-msil">
+      <HintPath>$(WinFspBin)winfsp-msil.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Mikura.Core\Mikura.Core.csproj" />
+  </ItemGroup>
+
+</Project>
