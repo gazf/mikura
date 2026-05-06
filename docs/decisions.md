@@ -925,11 +925,6 @@ Mikura.App                            Mikura.App + WinFsp MSI redistributable
 6. README / `Mikura.Client.sln` / Directory.Build.props 更新
 7. WinFsp MSI を Mikura.App のインストーラに同梱(配布工程)
 8. main へマージ
-9. ブランディング再考(プロジェクト名 "mikura = Cloud API File System" は CfApi 由来。要再検討)
-
-**プロジェクト名の扱い**:
-
-`mikura` は "Cloud API File System" の略で CfApi 由来。WinFsp 移行で意味が成立しなくなるため、main マージ時または直後にリブランディングを検討。候補は別途オープンチケットで議論(本 ADR では決めない)。
 
 **関連 ADR**:
 
