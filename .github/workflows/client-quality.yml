@@ -24,10 +24,14 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
-      # Mikura.Client.sln は net10.0-windows TFM を使うが、Directory.Build.props で
-      # EnableWindowsTargeting=true を立てているため Linux でもビルド可能。
-      - run: dotnet restore Mikura.Client.sln
-      - run: dotnet build Mikura.Client.sln --no-restore --configuration Debug
+      # WinFsp.Interop / Mikura.App は WinFsp ネイティブ DLL に依存しており Linux
+      # runner ではビルド不可。cross-platform な Core / Transport とそのテスト
+      # プロジェクトのみを CI で検証する (net10.0-windows TFM でも
+      # EnableWindowsTargeting=true により Linux でビルド可能)。
+      - run: dotnet build src/Mikura.Core/Mikura.Core.csproj --configuration Debug
+      - run: dotnet build src/Mikura.Transport/Mikura.Transport.csproj --configuration Debug
+      - run: dotnet build tests/Mikura.Core.Tests/Mikura.Core.Tests.csproj --configuration Debug
+      - run: dotnet build tests/Mikura.Transport.Tests/Mikura.Transport.Tests.csproj --configuration Debug
 
   test:
     name: dotnet test
@@ -37,4 +41,5 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
-      - run: dotnet test Mikura.Client.sln --configuration Debug
+      - run: dotnet test tests/Mikura.Core.Tests/Mikura.Core.Tests.csproj --configuration Debug
+      - run: dotnet test tests/Mikura.Transport.Tests/Mikura.Transport.Tests.csproj --configuration Debug
