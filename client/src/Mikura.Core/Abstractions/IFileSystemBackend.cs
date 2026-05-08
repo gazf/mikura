@@ -3,7 +3,7 @@ using Mikura.Core.Models;
 namespace Mikura.Core.Abstractions;
 
 /// <summary>
-/// Domain-shaped projection backend that <c>WinFsp.Interop.MikuraFileSystem</c>
+/// Domain-shaped projection backend that <c>WinFsp.Interop.BackendFileSystem</c>
 /// delegates to. Replaces the CfApi-shaped <c>ISyncCallbacks</c> (ADR-021).
 ///
 /// <para>All callbacks are async even though WinFsp itself dispatches synchronously

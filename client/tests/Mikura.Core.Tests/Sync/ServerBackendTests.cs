@@ -9,7 +9,7 @@ using Xunit;
 namespace Mikura.Core.Tests.Sync;
 
 /// <summary>
-/// MikuraServerBackend の責務 (ADR-021/022/023):
+/// ServerBackend の責務 (ADR-021/022/023):
 ///   - WinFsp のメタデータ問合せに対し、起動時に取得した /tree のキャッシュで応答する。
 ///   - ADR-016/022: write-intent open でだけサーバロックを取得し、read open は素通し。
 ///     プロセス内の同一パスへの複数 open は LockSlot で refcount し、POST/DELETE は
@@ -24,11 +24,11 @@ namespace Mikura.Core.Tests.Sync;
 ///   - Cleanup(Modified) または FreshlyCreated でアップロード、tree 更新、ロック解放、
 ///     buffer drop を行う (ADR-020)。
 /// </summary>
-public class MikuraServerBackendTests
+public class ServerBackendTests
 {
-    private static async Task<MikuraServerBackend> NewInitializedBackendAsync(FakeMikuraServer server)
+    private static async Task<ServerBackend> NewInitializedBackendAsync(FakeServerApi server)
     {
-        var backend = new MikuraServerBackend(server);
+        var backend = new ServerBackend(server);
         await backend.InitializeAsync();
         return backend;
     }
@@ -36,7 +36,7 @@ public class MikuraServerBackendTests
     [Fact]
     public async Task Initialize_PullsTreeFromServer()
     {
-        var server = new FakeMikuraServer();
+        var server = new FakeServerApi();
         server.SeedFile("/a.txt", new byte[] { 1, 2, 3 });
         server.SeedDirectory("/sub");
 
@@ -56,7 +56,7 @@ public class MikuraServerBackendTests
     [Fact]
     public async Task ReadOpen_DoesNotAcquireLock()
     {
-        var server = new FakeMikuraServer();
+        var server = new FakeServerApi();
         server.SeedFile("/a.txt", new byte[] { 1, 2, 3 });
         var backend = await NewInitializedBackendAsync(server);
 
@@ -69,7 +69,7 @@ public class MikuraServerBackendTests
     [Fact]
     public async Task WriteOpen_LockDenied_ThrowsUnauthorized()
     {
-        var server = new FakeMikuraServer { DenyAcquireLock = true };
+        var server = new FakeServerApi { DenyAcquireLock = true };
         server.SeedFile("/a.txt", new byte[] { 1, 2, 3 });
         var backend = await NewInitializedBackendAsync(server);
 
@@ -87,7 +87,7 @@ public class MikuraServerBackendTests
     {
         // Defense in depth: kernel が read-only ハンドルからの WriteFile を本来弾くが、
         // バックエンド側でも HasLock=false かつ FreshlyCreated=false なら拒否する。
-        var server = new FakeMikuraServer();
+        var server = new FakeServerApi();
         server.SeedFile("/a.txt", new byte[] { 1, 2, 3 });
         var backend = await NewInitializedBackendAsync(server);
 
@@ -103,7 +103,7 @@ public class MikuraServerBackendTests
     [Fact]
     public async Task ConcurrentWriteOpens_ShareLock_AcquireOnceReleaseOnLast()
     {
-        var server = new FakeMikuraServer();
+        var server = new FakeServerApi();
         server.SeedFile("/a.txt", new byte[] { 1, 2, 3 });
         var backend = await NewInitializedBackendAsync(server);
 
@@ -134,7 +134,7 @@ public class MikuraServerBackendTests
         // 取れない 2 byte を staging することになる。
         // ReadExactlyAsync 化により、こういうケースは EndOfStreamException として
         // 弾かれて hydrate 自体が失敗する責務 (上位での再試行 or エラー伝播)。
-        var server = new FakeMikuraServer();
+        var server = new FakeServerApi();
         server.SeedFile("/short.bin", new byte[] { 1, 2, 3, 4, 5 }); // tree size = 5
         server.TruncatedDownloadSizes["/short.bin"] = 2;             // 実 stream は 2 byte
         var backend = await NewInitializedBackendAsync(server);
@@ -153,7 +153,7 @@ public class MikuraServerBackendTests
         // Z: ドライブの「ディスクの空き容量」表示は server statfs の値を映す。
         // InitializeAsync で初回 fetch、以後 cache が VolumeStats getter で
         // 即返される (WinFsp GetVolumeInfo callback は sync なため block 不可)。
-        var server = new FakeMikuraServer
+        var server = new FakeServerApi
         {
             VolumeStats = new VolumeStats(TotalSize: 500_000_000_000L, FreeSize: 100_000_000_000L),
         };
@@ -173,7 +173,7 @@ public class MikuraServerBackendTests
         // ハンドルがユーザの渡した非正規 path を握ったまま Read するとサーバ側
         // の GET /content/<path> が 404 になり、再生 / シークが落ちる。
         // OpenAsync が tree の正規 path (entry.Path) を ServerHandle に詰めるべき。
-        var server = new FakeMikuraServer();
+        var server = new FakeServerApi();
         var content = new byte[] { 1, 2, 3, 4 };
         server.SeedFile("/Movie.mp4", content);
         var backend = await NewInitializedBackendAsync(server);
@@ -200,7 +200,7 @@ public class MikuraServerBackendTests
         // 抽出のために 100MB ファイルを丸ごと load しないことが目的)。
         // 以前の "hydrate once" 責務は廃止。
         var content = new byte[] { 10, 20, 30, 40 };
-        var server = new FakeMikuraServer();
+        var server = new FakeServerApi();
         server.SeedFile("/a.txt", content);
         var backend = await NewInitializedBackendAsync(server);
 
@@ -228,7 +228,7 @@ public class MikuraServerBackendTests
         // ゼロ化は server side の責務に移った。テストは結果側 (server payload)
         // を見ているのでどちらの実装でも同じ責務を観測できる。
 
-        var server = new FakeMikuraServer();
+        var server = new FakeServerApi();
         var backend = await NewInitializedBackendAsync(server);
 
         using var handle = await backend.CreateAsync("/sparse.bin", isDirectory: false);
@@ -257,7 +257,7 @@ public class MikuraServerBackendTests
         // 後続の Write が来る前に Cleanup された場合に "8MB の 0 埋めゴミ" が
         // upload されてしまう。hint は容量だけ確保し、論理長 (= upload sizes)
         // を変えないことが責務。
-        var server = new FakeMikuraServer();
+        var server = new FakeServerApi();
         var backend = await NewInitializedBackendAsync(server);
 
         using var handle = await backend.CreateAsync("/big.bin", isDirectory: false);
@@ -271,7 +271,7 @@ public class MikuraServerBackendTests
     [Fact]
     public async Task SetSize_Extending_ZeroFillsNewRange()
     {
-        var server = new FakeMikuraServer();
+        var server = new FakeServerApi();
         server.SeedFile("/a.txt", new byte[] { 1, 2, 3 });
         var backend = await NewInitializedBackendAsync(server);
 
@@ -287,7 +287,7 @@ public class MikuraServerBackendTests
     [Fact]
     public async Task Cleanup_Modified_PersistsNewContentAndUpdatesMetadata()
     {
-        var server = new FakeMikuraServer();
+        var server = new FakeServerApi();
         server.SeedFile("/a.txt", new byte[] { 1, 2, 3 });
         var backend = await NewInitializedBackendAsync(server);
 
@@ -309,7 +309,7 @@ public class MikuraServerBackendTests
         // 編集なしで write open → close したケース (Excel のプレビュー保存等で
         // ハンドルだけ取って結局書かないことがある) でサーバ上のファイルが
         // 変化しないことが責務。
-        var server = new FakeMikuraServer();
+        var server = new FakeServerApi();
         var original = new byte[] { 1, 2, 3 };
         server.SeedFile("/a.txt", original);
         var backend = await NewInitializedBackendAsync(server);
@@ -326,7 +326,7 @@ public class MikuraServerBackendTests
     {
         // touch 相当: Create 直後に編集なしで close されても、サーバにファイルが
         // 出現することがエクスプローラ「新規 > テキストドキュメント」の責務。
-        var server = new FakeMikuraServer();
+        var server = new FakeServerApi();
         var backend = await NewInitializedBackendAsync(server);
 
         using var handle = await backend.CreateAsync("/touched.txt", isDirectory: false);
@@ -340,7 +340,7 @@ public class MikuraServerBackendTests
     [Fact]
     public async Task Cleanup_Delete_RemovesFromServerAndTree()
     {
-        var server = new FakeMikuraServer();
+        var server = new FakeServerApi();
         server.SeedFile("/doomed.txt", new byte[] { 1 });
         var backend = await NewInitializedBackendAsync(server);
 
@@ -355,7 +355,7 @@ public class MikuraServerBackendTests
     [Fact]
     public async Task Rename_MovesFileOnServerAndInTree()
     {
-        var server = new FakeMikuraServer();
+        var server = new FakeServerApi();
         server.SeedFile("/a.txt", new byte[] { 1 });
         var backend = await NewInitializedBackendAsync(server);
 
@@ -375,7 +375,7 @@ public class MikuraServerBackendTests
         // rename は編集完了のセマンティクスなので、両方の lock をその場で
         // 強制 release しないと heartbeat で永久に refresh され続けて孤児化する
         // (実機ログ: Excel デフォルト保存後に複数の Device ID 由来 lock が残留)。
-        var server = new FakeMikuraServer();
+        var server = new FakeServerApi();
         server.SeedFile("/temp.bin", new byte[] { 1 });
         server.SeedFile("/target.bin", new byte[] { 2 });
         var backend = await NewInitializedBackendAsync(server);
@@ -398,7 +398,7 @@ public class MikuraServerBackendTests
         // server PATCH /files は衝突時 409 を返す仕様 (ADR-024)。replaceIfExists の
         // セマンティクスを満たすためにはクライアントが先に dst を消してから rename
         // する必要がある。観測可能な責務は「rename 後 dst の中身が src 由来になる」。
-        var server = new FakeMikuraServer();
+        var server = new FakeServerApi();
         server.SeedFile("/a.txt", new byte[] { 0xAA });
         server.SeedFile("/b.txt", new byte[] { 0xBB });
         var backend = await NewInitializedBackendAsync(server);
@@ -412,7 +412,7 @@ public class MikuraServerBackendTests
     [Fact]
     public async Task ApplyExternalEvent_CreatedAndDeleted_UpdatesTree()
     {
-        var server = new FakeMikuraServer();
+        var server = new FakeServerApi();
         var backend = await NewInitializedBackendAsync(server);
 
         var changed = backend.ApplyExternalEvent("created", "/new.txt", size: 4, lastModified: DateTime.UtcNow, isDirectory: false);
@@ -438,7 +438,7 @@ public class MikuraServerBackendTests
         // 新規作成も write 操作なので lock を取る責務を CreateAsync に課す。
         // 観測可能なふるまい: 新規作成 + Write + Cleanup が完走し、
         // server.Files に内容が永続化される (= session start が拒否されていない)。
-        var server = new FakeMikuraServer();
+        var server = new FakeServerApi();
         var backend = await NewInitializedBackendAsync(server);
 
         using var handle = await backend.CreateAsync("/new.bin", isDirectory: false);
@@ -457,7 +457,7 @@ public class MikuraServerBackendTests
     {
         // ADR-025 の核: 新規作成 (FreshlyCreated) は session 開始時に
         // baseFromExisting=false で開かれ、kernel write は PATCH で素通しする。
-        var server = new FakeMikuraServer();
+        var server = new FakeServerApi();
         var backend = await NewInitializedBackendAsync(server);
 
         using var handle = await backend.CreateAsync("/fresh.bin", isDirectory: false);
@@ -479,7 +479,7 @@ public class MikuraServerBackendTests
     {
         // 既存ファイル open (write) → 1 byte だけ書き換えても、それ以外は
         // 元の内容が残る (server temp が baseFromExisting で複製されているため)。
-        var server = new FakeMikuraServer();
+        var server = new FakeServerApi();
         server.SeedFile("/doc.bin", new byte[] { 0x10, 0x20, 0x30, 0x40, 0x50 });
         var backend = await NewInitializedBackendAsync(server);
 
@@ -500,7 +500,7 @@ public class MikuraServerBackendTests
         // 順序を入れ替えて offset をジャンプさせる: pass-through 設計では
         // 各 PATCH の offset がそのまま server temp の seek+write になる。
         // FreshlyCreated なので gap は server (POSIX file extend) でゼロ埋め。
-        var server = new FakeMikuraServer();
+        var server = new FakeServerApi();
         var backend = await NewInitializedBackendAsync(server);
 
         using var handle = await backend.CreateAsync("/scattered.bin", isDirectory: false);
@@ -524,7 +524,7 @@ public class MikuraServerBackendTests
     {
         // 編集途中で Delete された場合、開いていた session を abort してから
         // ファイル削除する (孤児 session を残さない責務)。
-        var server = new FakeMikuraServer();
+        var server = new FakeServerApi();
         server.SeedFile("/doomed.bin", new byte[] { 1, 2, 3 });
         var backend = await NewInitializedBackendAsync(server);
 
@@ -544,7 +544,7 @@ public class MikuraServerBackendTests
     {
         // touch 相当: Create だけして Cleanup → Write が 1 度も来ていなくても、
         // session を開いて size=0 で finalize し、サーバ上にファイルを実体化する。
-        var server = new FakeMikuraServer();
+        var server = new FakeServerApi();
         var backend = await NewInitializedBackendAsync(server);
 
         using var handle = await backend.CreateAsync("/touched.bin", isDirectory: false);
@@ -565,7 +565,7 @@ public class MikuraServerBackendTests
         // Excel/Notepad save の典型: 既存ファイルを truncate(0) してから新内容を書く。
         // session は baseFromExisting=true で開かれるが、SetSize(0) + Write で
         // 旧内容は finalize size と PATCH の上書きで上書きされる。
-        var server = new FakeMikuraServer();
+        var server = new FakeServerApi();
         server.SeedFile("/save.txt", new byte[] { 0xAA, 0xAA, 0xAA, 0xAA, 0xAA });
         var backend = await NewInitializedBackendAsync(server);
 
@@ -581,7 +581,7 @@ public class MikuraServerBackendTests
     [Fact]
     public async Task Enumerate_ReturnsImmediateChildrenOnly()
     {
-        var server = new FakeMikuraServer();
+        var server = new FakeServerApi();
         server.SeedFile("/root.txt", new byte[] { 1 });
         server.SeedDirectory("/dir");
         server.SeedFile("/dir/inside.txt", new byte[] { 2 });

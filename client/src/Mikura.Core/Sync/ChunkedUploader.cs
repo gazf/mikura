@@ -31,7 +31,7 @@ internal sealed class ChunkedUploader : IAsyncDisposable
     private static readonly ArrayPool<byte> _chunkPool =
         ArrayPool<byte>.Create(maxArrayLength: 4 * 1024 * 1024, maxArraysPerBucket: 4);
 
-    private readonly IMikuraServer _server;
+    private readonly IServerApi _server;
     private readonly string _uploadId;
     private readonly Channel<UploadChunk> _channel;
     private readonly Task[] _workers;
@@ -40,7 +40,7 @@ internal sealed class ChunkedUploader : IAsyncDisposable
     private readonly object _errorGate = new();
     private Exception? _firstError;
 
-    public ChunkedUploader(IMikuraServer server, string uploadId)
+    public ChunkedUploader(IServerApi server, string uploadId)
     {
         _server = server;
         _uploadId = uploadId;

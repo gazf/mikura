@@ -13,18 +13,18 @@ using Xunit;
 namespace Mikura.Transport.Tests;
 
 /// <summary>
-/// HttpMikuraServer の責務:
+/// HttpServerApi の責務:
 ///   - REST 各エンドポイントへ正しい URL / メソッドで問い合わせる。
 ///   - GET /content/* レスポンスの X-File-Attributes ヘッダを HydratedContent に
 ///     反映する (ADR-019)。
 ///   - POST /locks/* が 409 を返したら null を返す (呼び出し側で「他ユーザー保持中」
 ///     と区別できるようにする)。
-///   - 他のエラー (4xx/5xx) は MikuraApiException としてラップして throw する。
+///   - 他のエラー (4xx/5xx) は ApiException としてラップして throw する。
 ///
 /// HttpClient 自体は HttpMessageHandler で差し替えてテストする
 /// (実 HTTP listener を立てない、純単体テスト)。
 /// </summary>
-public class HttpMikuraServerTests
+public class HttpServerApiTests
 {
     /// <summary>
     /// SendAsync を関数で差し替えできる HttpMessageHandler。
@@ -48,12 +48,12 @@ public class HttpMikuraServerTests
         }
     }
 
-    private static (HttpMikuraServer server, FakeHandler handler) NewServer(
+    private static (HttpServerApi server, FakeHandler handler) NewServer(
         Func<HttpRequestMessage, HttpResponseMessage> responder)
     {
         var handler = new FakeHandler(responder);
         var http = new HttpClient(handler);
-        var server = new HttpMikuraServer(http, "http://localhost:8700");
+        var server = new HttpServerApi(http, "http://localhost:8700");
         return (server, handler);
     }
 
@@ -106,10 +106,10 @@ public class HttpMikuraServerTests
     }
 
     [Fact]
-    public async Task DownloadFileAsync_ServerError_ThrowsMikuraApiException()
+    public async Task DownloadFileAsync_ServerError_ThrowsApiException()
     {
         var (server, _) = NewServer(_ => Json(HttpStatusCode.InternalServerError, "{\"message\":\"boom\"}"));
-        var ex = await Assert.ThrowsAsync<MikuraApiException>(() => server.DownloadFileAsync("/x.txt"));
+        var ex = await Assert.ThrowsAsync<ApiException>(() => server.DownloadFileAsync("/x.txt"));
         Assert.Equal(500, ex.StatusCode);
     }
 
@@ -143,7 +143,7 @@ public class HttpMikuraServerTests
     public async Task AcquireLockAsync_403_Throws()
     {
         var (server, _) = NewServer(_ => Json(HttpStatusCode.Forbidden, "{\"message\":\"no write perm\"}"));
-        var ex = await Assert.ThrowsAsync<MikuraApiException>(() => server.AcquireLockAsync("/foo.txt"));
+        var ex = await Assert.ThrowsAsync<ApiException>(() => server.AcquireLockAsync("/foo.txt"));
         Assert.Equal(403, ex.StatusCode);
     }
 
@@ -165,7 +165,7 @@ public class HttpMikuraServerTests
     public async Task ReleaseLockAsync_403_Throws()
     {
         var (server, _) = NewServer(_ => Json(HttpStatusCode.Forbidden, "{\"message\":\"not holder\"}"));
-        await Assert.ThrowsAsync<MikuraApiException>(() => server.ReleaseLockAsync("/foo.txt"));
+        await Assert.ThrowsAsync<ApiException>(() => server.ReleaseLockAsync("/foo.txt"));
     }
 
     // ---------- DeleteFileAsync ----------
@@ -182,7 +182,7 @@ public class HttpMikuraServerTests
     public async Task DeleteFileAsync_500_Throws()
     {
         var (server, _) = NewServer(_ => Json(HttpStatusCode.InternalServerError, "{}"));
-        await Assert.ThrowsAsync<MikuraApiException>(() => server.DeleteFileAsync("/x.txt"));
+        await Assert.ThrowsAsync<ApiException>(() => server.DeleteFileAsync("/x.txt"));
     }
 
     // ---------- NormalizePath (URL composition) ----------
@@ -217,7 +217,7 @@ public class HttpMikuraServerTests
             Content = new StringContent("plain text error"),
         });
 
-        var ex = await Assert.ThrowsAsync<MikuraApiException>(() => server.AcquireLockAsync("/foo.txt"));
+        var ex = await Assert.ThrowsAsync<ApiException>(() => server.AcquireLockAsync("/foo.txt"));
         Assert.Equal(400, ex.StatusCode);
         Assert.Contains("plain text", ex.Message);
     }
@@ -226,7 +226,7 @@ public class HttpMikuraServerTests
     public async Task EnsureSuccess_JsonError_ExtractsMessageField()
     {
         var (server, _) = NewServer(_ => Json(HttpStatusCode.Forbidden, "{\"message\":\"no write\"}"));
-        var ex = await Assert.ThrowsAsync<MikuraApiException>(() => server.AcquireLockAsync("/foo.txt"));
+        var ex = await Assert.ThrowsAsync<ApiException>(() => server.AcquireLockAsync("/foo.txt"));
         Assert.Equal("no write", ex.Message);
     }
 }

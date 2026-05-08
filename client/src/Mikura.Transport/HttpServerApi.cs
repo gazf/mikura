@@ -5,7 +5,7 @@ using Mikura.Core.Models;
 
 namespace Mikura.Transport;
 
-public class MikuraApiException(string message, int statusCode) : Exception(message)
+public class ApiException(string message, int statusCode) : Exception(message)
 {
     public int StatusCode { get; } = statusCode;
 }
@@ -17,7 +17,7 @@ public class MikuraApiException(string message, int statusCode) : Exception(mess
 /// 物理メモリが解放されない (実機: 数十 MB の動画ファイル copy で数百 MB のリーク観測)。
 /// HttpClient レベルの接続再利用にも影響するので、一律 using で受ける。</para>
 /// </summary>
-public class HttpMikuraServer(HttpClient http, string baseUrl) : IMikuraServer, IDisposable
+public class HttpServerApi(HttpClient http, string baseUrl) : IServerApi, IDisposable
 {
     private readonly HttpClient _http = http;
     private readonly string _baseUrl = baseUrl.TrimEnd('/');
@@ -47,7 +47,7 @@ public class HttpMikuraServer(HttpClient http, string baseUrl) : IMikuraServer, 
         await EnsureSuccess(response, ct).ConfigureAwait(false);
         var json = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
         return JsonSerializer.Deserialize<FileNode>(json)
-            ?? throw new MikuraApiException("Failed to parse response", 500);
+            ?? throw new ApiException("Failed to parse response", 500);
     }
 
     public async Task<Stream> DownloadFileAsync(string path, long offset = 0, long length = -1, CancellationToken ct = default)
@@ -123,7 +123,7 @@ public class HttpMikuraServer(HttpClient http, string baseUrl) : IMikuraServer, 
         await EnsureSuccess(response, ct).ConfigureAwait(false);
         var json = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
         return JsonSerializer.Deserialize<UploadResult>(json)
-            ?? throw new MikuraApiException("Failed to parse upload response", 500);
+            ?? throw new ApiException("Failed to parse upload response", 500);
     }
 
     public async Task DeleteFileAsync(string path, CancellationToken ct = default)
@@ -180,7 +180,7 @@ public class HttpMikuraServer(HttpClient http, string baseUrl) : IMikuraServer, 
         await EnsureSuccess(response, ct).ConfigureAwait(false);
         var json = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
         return JsonSerializer.Deserialize<VolumeStats>(json)
-            ?? throw new MikuraApiException("Failed to parse volume stats", 500);
+            ?? throw new ApiException("Failed to parse volume stats", 500);
     }
 
     public async Task<string> StartUploadAsync(string path, bool baseFromExisting, CancellationToken ct = default)
@@ -196,7 +196,7 @@ public class HttpMikuraServer(HttpClient http, string baseUrl) : IMikuraServer, 
         await EnsureSuccess(response, ct).ConfigureAwait(false);
         var json = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
         var result = JsonSerializer.Deserialize<StartUploadResponse>(json)
-            ?? throw new MikuraApiException("Failed to parse start-upload response", 500);
+            ?? throw new ApiException("Failed to parse start-upload response", 500);
         return result.UploadId;
     }
 
@@ -228,7 +228,7 @@ public class HttpMikuraServer(HttpClient http, string baseUrl) : IMikuraServer, 
         await EnsureSuccess(response, ct).ConfigureAwait(false);
         var json = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
         return JsonSerializer.Deserialize<UploadResult>(json)
-            ?? throw new MikuraApiException("Failed to parse finalize response", 500);
+            ?? throw new ApiException("Failed to parse finalize response", 500);
     }
 
     public async Task AbortUploadAsync(string uploadId, CancellationToken ct = default)
@@ -268,7 +268,7 @@ public class HttpMikuraServer(HttpClient http, string baseUrl) : IMikuraServer, 
             {
                 message = body;
             }
-            throw new MikuraApiException(message, (int)response.StatusCode);
+            throw new ApiException(message, (int)response.StatusCode);
         }
     }
 

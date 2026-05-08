@@ -6,7 +6,7 @@ using Mikura.Core.Models;
 namespace Mikura.Core.Sync;
 
 /// <summary>
-/// Production <see cref="IFileSystemBackend"/> wired to <see cref="IMikuraServer"/>.
+/// Production <see cref="IFileSystemBackend"/> wired to <see cref="IServerApi"/>.
 /// Replaces the CfApi-shaped <c>MikuraSyncCallbacks</c>+<c>SyncProvider</c> pair
 /// (ADR-021).
 ///
@@ -20,9 +20,9 @@ namespace Mikura.Core.Sync;
 /// という挙動になる。Samba 代替の主要ワークフロー (file copy / save / rename)
 /// では問題にならない。</para>
 /// </summary>
-public sealed class MikuraServerBackend : IFileSystemBackend
+public sealed class ServerBackend : IFileSystemBackend
 {
-    private readonly IMikuraServer _server;
+    private readonly IServerApi _server;
     private readonly ConcurrentDictionary<string, FileEntry> _tree =
         new(StringComparer.OrdinalIgnoreCase);
 
@@ -30,7 +30,7 @@ public sealed class MikuraServerBackend : IFileSystemBackend
         new(StringComparer.OrdinalIgnoreCase);
     private readonly object _activeLocksGate = new();
 
-    public MikuraServerBackend(IMikuraServer server)
+    public ServerBackend(IServerApi server)
     {
         _server = server;
     }
@@ -614,7 +614,7 @@ public sealed class MikuraServerBackend : IFileSystemBackend
     /// </summary>
     private sealed class ServerHandle : IFileHandle
     {
-        private readonly MikuraServerBackend _backend;
+        private readonly ServerBackend _backend;
         private FileEntry _entry;
         private long _length;
         private readonly long _originalServerSize;
@@ -624,7 +624,7 @@ public sealed class MikuraServerBackend : IFileSystemBackend
         private ChunkedUploader? _uploader;
         private readonly SemaphoreSlim _sessionGate = new(1, 1);
 
-        public ServerHandle(MikuraServerBackend backend, string path, FileEntry entry, bool hasLock)
+        public ServerHandle(ServerBackend backend, string path, FileEntry entry, bool hasLock)
         {
             _backend = backend;
             Path = path;
@@ -693,7 +693,7 @@ public sealed class MikuraServerBackend : IFileSystemBackend
 
         // ─────────────────────────────────────── chunked upload session ────
 
-        public async Task EnsureSessionAsync(IMikuraServer server, bool baseFromExisting, CancellationToken ct)
+        public async Task EnsureSessionAsync(IServerApi server, bool baseFromExisting, CancellationToken ct)
         {
             if (_uploader is not null) return;
             await _sessionGate.WaitAsync(ct).ConfigureAwait(false);
@@ -713,7 +713,7 @@ public sealed class MikuraServerBackend : IFileSystemBackend
             return _uploader.EnqueueAsync(offset, data, ct);
         }
 
-        public async Task<UploadResult> FinalizeAsync(IMikuraServer server, long finalSize, CancellationToken ct)
+        public async Task<UploadResult> FinalizeAsync(IServerApi server, long finalSize, CancellationToken ct)
         {
             if (_uploader is null)
                 throw new InvalidOperationException("session not started");

@@ -14,10 +14,10 @@ Windows エクスプローラー
 WinFsp (winfsp-x64.sys ファイルシステムドライバ)
   ↓ ユーザーモード コールバック (Fsp.FileSystemBase)
 mikura client (C# .NET 10, Clean Architecture)
-  ├─ WinFsp.Interop   : MikuraFileSystem (IRP → IFileSystemBackend), OnlineGate
-  ├─ Mikura.Core      : MikuraServerBackend (ADR-016 ロック / ADR-022 refcount),
+  ├─ WinFsp.Interop   : BackendFileSystem (IRP → IFileSystemBackend), OnlineGate
+  ├─ Mikura.Core      : ServerBackend (ADR-016 ロック / ADR-022 refcount),
   │                     SyncEngine, ChunkedUploader (ADR-025)
-  ├─ Mikura.Transport : HttpMikuraServer / HttpEventStream (REST + WSS)
+  ├─ Mikura.Transport : HttpServerApi / HttpEventStream (REST + WSS)
   └─ Mikura.App       : WinForms tray host
   ↓ HTTPS + WSS
 mikura server (Deno + Hono + Deno KV)

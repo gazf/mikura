@@ -4,19 +4,19 @@ using Fsp;
 namespace WinFsp.Interop;
 
 /// <summary>
-/// Owns a <see cref="FileSystemHost"/> and a <see cref="MikuraFileSystem"/>;
+/// Owns a <see cref="FileSystemHost"/> and a <see cref="BackendFileSystem"/>;
 /// the WinFsp counterpart to <c>SyncProvider</c>/<c>SyncRootRegistrar</c> in
 /// the legacy CfApi stack (ADR-021).
 /// </summary>
-public sealed class MikuraFileSystemHost : IDisposable
+public sealed class BackendFileSystemHost : IDisposable
 {
     private readonly FileSystemHost _host;
-    private readonly MikuraFileSystem _fileSystem;
+    private readonly BackendFileSystem _fileSystem;
     private bool _mounted;
 
-    public MikuraFileSystemHost(IFileSystemBackend backend, OnlineGate gate)
+    public BackendFileSystemHost(IFileSystemBackend backend, OnlineGate gate)
     {
-        _fileSystem = new MikuraFileSystem(backend, gate);
+        _fileSystem = new BackendFileSystem(backend, gate);
         _host = new FileSystemHost(_fileSystem);
     }
 

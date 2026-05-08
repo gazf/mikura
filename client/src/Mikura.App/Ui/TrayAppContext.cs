@@ -16,9 +16,9 @@ public sealed class TrayAppContext : ApplicationContext
 
     private static readonly TimeSpan WssHeartbeatInterval = TimeSpan.FromSeconds(10);
 
-    private HttpMikuraServer? _server;
-    private MikuraServerBackend? _backend;
-    private MikuraFileSystemHost? _fsHost;
+    private HttpServerApi? _server;
+    private ServerBackend? _backend;
+    private BackendFileSystemHost? _fsHost;
     private SyncEngine? _syncEngine;
     private HttpEventStream? _eventStream;
     private CancellationTokenSource? _eventLoopCts;
@@ -102,14 +102,14 @@ public sealed class TrayAppContext : ApplicationContext
             http.DefaultRequestHeaders.Authorization =
                 new AuthenticationHeaderValue("Bearer", _settings.BearerToken);
             http.DefaultRequestHeaders.Add("X-Device-Id", _deviceId);
-            _server = new HttpMikuraServer(http, _settings.ServerUrl);
+            _server = new HttpServerApi(http, _settings.ServerUrl);
 
-            _backend = new MikuraServerBackend(_server);
+            _backend = new ServerBackend(_server);
             Trace.WriteLine($"Initializing backend (server={_settings.ServerUrl})");
             await _backend.InitializeAsync().ConfigureAwait(true);
             Trace.WriteLine($"Backend initialized: {_backend.TreeSnapshot.Count} entries cached");
 
-            _fsHost = new MikuraFileSystemHost(_backend, _onlineGate);
+            _fsHost = new BackendFileSystemHost(_backend, _onlineGate);
             Trace.WriteLine($"Mounting at '{_settings.SyncRootPath}'");
             _mountPoint = _fsHost.Mount(_settings.SyncRootPath);
             Trace.WriteLine($"Mounted at {_mountPoint}");
@@ -282,7 +282,7 @@ public sealed class TrayAppContext : ApplicationContext
             _fsHost = null;
 
             await _backend!.InitializeAsync();
-            _fsHost = new MikuraFileSystemHost(_backend, _onlineGate);
+            _fsHost = new BackendFileSystemHost(_backend, _onlineGate);
             _mountPoint = _fsHost.Mount(_settings.SyncRootPath);
 
             _syncEngine = new SyncEngine(_backend, _mountPoint, _deviceId!);

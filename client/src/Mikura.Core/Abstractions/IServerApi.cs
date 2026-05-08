@@ -2,7 +2,7 @@ using Mikura.Core.Models;
 
 namespace Mikura.Core.Abstractions;
 
-public interface IMikuraServer
+public interface IServerApi
 {
     Task<IReadOnlyList<FileNode>> ListDirectoryAsync(string path, CancellationToken ct = default);
     Task<IReadOnlyList<TreeNode>> GetTreeAsync(CancellationToken ct = default);

@@ -1,7 +1,7 @@
 namespace WinFsp.Interop;
 
 /// <summary>
-/// Thread-safe online/offline flag consulted by every <see cref="MikuraFileSystem"/>
+/// Thread-safe online/offline flag consulted by every <see cref="BackendFileSystem"/>
 /// callback. When offline, all IO returns STATUS_NETWORK_UNREACHABLE so apps see
 /// the SMB-equivalent "session lost" semantics that CfApi could not deliver
 /// (ADR-021).

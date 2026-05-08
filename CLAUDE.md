@@ -10,19 +10,19 @@ ADR-021 documents the migration from CfApi to WinFsp — undertaken to gain SMB-
 
 - `server/` — Deno + TypeScript (Hono, Deno KV)
 - `client/` — C# .NET 10 / Windows Forms. Clean Architecture, 4 layers:
-  - `WinFsp.Interop` — `Fsp.FileSystemBase`-derived `MikuraFileSystem` adapter, `OnlineGate`, `MikuraFileSystemHost`
-  - `Mikura.Core` — domain models, abstractions (`IMikuraServer`, `IEventStream`, `IFileSystemBackend`), `MikuraServerBackend`, `SyncEngine`
-  - `Mikura.Transport` — REST/WSS HTTP impl (`HttpMikuraServer`, `HttpEventStream`)
+  - `WinFsp.Interop` — `Fsp.FileSystemBase`-derived `BackendFileSystem` adapter, `OnlineGate`, `BackendFileSystemHost`
+  - `Mikura.Core` — domain models, abstractions (`IServerApi`, `IEventStream`, `IFileSystemBackend`), `ServerBackend`, `SyncEngine`
+  - `Mikura.Transport` — REST/WSS HTTP impl (`HttpServerApi`, `HttpEventStream`)
   - `Mikura.App` — WinForms host (`TrayAppContext`, `SettingsForm`)
 
 ## Current implementation
 
-- Projection: WinFsp callback-driven. `MikuraFileSystem` translates IRPs to `IFileSystemBackend` calls (ADR-021 supersedes ADR-013).
+- Projection: WinFsp callback-driven. `BackendFileSystem` translates IRPs to `IFileSystemBackend` calls (ADR-021 supersedes ADR-013).
 - Offline gate: `OnlineGate` flips on WSS disconnect; every callback returns `STATUS_NETWORK_UNREACHABLE` so existing handles die immediately — the migration's raison d'être.
 - Read: per-IRP byte-range fetch via `GET /content` with `Range:` header. No whole-file hydrate; `_originalServerSize` per handle bounds the fetch.
 - Write: kernel writes are forwarded chunk-by-chunk through `ChunkedUploader` (`Channel<UploadChunk>` bounded(1) + 4 workers, `ArrayPool` 4MB max) over the `POST /uploads` → `PATCH /uploads/:id` → `POST /uploads/:id/finalize` session API (ADR-025). Server stages to a sibling `staging/` dir and POSIX-renames into `data/` on finalize.
 - Cleanup: WinFsp `Cleanup` with `CleanupSetLastWriteTime` → drain uploader → finalize session → release lock (ADR-016 retained, ADR-020 retained at concept level). `PostCleanupWhenModifiedOnly = false`; `Close` is a safety-net for lock release.
-- Locking: acquired in `MikuraServerBackend.OpenAsync` per Device ID (ADR-016, ADR-022 process-local refcount via `LockSlot`); write-intent + lock denial = immediate `STATUS_ACCESS_DENIED`; TTL via Deno KV `expireIn` 30s + WSS heartbeat 10s (ADR-018). `Rename` force-releases src/dst locks (ADR-024).
+- Locking: acquired in `ServerBackend.OpenAsync` per Device ID (ADR-016, ADR-022 process-local refcount via `LockSlot`); write-intent + lock denial = immediate `STATUS_ACCESS_DENIED`; TTL via Deno KV `expireIn` 30s + WSS heartbeat 10s (ADR-018). `Rename` force-releases src/dst locks (ADR-024).
 - Volume info: `GET /volume` reports real FS capacity via `node:fs/promises` `statfs` against `DATA_ROOT` (so Docker bind/named volumes report host capacity). Client caches with 30s background refresh.
 - Event broadcast: API-driven. Each mutation route calls `broadcastFileEvent("created"|"modified"|"deleted", path, meta?)`; `Deno.watchFs` retired (rename events were unreliable).
 - Device ID: persisted in `device.json` next to the client executable.

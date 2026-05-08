@@ -20,7 +20,7 @@ namespace WinFsp.Interop;
 /// synchronous. The blocking happens on WinFsp worker threads dedicated to IRP
 /// dispatch, so it does not stall any application thread.</para>
 /// </summary>
-public sealed class MikuraFileSystem : FileSystemBase
+public sealed class BackendFileSystem : FileSystemBase
 {
     private const int AllocationUnit = 4096;
 
@@ -47,7 +47,7 @@ public sealed class MikuraFileSystem : FileSystemBase
     private readonly OnlineGate _gate;
     private readonly DateTime _createdAt = DateTime.UtcNow;
 
-    public MikuraFileSystem(IFileSystemBackend backend, OnlineGate gate)
+    public BackendFileSystem(IFileSystemBackend backend, OnlineGate gate)
     {
         _backend = backend;
         _gate = gate;
