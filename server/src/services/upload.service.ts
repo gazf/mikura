@@ -262,7 +262,7 @@ export async function finalizeSession(
     type: "file",
     size: stat.size,
     lastModified,
-  });
+  }, session.deviceId);
 
   // KV エントリを掃除。
   const kv = await getKv();

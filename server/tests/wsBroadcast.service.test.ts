@@ -1,5 +1,6 @@
 import { assertEquals } from "@std/assert";
 import {
+  broadcastFileEvent,
   broadcastLockEvent,
   registerSocket,
   unregisterSocket,
@@ -9,6 +10,10 @@ import { seedUser, withTestKv } from "./_helpers.ts";
 interface SentMsg {
   event: string;
   path: string;
+  type?: string;
+  size?: number;
+  lastModified?: string;
+  originatorDeviceId?: string;
   holder?: { userId: number; deviceId: string; name: string };
 }
 
@@ -206,5 +211,116 @@ Deno.test("broadcast: no peers does not throw", async () => {
       deviceId: "d",
     });
     // 例外ゼロで返ってくれば OK
+  });
+});
+
+// ----- broadcast: 自端末を除外する (#1: originator は自分の event を受け取らない) -----
+
+Deno.test("broadcastLockEvent: holder.deviceId と一致する peer は除外される", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "alice",
+      groupId: 10,
+      groupName: "g",
+      permissions: [{ path: "/", accessLevel: "read" }],
+    });
+
+    // 同一 user が 2 端末 (holder と他端末) で接続している状態を想定。
+    const holderSock = new FakeSocket();
+    const otherSock = new FakeSocket();
+    registerSocket({
+      socket: holderSock as unknown as WebSocket,
+      userId: 1,
+      deviceId: "dev-holder",
+    });
+    registerSocket({
+      socket: otherSock as unknown as WebSocket,
+      userId: 1,
+      deviceId: "dev-other",
+    });
+
+    await broadcastLockEvent("lock_acquired", "/foo.txt", {
+      userId: 1,
+      deviceId: "dev-holder",
+    });
+
+    // holder は自分が起こした event を受け取らない。
+    assertEquals(holderSock.sent.length, 0);
+    // 別端末 (read 権限あり) は受け取る。
+    assertEquals(otherSock.sent.length, 1);
+  });
+});
+
+Deno.test("broadcastFileEvent: originatorDeviceId と一致する peer は除外される + payload に originatorDeviceId が載る", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "alice",
+      groupId: 10,
+      groupName: "g",
+      permissions: [{ path: "/", accessLevel: "read" }],
+    });
+
+    const originSock = new FakeSocket();
+    const otherSock = new FakeSocket();
+    registerSocket({
+      socket: originSock as unknown as WebSocket,
+      userId: 1,
+      deviceId: "dev-origin",
+    });
+    registerSocket({
+      socket: otherSock as unknown as WebSocket,
+      userId: 1,
+      deviceId: "dev-other",
+    });
+
+    await broadcastFileEvent(
+      "modified",
+      "/foo.txt",
+      { type: "file", size: 42, lastModified: "2026-01-01T00:00:00Z" },
+      "dev-origin",
+    );
+
+    // 自端末は受け取らない。
+    assertEquals(originSock.sent.length, 0);
+    // 他端末は受け取り、payload には originatorDeviceId が載る (client 側 defense-in-depth)。
+    assertEquals(otherSock.sent.length, 1);
+    assertEquals(otherSock.sent[0].originatorDeviceId, "dev-origin");
+  });
+});
+
+Deno.test("broadcastFileEvent: originatorDeviceId 未指定時 (watcher 経由想定) は全 peer に配信し payload にも載らない", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "alice",
+      groupId: 10,
+      groupName: "g",
+      permissions: [{ path: "/", accessLevel: "read" }],
+    });
+
+    const a = new FakeSocket();
+    const b = new FakeSocket();
+    registerSocket({
+      socket: a as unknown as WebSocket,
+      userId: 1,
+      deviceId: "dev-a",
+    });
+    registerSocket({
+      socket: b as unknown as WebSocket,
+      userId: 1,
+      deviceId: "dev-b",
+    });
+
+    await broadcastFileEvent("modified", "/x.txt", {
+      type: "file",
+      size: 1,
+      lastModified: "2026-01-01T00:00:00Z",
+    });
+
+    assertEquals(a.sent.length, 1);
+    assertEquals(b.sent.length, 1);
+    assertEquals(a.sent[0].originatorDeviceId, undefined);
   });
 });

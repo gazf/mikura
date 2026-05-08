@@ -182,6 +182,91 @@ Deno.test("createFolder: directory created を broadcast", async () => {
   });
 });
 
+Deno.test("originator 端末は自身の操作 broadcast を受け取らない (#1 回帰防止)", async () => {
+  await withTestKv(async (kv) => {
+    // 自分自身も WSS 接続している状態 — listener は別端末。
+    await seedUser(kv, {
+      userId: 100,
+      userName: "listener",
+      groupId: 100,
+      groupName: "listener-g",
+      permissions: [{ path: "/", accessLevel: "read" }],
+    });
+    await seedUser(kv, {
+      userId: 1,
+      userName: "alice",
+      groupId: 10,
+      groupName: "alice-g",
+      permissions: [{ path: "/", accessLevel: "write" }],
+    });
+    const listenerSock = new FakeSocket();
+    const aliceSock = new FakeSocket();
+    registerSocket({
+      socket: listenerSock as unknown as WebSocket,
+      userId: 100,
+      deviceId: "dev-listener",
+    });
+    registerSocket({
+      socket: aliceSock as unknown as WebSocket,
+      userId: 1,
+      deviceId: "dev-alice",
+    });
+
+    const fx = await ensureFixtureDir();
+    const target = `/${FIXTURE_DIR}/originator.bin`;
+    try {
+      // 1) writeFile (originator=dev-alice): alice は受け取らない、listener は受け取る。
+      const stream = new ReadableStream<Uint8Array>({
+        start(c) {
+          c.enqueue(new Uint8Array([1, 2, 3]));
+          c.close();
+        },
+      });
+      await writeFile(target, stream, "dev-alice");
+      await flush();
+      assertEquals(
+        aliceSock.sent.find((m) => m.event === "modified"),
+        undefined,
+      );
+      assertEquals(
+        listenerSock.sent.find((m) => m.event === "modified")?.path,
+        target,
+      );
+
+      // 2) deleteFile (originator=dev-alice): 同上。
+      aliceSock.sent.length = 0;
+      listenerSock.sent.length = 0;
+      await deleteFile(target, "dev-alice");
+      await flush();
+      assertEquals(
+        aliceSock.sent.find((m) => m.event === "deleted"),
+        undefined,
+      );
+      assertEquals(
+        listenerSock.sent.find((m) => m.event === "deleted")?.path,
+        target,
+      );
+
+      // 3) createFolder (originator=dev-alice): 同上。
+      const dirTarget = `/${FIXTURE_DIR}/originator-dir`;
+      aliceSock.sent.length = 0;
+      listenerSock.sent.length = 0;
+      await createFolder(dirTarget, "dev-alice");
+      await flush();
+      assertEquals(
+        aliceSock.sent.find((m) => m.event === "created"),
+        undefined,
+      );
+      assertEquals(
+        listenerSock.sent.find((m) => m.event === "created")?.path,
+        dirTarget,
+      );
+    } finally {
+      await fx.cleanup();
+    }
+  });
+});
+
 Deno.test("finalizeSession: 確定 path の modified を broadcast (staging→storage rename)", async () => {
   await withTestKv(async (kv) => {
     const sock = await setupListener(kv);

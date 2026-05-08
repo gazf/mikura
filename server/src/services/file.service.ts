@@ -178,6 +178,7 @@ export async function readFile(
 export async function writeFile(
   relativePath: string,
   body: ReadableStream<Uint8Array>,
+  originatorDeviceId?: string,
 ): Promise<void> {
   const fullPath = resolveAndValidate(relativePath);
 
@@ -210,7 +211,7 @@ export async function writeFile(
     type: "file",
     size: stat.size,
     lastModified: (stat.mtime ?? new Date()).toISOString(),
-  });
+  }, originatorDeviceId);
 }
 
 async function writeAll(file: Deno.FsFile, data: Uint8Array): Promise<void> {
@@ -220,7 +221,10 @@ async function writeAll(file: Deno.FsFile, data: Uint8Array): Promise<void> {
   }
 }
 
-export async function deleteFile(relativePath: string): Promise<void> {
+export async function deleteFile(
+  relativePath: string,
+  originatorDeviceId?: string,
+): Promise<void> {
   const fullPath = resolveAndValidate(relativePath);
 
   try {
@@ -233,10 +237,13 @@ export async function deleteFile(relativePath: string): Promise<void> {
     throw e;
   }
 
-  await broadcastFileEvent("deleted", relativePath);
+  await broadcastFileEvent("deleted", relativePath, undefined, originatorDeviceId);
 }
 
-export async function createFolder(relativePath: string): Promise<void> {
+export async function createFolder(
+  relativePath: string,
+  originatorDeviceId?: string,
+): Promise<void> {
   const fullPath = resolveAndValidate(relativePath);
 
   try {
@@ -257,12 +264,13 @@ export async function createFolder(relativePath: string): Promise<void> {
     type: "directory",
     size: 0,
     lastModified: (stat.mtime ?? new Date()).toISOString(),
-  });
+  }, originatorDeviceId);
 }
 
 export async function renameEntry(
   oldRelativePath: string,
   newRelativePath: string,
+  originatorDeviceId?: string,
 ): Promise<void> {
   const oldFull = resolveAndValidate(oldRelativePath);
   const newFull = resolveAndValidate(newRelativePath);
@@ -293,12 +301,17 @@ export async function renameEntry(
   // (実機でそれを踏んだ)。ここで明示的に旧 path の deleted と新 path の
   // created を発火しておけば、別 client は確実に tree を更新できる。
   const newStat = await Deno.stat(newFull);
-  await broadcastFileEvent("deleted", oldRelativePath);
+  await broadcastFileEvent(
+    "deleted",
+    oldRelativePath,
+    undefined,
+    originatorDeviceId,
+  );
   await broadcastFileEvent("created", newRelativePath, {
     type: newStat.isDirectory ? "directory" : "file",
     size: newStat.isDirectory ? 0 : newStat.size,
     lastModified: (newStat.mtime ?? new Date()).toISOString(),
-  });
+  }, originatorDeviceId);
 }
 
 export function getDataRoot(): string {

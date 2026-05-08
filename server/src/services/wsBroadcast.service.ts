@@ -72,8 +72,10 @@ export async function broadcastLockEvent(
 
   let sent = 0;
   // 認可チェックは並列に。失敗 (権限なし) は黙って配信スキップ。
+  // 自端末向けの broadcast はそもそも自分が起こした事象なので除外。
   await Promise.all(
     [...peers].map(async (peer) => {
+      if (peer.deviceId === holder.deviceId) return;
       if (peer.socket.readyState !== WebSocket.OPEN) return;
       try {
         if (!(await checkPermission(peer.userId, filePath, "read"))) return;
@@ -100,21 +102,29 @@ export async function broadcastFileEvent(
   event: "created" | "modified" | "deleted",
   filePath: string,
   meta?: { type: "file" | "directory"; size: number; lastModified: string },
+  originatorDeviceId?: string,
 ): Promise<void> {
   if (peers.size === 0) return;
 
-  const payload = JSON.stringify(
-    event === "deleted" ? { event, path: filePath } : {
+  // payload に originatorDeviceId を載せておくのは client 側 defense-in-depth。
+  // server が万一フィルタ漏れしても、SyncEngine 側で自端末発の event を捨てて
+  // 二重 ApplyExternalEvent + Shell.Notify を防げる。
+  const base = event === "deleted"
+    ? { event, path: filePath }
+    : {
       event,
       path: filePath,
       type: meta?.type ?? "file",
       size: meta?.size ?? 0,
       lastModified: meta?.lastModified ?? new Date().toISOString(),
-    },
+    };
+  const payload = JSON.stringify(
+    originatorDeviceId ? { ...base, originatorDeviceId } : base,
   );
 
   await Promise.all(
     [...peers].map(async (peer) => {
+      if (originatorDeviceId && peer.deviceId === originatorDeviceId) return;
       if (peer.socket.readyState !== WebSocket.OPEN) return;
       try {
         if (!(await checkPermission(peer.userId, filePath, "read"))) return;

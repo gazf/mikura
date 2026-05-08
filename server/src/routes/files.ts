@@ -39,6 +39,7 @@ export function registerFileRoutes(app: Hono<Env>) {
   // GET /tree — recursive full tree listing (read 権限のあるノードのみ返す)
   app.get("/tree", async (c) => {
     const user = c.get("user");
+    const t0 = performance.now();
     try {
       const tree = await getTree();
       const locks = await getAllLocks();
@@ -55,6 +56,7 @@ export function registerFileRoutes(app: Hono<Env>) {
       const filtered = checks.filter(
         (n): n is (typeof tree)[number] & { isReadOnly: boolean } => n !== null,
       );
+      console.log(`[diag] GET /tree dev=${user.deviceId} entries=${filtered.length} ${(performance.now() - t0).toFixed(1)}ms`);
       return c.json(filtered);
     } catch (e) {
       if (e instanceof FileServiceError) {
@@ -69,6 +71,7 @@ export function registerFileRoutes(app: Hono<Env>) {
     const wildcard = c.req.path.replace(/^\/files\/?/, "");
     const filePath = "/" + wildcard;
     const user = c.get("user");
+    const t0 = performance.now();
 
     if (!(await checkPermission(user.id, filePath, "read"))) {
       return c.json({ message: "Forbidden" }, 403);
@@ -78,8 +81,10 @@ export function registerFileRoutes(app: Hono<Env>) {
       const info = await getFileInfo(filePath);
       if (info.type === "directory") {
         const entries = await listDirectory(filePath);
+        console.log(`[diag] GET /files dev=${user.deviceId} ${filePath} dir entries=${entries.length} ${(performance.now() - t0).toFixed(1)}ms`);
         return c.json(entries);
       }
+      console.log(`[diag] GET /files dev=${user.deviceId} ${filePath} stat ${(performance.now() - t0).toFixed(1)}ms`);
       return c.json(info);
     } catch (e) {
       if (e instanceof FileServiceError) {
@@ -104,7 +109,7 @@ export function registerFileRoutes(app: Hono<Env>) {
     }
 
     try {
-      await deleteFile(filePath);
+      await deleteFile(filePath, user.deviceId);
       return c.json({ message: "Deleted" }, 200);
     } catch (e) {
       if (e instanceof FileServiceError) {
@@ -129,7 +134,7 @@ export function registerFileRoutes(app: Hono<Env>) {
     }
 
     try {
-      await createFolder(filePath);
+      await createFolder(filePath, user.deviceId);
       return c.json({ message: "Created", path: filePath }, 201);
     } catch (e) {
       if (e instanceof FileServiceError) {
@@ -169,7 +174,7 @@ export function registerFileRoutes(app: Hono<Env>) {
     }
 
     try {
-      await renameEntry(oldPath, newPath);
+      await renameEntry(oldPath, newPath, user.deviceId);
       return c.json({ message: "Renamed", oldPath, newPath }, 200);
     } catch (e) {
       if (e instanceof FileServiceError) {
@@ -184,6 +189,7 @@ export function registerFileRoutes(app: Hono<Env>) {
     const wildcard = c.req.path.replace(/^\/content\/?/, "");
     const filePath = "/" + wildcard;
     const user = c.get("user");
+    const t0 = performance.now();
 
     if (!(await checkPermission(user.id, filePath, "read"))) {
       return c.json({ message: "Forbidden" }, 403);
@@ -206,6 +212,7 @@ export function registerFileRoutes(app: Hono<Env>) {
       }
 
       const { stream, size } = await readFile(filePath, offset, length);
+      console.log(`[diag] GET /content dev=${user.deviceId} ${filePath} range=${rangeHeader ?? "-"} size=${size} ${(performance.now() - t0).toFixed(1)}ms`);
 
       const headers: Record<string, string> = {
         "Content-Type": "application/octet-stream",
@@ -252,7 +259,7 @@ export function registerFileRoutes(app: Hono<Env>) {
       if (!body) {
         return c.json({ message: "Request body required" }, 400);
       }
-      await writeFile(filePath, body);
+      await writeFile(filePath, body, user.deviceId);
       // Return up-to-date metadata so the client can refresh its placeholder.
       const stat = await statFile(filePath);
       return c.json(

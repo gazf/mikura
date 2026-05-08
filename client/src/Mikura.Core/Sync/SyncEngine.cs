@@ -48,6 +48,11 @@ public sealed class SyncEngine
 
     private void HandleEvent(ServerEvent evt)
     {
+        // Defense-in-depth: server should already exclude the originator, but
+        // if a regression slips through, drop self-issued file events here so
+        // we don't redundantly ApplyExternalEvent + nudge the Shell.
+        if (evt.OriginatorDeviceId is not null && IsSelfDevice(evt.OriginatorDeviceId)) return;
+
         Trace.WriteLine($"Event: {evt.Event} {evt.Path}");
 
         switch (evt.Event)

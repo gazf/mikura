@@ -14,7 +14,8 @@ public record ServerEvent(
     [property: JsonPropertyName("type")] string? Type = null,
     [property: JsonPropertyName("size")] long Size = 0,
     [property: JsonPropertyName("lastModified")] DateTime? LastModified = null,
-    [property: JsonPropertyName("holder")] LockHolder? Holder = null
+    [property: JsonPropertyName("holder")] LockHolder? Holder = null,
+    [property: JsonPropertyName("originatorDeviceId")] string? OriginatorDeviceId = null
 );
 
 public interface IEventStream : IAsyncDisposable
