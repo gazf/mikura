@@ -504,7 +504,7 @@ public sealed class BackendFileSystem : FileSystemBase
         info.LastAccessTime = (ulong)entry.LastWriteTimeUtc.ToFileTimeUtc();
         info.LastWriteTime = (ulong)entry.LastWriteTimeUtc.ToFileTimeUtc();
         info.ChangeTime = info.LastWriteTime;
-        info.IndexNumber = 0;
+        info.IndexNumber = (ulong)entry.Path.GetHashCode();
         info.HardLinks = 0;
     }
 
