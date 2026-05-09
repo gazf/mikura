@@ -14,6 +14,7 @@
   <PropertyGroup>
     <WinFspBin Condition="'$(WinFspBin)' == '' AND '$(OS)' == 'Windows_NT'">$(MSBuildProgramFiles32)\WinFsp\bin\</WinFspBin>
     <WinFspBin Condition="'$(WinFspBin)' == '' AND '$(OS)' != 'Windows_NT'">/mnt/c/Program Files (x86)/WinFsp/bin/</WinFspBin>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <ItemGroup>
