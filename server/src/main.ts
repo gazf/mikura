@@ -16,4 +16,9 @@ await initializeStagingRoot();
 
 console.log(`mikura server starting on port ${port} (data=${getDataRoot()})`);
 
-Deno.serve({ port }, app.fetch);
+// hostname に "::" を指定して IPv6 で listen する。Linux/Windows いずれも
+// IPV6_V6ONLY=0 が既定なので、IPv4-mapped IPv6 経由で IPv4 も受け付ける。
+// 既定 (= "0.0.0.0") のままだと IPv4 のみ bind し、client 側で `localhost`
+// を解決して `::1` を先に試した場合に TCP SYN リトライで ~21 秒の接続遅延
+// になる (Happy Eyeballs fallback)。dev/local の体感を悪化させる主犯だった。
+Deno.serve({ port, hostname: "::" }, app.fetch);
