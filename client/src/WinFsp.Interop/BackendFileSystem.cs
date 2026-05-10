@@ -1,5 +1,7 @@
 using System.Buffers;
 using System.Collections;
+using System.Numerics;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Mikura.Core.Abstractions;
 using Mikura.Core.Models;
@@ -59,7 +61,7 @@ public sealed class BackendFileSystem : FileSystemBase
         host.SectorSize = AllocationUnit;
         host.SectorsPerAllocationUnit = 1;
         host.MaxComponentLength = 255;
-        host.FileInfoTimeout = 0;
+        host.FileInfoTimeout = 1000;
         host.CaseSensitiveSearch = false;
         host.CasePreservedNames = true;
         host.UnicodeOnDisk = true;
@@ -71,10 +73,15 @@ public sealed class BackendFileSystem : FileSystemBase
         // Cleanup を経由せず孤児化する (実機: 1 個残る現象)。
         host.PostCleanupWhenModifiedOnly = false;
         host.PassQueryDirectoryPattern = true;
-        host.FlushAndPurgeOnCleanup = true;
+        // false にすると最後の handle が閉じても kernel cache を保持 → shell の
+        // "右クリックの度に icon/version handler が file を open しなおす" 系の
+        // 反復アクセスが cache hit で消える。trade-off: 他端末での mutation を
+        // broadcast で知った直後でも、こちら側 kernel cache に古い byte が
+        // 残り得る (FileInfoTimeout=1000 の memo data lag と同じオーダー)。
+        host.FlushAndPurgeOnCleanup = false;
         host.VolumeCreationTime = (ulong)_createdAt.ToFileTimeUtc();
         host.VolumeSerialNumber = 0xCAF5;
-        host.FileSystemName = "Mikura";
+        host.FileSystemName = "NTFS";
 
         // NOTE: do NOT call _backend.InitializeAsync().GetResult() here — Init
         // runs on the thread that invoked Mount (typically the UI thread). Any
@@ -504,8 +511,41 @@ public sealed class BackendFileSystem : FileSystemBase
         info.LastAccessTime = (ulong)entry.LastWriteTimeUtc.ToFileTimeUtc();
         info.LastWriteTime = (ulong)entry.LastWriteTimeUtc.ToFileTimeUtc();
         info.ChangeTime = info.LastWriteTime;
-        info.IndexNumber = (ulong)entry.Path.GetHashCode();
-        info.HardLinks = 0;
+        info.IndexNumber = ComputeIndexNumber(entry.Path);
+        info.HardLinks = 1;
+    }
+
+    private static ulong ComputeIndexNumber(ReadOnlySpan<char> path)
+    {
+        const ulong prime1 = 0x9E3779B185EBCA87UL;
+        const ulong prime2 = 0xC2B2AE3D27D4EB4FUL;
+        
+        ReadOnlySpan<byte> data = MemoryMarshal.AsBytes(path);
+        ref byte ptr = ref MemoryMarshal.GetReference(data);
+        int len = data.Length;
+        
+        ulong hash = (ulong)len * prime1;
+        int i = 0;
+        
+        while (i + 8 <= len)
+        {
+            ulong k = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref ptr, i));
+            hash ^= k * prime2;
+            hash = BitOperations.RotateLeft(hash, 31) * prime1;
+            i += 8;
+        }
+        
+        while (i < len)
+        {
+            hash ^= (ulong)Unsafe.Add(ref ptr, i) * prime2;
+            hash = BitOperations.RotateLeft(hash, 11) * prime1;
+            i++;
+        }
+        
+        hash ^= hash >> 33;
+        hash *= prime2;
+        hash ^= hash >> 29;
+        return hash;
     }
 
     private static T? AwaitOrNull<T>(Task<T?> task) where T : class
