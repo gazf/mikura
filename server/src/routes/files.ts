@@ -56,7 +56,7 @@ export function registerFileRoutes(app: Hono<Env>) {
       const filtered = checks.filter(
         (n): n is (typeof tree)[number] & { isReadOnly: boolean } => n !== null,
       );
-      console.log(`[diag] GET /tree dev=${user.deviceId} entries=${filtered.length} ${(performance.now() - t0).toFixed(1)}ms`);
+      // console.log(`[diag] GET /tree dev=${user.deviceId} entries=${filtered.length} ${(performance.now() - t0).toFixed(1)}ms`);
       return c.json(filtered);
     } catch (e) {
       if (e instanceof FileServiceError) {
@@ -81,10 +81,10 @@ export function registerFileRoutes(app: Hono<Env>) {
       const info = await getFileInfo(filePath);
       if (info.type === "directory") {
         const entries = await listDirectory(filePath);
-        console.log(`[diag] GET /files dev=${user.deviceId} ${filePath} dir entries=${entries.length} ${(performance.now() - t0).toFixed(1)}ms`);
+        // console.log(`[diag] GET /files dev=${user.deviceId} ${filePath} dir entries=${entries.length} ${(performance.now() - t0).toFixed(1)}ms`);
         return c.json(entries);
       }
-      console.log(`[diag] GET /files dev=${user.deviceId} ${filePath} stat ${(performance.now() - t0).toFixed(1)}ms`);
+      // console.log(`[diag] GET /files dev=${user.deviceId} ${filePath} stat ${(performance.now() - t0).toFixed(1)}ms`);
       return c.json(info);
     } catch (e) {
       if (e instanceof FileServiceError) {
@@ -212,7 +212,7 @@ export function registerFileRoutes(app: Hono<Env>) {
       }
 
       const { stream, size } = await readFile(filePath, offset, length);
-      console.log(`[diag] GET /content dev=${user.deviceId} ${filePath} range=${rangeHeader ?? "-"} size=${size} ${(performance.now() - t0).toFixed(1)}ms`);
+      // console.log(`[diag] GET /content dev=${user.deviceId} ${filePath} range=${rangeHeader ?? "-"} size=${size} ${(performance.now() - t0).toFixed(1)}ms`);
 
       const headers: Record<string, string> = {
         "Content-Type": "application/octet-stream",
