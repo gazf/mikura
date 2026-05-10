@@ -39,7 +39,7 @@ export function registerFileRoutes(app: Hono<Env>) {
   // GET /tree — recursive full tree listing (read 権限のあるノードのみ返す)
   app.get("/tree", async (c) => {
     const user = c.get("user");
-    const t0 = performance.now();
+    // const t0 = performance.now();
     try {
       const tree = await getTree();
       const locks = await getAllLocks();
@@ -71,7 +71,7 @@ export function registerFileRoutes(app: Hono<Env>) {
     const wildcard = c.req.path.replace(/^\/files\/?/, "");
     const filePath = "/" + wildcard;
     const user = c.get("user");
-    const t0 = performance.now();
+    // const t0 = performance.now();
 
     if (!(await checkPermission(user.id, filePath, "read"))) {
       return c.json({ message: "Forbidden" }, 403);
@@ -189,7 +189,7 @@ export function registerFileRoutes(app: Hono<Env>) {
     const wildcard = c.req.path.replace(/^\/content\/?/, "");
     const filePath = "/" + wildcard;
     const user = c.get("user");
-    const t0 = performance.now();
+    // const t0 = performance.now();
 
     if (!(await checkPermission(user.id, filePath, "read"))) {
       return c.json({ message: "Forbidden" }, 403);

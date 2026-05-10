@@ -237,7 +237,12 @@ export async function deleteFile(
     throw e;
   }
 
-  await broadcastFileEvent("deleted", relativePath, undefined, originatorDeviceId);
+  await broadcastFileEvent(
+    "deleted",
+    relativePath,
+    undefined,
+    originatorDeviceId,
+  );
 }
 
 export async function createFolder(

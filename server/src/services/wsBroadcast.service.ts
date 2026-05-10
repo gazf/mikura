@@ -109,15 +109,13 @@ export async function broadcastFileEvent(
   // payload に originatorDeviceId を載せておくのは client 側 defense-in-depth。
   // server が万一フィルタ漏れしても、SyncEngine 側で自端末発の event を捨てて
   // 二重 ApplyExternalEvent + Shell.Notify を防げる。
-  const base = event === "deleted"
-    ? { event, path: filePath }
-    : {
-      event,
-      path: filePath,
-      type: meta?.type ?? "file",
-      size: meta?.size ?? 0,
-      lastModified: meta?.lastModified ?? new Date().toISOString(),
-    };
+  const base = event === "deleted" ? { event, path: filePath } : {
+    event,
+    path: filePath,
+    type: meta?.type ?? "file",
+    size: meta?.size ?? 0,
+    lastModified: meta?.lastModified ?? new Date().toISOString(),
+  };
   const payload = JSON.stringify(
     originatorDeviceId ? { ...base, originatorDeviceId } : base,
   );
