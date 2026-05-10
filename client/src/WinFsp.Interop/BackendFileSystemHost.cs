@@ -1,5 +1,6 @@
 using Mikura.Core.Abstractions;
 using Fsp;
+using Fsp.Interop;
 
 namespace WinFsp.Interop;
 
@@ -56,6 +57,51 @@ public sealed class BackendFileSystemHost : IDisposable
             && char.IsLetter(mountPoint[0]) && mountPoint[1] == ':')
             return false;
         return true;
+    }
+
+    /// <summary>
+    /// kernel cache invalidation を WinFsp 経由で kernel に伝える。WSS broadcast で
+    /// 他端末由来の created / modified / deleted を受け取った時に呼ぶことで、
+    /// FlushAndPurgeOnCleanup=false で温存している data cache を明示的に捨てて
+    /// stale read を防ぐ。
+    ///
+    /// <para>WinFsp 仕様: NotifyBegin → 0..N Notify(...) → NotifyEnd の 3 段。
+    /// FileName は server canonical な絶対 path (先頭スラッシュ付き) を渡す。
+    /// mount 前 / unmount 後に呼ばれてしまっても安全に no-op で抜ける。</para>
+    /// </summary>
+    public void NotifyExternalChange(string serverPath, Mikura.Core.Abstractions.ExternalChangeKind kind)
+    {
+        if (!_mounted || string.IsNullOrEmpty(serverPath)) return;
+
+        var (action, filter) = kind switch
+        {
+            Mikura.Core.Abstractions.ExternalChangeKind.Created => (NotifyAction.Added, NotifyFilter.ChangeFileName),
+            Mikura.Core.Abstractions.ExternalChangeKind.Deleted => (NotifyAction.Removed, NotifyFilter.ChangeFileName),
+            Mikura.Core.Abstractions.ExternalChangeKind.Modified => (NotifyAction.Modified, NotifyFilter.ChangeLastWrite | NotifyFilter.ChangeSize),
+            _ => (NotifyAction.Modified, NotifyFilter.ChangeLastWrite),
+        };
+
+        var info = new NotifyInfo
+        {
+            FileName = serverPath,
+            Action = action,
+            Filter = filter,
+        };
+
+        try
+        {
+            // タイムアウトは 1 秒に設定。NotifyBegin は rename 競合があると待たされる
+            // が、broadcast の流量で長時間 block されては困るので短めに切る。
+            // 失敗しても一貫性が「キャッシュ寿命だけ stale」レベルに退化するだけで
+            // クラッシュにはならないので、catch して握りつぶす。
+            if (_host.NotifyBegin(1000) < 0) return;
+            try { _host.Notify(new[] { info }); }
+            finally { _host.NotifyEnd(); }
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Trace.WriteLine($"[WARN] WinFsp Notify failed for {serverPath} ({kind}): {ex.Message}");
+        }
     }
 
     public void Unmount()

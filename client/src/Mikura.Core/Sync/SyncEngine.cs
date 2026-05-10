@@ -17,12 +17,18 @@ public sealed class SyncEngine
     private readonly ServerBackend _backend;
     private readonly string _mountPoint;
     private readonly string _deviceId;
+    private readonly Action<string, ExternalChangeKind>? _notifyKernelCache;
 
-    public SyncEngine(ServerBackend backend, string mountPoint, string deviceId)
+    public SyncEngine(
+        ServerBackend backend,
+        string mountPoint,
+        string deviceId,
+        Action<string, ExternalChangeKind>? notifyKernelCache = null)
     {
         _backend = backend;
         _mountPoint = mountPoint;
         _deviceId = deviceId;
+        _notifyKernelCache = notifyKernelCache;
     }
 
     /// <summary>
@@ -65,6 +71,14 @@ public sealed class SyncEngine
                 var isDirectory = evt.Type == "directory";
                 _backend.ApplyExternalEvent(evt.Event, evt.Path, evt.Size, lastModified, isDirectory);
 
+                // FlushAndPurgeOnCleanup=false で温存している kernel data cache を、
+                // 他端末由来の mutation の通知を機に明示 invalidate する。これを
+                // 入れないと、別 client が同 path を書き換えても自端末の Explorer
+                // が古い byte を返し続ける可能性がある。
+                _notifyKernelCache?.Invoke(
+                    evt.Path,
+                    evt.Event == "created" ? ExternalChangeKind.Created : ExternalChangeKind.Modified);
+
                 // Nudge Explorer to re-enumerate the affected directory so the
                 // change appears without F5. WinFsp itself flushes its file info
                 // cache (FileInfoTimeout=0), but the Shell view is independent.
@@ -79,6 +93,7 @@ public sealed class SyncEngine
                 var existed = _backend.ApplyExternalEvent(
                     "deleted", evt.Path, size: 0, DateTime.UtcNow, isDirectory: false);
                 if (!existed) break;
+                _notifyKernelCache?.Invoke(evt.Path, ExternalChangeKind.Deleted);
                 Shell.NotifyDelete(ToLocalPath(evt.Path), isDirectory: false);
                 break;
             }

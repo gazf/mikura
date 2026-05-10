@@ -114,7 +114,8 @@ public sealed class TrayAppContext : ApplicationContext
             _mountPoint = _fsHost.Mount(_settings.SyncRootPath);
             Trace.WriteLine($"Mounted at {_mountPoint}");
 
-            _syncEngine = new SyncEngine(_backend, _mountPoint, _deviceId);
+            _syncEngine = new SyncEngine(_backend, _mountPoint, _deviceId,
+                notifyKernelCache: _fsHost.NotifyExternalChange);
             _eventLoopCts = new CancellationTokenSource();
             _ = RunEventLoopWithReconnectAsync(_eventLoopCts.Token);
 
@@ -285,7 +286,8 @@ public sealed class TrayAppContext : ApplicationContext
             _fsHost = new BackendFileSystemHost(_backend, _onlineGate);
             _mountPoint = _fsHost.Mount(_settings.SyncRootPath);
 
-            _syncEngine = new SyncEngine(_backend, _mountPoint, _deviceId!);
+            _syncEngine = new SyncEngine(_backend, _mountPoint, _deviceId!,
+                notifyKernelCache: _fsHost.NotifyExternalChange);
             _eventLoopCts = new CancellationTokenSource();
             _ = RunEventLoopWithReconnectAsync(_eventLoopCts.Token);
 
