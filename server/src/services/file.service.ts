@@ -114,6 +114,35 @@ export async function getFileInfo(
   }
 }
 
+/**
+ * 指定 byte 数を受信し終わった時点で upstream を terminate する TransformStream。
+ * Range 指定 (= 末尾までではなく途中で打ち切りたい) の readFile で使う。
+ * pipeThrough 上で terminate すると upstream の file.readable が cancel され、
+ * 結果として fd も閉じられる (Deno の resource lifecycle 規約)。
+ */
+function takeBytes(
+  maxBytes: number,
+): TransformStream<Uint8Array, Uint8Array> {
+  let consumed = 0;
+  return new TransformStream({
+    transform(chunk, controller) {
+      const remaining = maxBytes - consumed;
+      if (remaining <= 0) {
+        controller.terminate();
+        return;
+      }
+      if (chunk.length <= remaining) {
+        consumed += chunk.length;
+        controller.enqueue(chunk);
+      } else {
+        consumed += remaining;
+        controller.enqueue(chunk.subarray(0, remaining));
+        controller.terminate();
+      }
+    },
+  });
+}
+
 export async function readFile(
   relativePath: string,
   offset?: number,
@@ -144,33 +173,15 @@ export async function readFile(
   }
 
   const actualLength = length ?? totalSize - (offset ?? 0);
+  const remainingFromOffset = totalSize - (offset ?? 0);
 
-  let bytesRead = 0;
-  const stream = new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      const remaining = actualLength - bytesRead;
-      if (remaining <= 0) {
-        controller.close();
-        file.close();
-        return;
-      }
-
-      const chunkSize = Math.min(65536, remaining);
-      const buf = new Uint8Array(chunkSize);
-      const n = await file.read(buf);
-      if (n === null || n === 0) {
-        controller.close();
-        file.close();
-        return;
-      }
-
-      bytesRead += n;
-      controller.enqueue(buf.subarray(0, n));
-    },
-    cancel() {
-      file.close();
-    },
-  });
+  // file.readable は Deno 内部で chunk size / buffer reuse / fd の lifecycle を
+  // 管理してくれる。Range なし (= 末尾まで) なら直接、Range 指定なら
+  // takeBytes で打ち切る。stream が終わる / cancel される / 上限到達で
+  // terminate される、いずれの経路でも fd は Deno が close する。
+  const stream = actualLength >= remainingFromOffset
+    ? file.readable
+    : file.readable.pipeThrough(takeBytes(actualLength));
 
   return { stream, size: totalSize };
 }
