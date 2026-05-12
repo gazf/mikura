@@ -18,4 +18,13 @@
     <ProjectReference Include="..\WinFsp.Interop\WinFsp.Interop.csproj" />
   </ItemGroup>
 
+  <!--
+    Build 毎に古い実行時 log を消す。実行時にしか書かれないファイルなので
+    Clean target には乗せず Build の前段で消すだけ。AppendMode の追記が
+    肥大化して読みづらくなる + LLM の context を浪費するのを防ぐ目的。
+  -->
+  <Target Name="ClearRuntimeLog" BeforeTargets="Build">
+    <Delete Files="$(OutDir)mikura-client.log" ContinueOnError="true" />
+  </Target>
+
 </Project>
