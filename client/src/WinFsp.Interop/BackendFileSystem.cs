@@ -35,19 +35,25 @@ public sealed class BackendFileSystem : FileSystemBase
     /// <summary>STATUS_OBJECT_NAME_NOT_FOUND の数値定数。Open での 404 マッピング用。</summary>
     private const int StatusObjectNotFound = unchecked((int)0xC0000034);
 
-    /// <summary>
-    /// per-IRP の Marshal.Copy 中継バッファ専用 pool。
-    /// ArrayPool&lt;byte&gt;.Shared を使うとプロセス全体で per-CPU stack がリテンション
-    /// を効かせていて、handle close 後も大きな byte[] を握り続ける挙動が観測された
-    /// (実機: 数十 MB のファイル copy で常駐メモリが数倍に膨らむ)。サイズと
-    /// retention を絞った dedicated pool にすることで idle 時のメモリを bound する。
-    /// </summary>
-    private static readonly ArrayPool<byte> _ioPool =
-        ArrayPool<byte>.Create(maxArrayLength: 4 * 1024 * 1024, maxArraysPerBucket: 4);
-
     private readonly IFileSystemBackend _backend;
     private readonly OnlineGate _gate;
     private readonly DateTime _createdAt = DateTime.UtcNow;
+
+    /// <summary>STATUS_PENDING — async response パターンで callback を保留する。</summary>
+    private const int StatusPending = 0x00000103;
+
+    /// <summary>
+    /// SendReadResponse / SendWriteResponse / Notify を呼ぶために Mounted で
+    /// 受け取った host を保持する。Unmounted で null クリア。
+    /// </summary>
+    private FileSystemHost? _host;
+
+    // [spike] kernel Cache Manager がこの FS にどれだけ並列 IRP を投げてくるかの観測用。
+    // STATUS_PENDING 化前は ~2 が天井という観測。本 spike で増えるかを peak 値で見る。
+    private int _readInFlight;
+    private int _writeInFlight;
+    private int _maxReadInFlight;
+    private int _maxWriteInFlight;
 
     public BackendFileSystem(IFileSystemBackend backend, OnlineGate gate)
     {
@@ -61,7 +67,7 @@ public sealed class BackendFileSystem : FileSystemBase
         host.SectorSize = AllocationUnit;
         host.SectorsPerAllocationUnit = 1;
         host.MaxComponentLength = 255;
-        host.FileInfoTimeout = 1000;
+        host.FileInfoTimeout = 1500;
         host.CaseSensitiveSearch = false;
         host.CasePreservedNames = true;
         host.UnicodeOnDisk = true;
@@ -90,6 +96,21 @@ public sealed class BackendFileSystem : FileSystemBase
         // (TrayAppContext.StartAsync) is responsible for awaiting initialization
         // before calling Mount.
         return STATUS_SUCCESS;
+    }
+
+    /// <summary>
+    /// Mount 成功後に kernel 側へ NotifyBegin/SendReadResponse 等を呼べる状態になる。
+    /// Init 時点では host 参照は volume params 設定用途で、kernel 側 API は未稼働。
+    /// </summary>
+    public override int Mounted(object host0)
+    {
+        _host = (FileSystemHost)host0;
+        return STATUS_SUCCESS;
+    }
+
+    public override void Unmounted(object host0)
+    {
+        _host = null;
     }
 
     public override int GetVolumeInfo(out VolumeInfo info)
@@ -238,34 +259,61 @@ public sealed class BackendFileSystem : FileSystemBase
         var handle = (IFileHandle)fileDesc0;
         if (handle.IsDirectory) return STATUS_INVALID_DEVICE_REQUEST;
 
-        // Marshalling buffer rented from ArrayPool to keep per-IRP allocation
-        // pressure off the GC. Critical for large file copies (10 MB / 64 KB
-        // chunks = 160 reads — without pooling each one is a fresh byte[]).
-        var pooled = _ioPool.Rent((int)length);
+        // [spike] async response: callback は hint を取って即 StatusPending を返し、実 I/O は
+        // ProcessReadAsync が WinFsp dispatch thread 上で sync 部分を進めた後、最初の await
+        // (HTTP send) で yield する → dispatch thread は次の IRP に進める。
+        // 旧版は Task.Run で ThreadPool に明示 hop してたが、最初の await まで dispatch
+        // thread を借りるだけで済むので 1 段省略。Task / closure alloc も async state machine
+        // 1 つに集約される。
+        var hint = _host!.GetOperationRequestHint();
+        _ = ProcessReadAsync(hint, buffer, (int)length, (long)offset, handle);
+        return StatusPending;
+    }
+
+    /// <summary>
+    /// [spike A] memcpy 削減: IRP buffer (unmanaged IntPtr) を UnmanagedMemoryManager で
+    /// Memory&lt;byte&gt; として wrap し、ServerBackend.ReadAsync が直接書き込む。
+    /// 寿命: SendReadResponse 呼び出しまでに mgr を Dispose する順序を厳守。
+    /// </summary>
+    private async Task ProcessReadAsync(
+        ulong hint, IntPtr buffer, int length, long offset, IFileHandle handle)
+    {
+        var inFlight = System.Threading.Interlocked.Increment(ref _readInFlight);
+        UpdateMaxIfHigher(ref _maxReadInFlight, inFlight, "read");
+        int status = STATUS_SUCCESS;
+        int bytesRead = 0;
         try
         {
-            var bytesRead = _backend.ReadAsync(handle, (long)offset, pooled.AsMemory(0, (int)length))
-                .GetAwaiter().GetResult();
-            if (bytesRead <= 0) return STATUS_END_OF_FILE;
-            Marshal.Copy(pooled, 0, buffer, bytesRead);
-            pBytesTransferred = (uint)bytesRead;
-            return STATUS_SUCCESS;
-        }
-        catch (FileNotFoundException ex)
-        {
-            System.Diagnostics.Trace.WriteLine($"[ERROR] Read 404: {handle.Path}: {ex.Message}");
-            return StatusObjectNotFound;
-        }
-        catch (Exception ex)
-        {
-            // backend / transport が投げた例外を WinFsp に漏らさないことが目的。
-            // 漏らすとデバッガで unhandled になる + WinFsp 側の挙動が不定。
-            System.Diagnostics.Trace.WriteLine($"[ERROR] Read failed: {handle.Path} @{offset}+{length}: {ex.GetType().Name}: {ex.Message}");
-            return StatusUnexpectedIoError;
+            using var mgr = new UnmanagedMemoryManager(buffer, length);
+            try
+            {
+                bytesRead = await _backend.ReadAsync(handle, offset, mgr.Memory)
+                    .ConfigureAwait(false);
+            }
+            catch (FileNotFoundException ex)
+            {
+                System.Diagnostics.Trace.WriteLine($"[ERROR] Read 404: {handle.Path}: {ex.Message}");
+                status = StatusObjectNotFound;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"[ERROR] Read failed: {handle.Path} @{offset}+{length}: {ex.GetType().Name}: {ex.Message}");
+                status = StatusUnexpectedIoError;
+            }
+
+            if (status == STATUS_SUCCESS && bytesRead <= 0)
+            {
+                status = STATUS_END_OF_FILE;
+                bytesRead = 0;
+            }
         }
         finally
         {
-            _ioPool.Return(pooled);
+            // mgr は using で既に Dispose 済み。SendReadResponse は IRP buffer への
+            // 書き込みが完了し、Memory wrap も解除された後に呼ぶ。
+            _host!.SendReadResponse(hint, status, status == STATUS_SUCCESS ? (uint)bytesRead : 0);
+            System.Threading.Interlocked.Decrement(ref _readInFlight);
         }
     }
 
@@ -287,30 +335,71 @@ public sealed class BackendFileSystem : FileSystemBase
         var handle = (IFileHandle)fileDesc0;
         if (handle.IsDirectory) return STATUS_INVALID_DEVICE_REQUEST;
 
-        var pooled = _ioPool.Rent((int)length);
+        // Read と同じパターン: hint だけ取って StatusPending を返し、実 I/O は
+        // ProcessWriteAsync。Task.Run の dispatch hop を省略する。
+        var hint = _host!.GetOperationRequestHint();
+        _ = ProcessWriteAsync(hint, buffer, (int)length, (long)offset,
+            writeToEndOfFile, constrainedIo, handle);
+        return StatusPending;
+    }
+
+    /// <summary>
+    /// [spike A] memcpy 削減: IRP buffer (unmanaged IntPtr) を UnmanagedMemoryManager で
+    /// ReadOnlyMemory&lt;byte&gt; として wrap し、ServerBackend.WriteAsync が直接読み出す。
+    /// 寿命: SendWriteResponse まで mgr は alive を保つ。
+    /// </summary>
+    private async Task ProcessWriteAsync(
+        ulong hint, IntPtr buffer, int length, long offset,
+        bool writeToEnd, bool constrainedIo, IFileHandle handle)
+    {
+        var inFlight = System.Threading.Interlocked.Increment(ref _writeInFlight);
+        UpdateMaxIfHigher(ref _maxWriteInFlight, inFlight, "write");
+        int status = STATUS_SUCCESS;
+        FileInfo infoOut = default;
         try
         {
-            Marshal.Copy(buffer, pooled, 0, (int)length);
-            _backend.WriteAsync(handle, (long)offset, pooled.AsMemory(0, (int)length), writeToEndOfFile, constrainedIo)
-                .GetAwaiter().GetResult();
-            pBytesTransferred = length;
-            FillFileInfo(handle.Entry, out fileInfo);
-            return STATUS_SUCCESS;
-        }
-        catch (UnauthorizedAccessException ex)
-        {
-            System.Diagnostics.Trace.WriteLine($"[ERROR] Write denied: {handle.Path}: {ex.Message}");
-            return STATUS_ACCESS_DENIED;
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Trace.WriteLine($"[ERROR] Write failed: {handle.Path} @{offset}+{length}: {ex.GetType().Name}: {ex.Message}");
-            return StatusUnexpectedIoError;
+            using var mgr = new UnmanagedMemoryManager(buffer, length);
+            try
+            {
+                await _backend.WriteAsync(
+                    handle, offset, mgr.Memory, writeToEnd, constrainedIo)
+                    .ConfigureAwait(false);
+                FillFileInfo(handle.Entry, out infoOut);
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                System.Diagnostics.Trace.WriteLine($"[ERROR] Write denied: {handle.Path}: {ex.Message}");
+                status = STATUS_ACCESS_DENIED;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"[ERROR] Write failed: {handle.Path} @{offset}+{length}: {ex.GetType().Name}: {ex.Message}");
+                status = StatusUnexpectedIoError;
+            }
         }
         finally
         {
-            _ioPool.Return(pooled);
+            // mgr は using で既に Dispose 済み。SendWriteResponse は HTTP body 送信完了後。
+            _host!.SendWriteResponse(hint, status,
+                status == STATUS_SUCCESS ? (uint)length : 0, ref infoOut);
+            System.Threading.Interlocked.Decrement(ref _writeInFlight);
         }
+    }
+
+    /// <summary>
+    /// [spike] in-flight counter の peak 値を atomic に更新。新しい peak を踏んだ
+    /// 時だけ Trace に流す (= Q32 で 2 を超える瞬間を log で見たい)。
+    /// </summary>
+    private static void UpdateMaxIfHigher(ref int max, int candidate, string label)
+    {
+        int prev;
+        do
+        {
+            prev = max;
+            if (candidate <= prev) return;
+        } while (System.Threading.Interlocked.CompareExchange(ref max, candidate, prev) != prev);
+        System.Diagnostics.Trace.WriteLine($"[spike] new max in-flight {label}: {candidate}");
     }
 
     public override int GetFileInfo(object fileNode, object fileDesc0, out FileInfo fileInfo)

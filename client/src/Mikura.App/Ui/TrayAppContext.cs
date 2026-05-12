@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Windows.Forms;
 using Mikura.App.Config;
@@ -86,14 +87,10 @@ public sealed class TrayAppContext : ApplicationContext
             // Http1Connection 内部に _writeBuffer / _readBuffer (ArrayBuffer)
             // を持ち、4MB チャンクの PATCH を流すたびにそれらが auto-grow して
             // 巨大なまま (実機: 複数 connection × 数十 MB ≈ 100MB 超) 居座る。
-            // chunked upload 8 並列 + WSS + その他で MaxConnections を 16 に絞り、
+            // chunked upload 4 並列 + WSS + その他で MaxConnections を 8 に絞り、
             // 短めの lifetime で循環させて、接続側のメモリを bound する。
             var handler = new SocketsHttpHandler
             {
-                // Http1Connection の _writeBuffer は過去の最大送信サイズで auto-grow
-                // して縮まないため、connection を短命にして頻繁に張り直すことで
-                // 常駐メモリを bound する。chunked upload (N=4) + WSS + ad-hoc で
-                // 6 connection あれば足りる。
                 PooledConnectionLifetime = TimeSpan.FromMinutes(1),
                 PooledConnectionIdleTimeout = TimeSpan.FromSeconds(15),
                 MaxConnectionsPerServer = 8,
