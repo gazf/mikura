@@ -71,6 +71,15 @@ public class HttpServerApi(HttpClient http, string baseUrl) : IServerApi, IDispo
             var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
             return new ResponseOwningStream(stream, response);
         }
+        catch (ApiException ex) when (ex.StatusCode == 404)
+        {
+            // IServerApi 契約: 404 は FileNotFoundException として通知する。
+            // Excel save dance で rename された旧 temp path への stale read 等で
+            // 頻発するため、上位 (WinFsp.Interop) が STATUS_OBJECT_NAME_NOT_FOUND に
+            // マップして kernel の retry を止められるよう、専用例外に変換する。
+            response?.Dispose();
+            throw new FileNotFoundException(ex.Message, path);
+        }
         catch
         {
             response?.Dispose();

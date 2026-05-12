@@ -11,6 +11,8 @@ public interface IServerApi
     /// 指定 path / range の content を Stream として返す。Stream を Dispose
     /// (or DisposeAsync) すると、その下の HTTP response 等の所有資源も同時に
     /// 解放される (transport 実装側の責務)。
+    /// 対象 path が存在しない場合は <see cref="FileNotFoundException"/> を投げる
+    /// (transport-specific な 404 例外を呼び出し側で意識しなくて済むようにする)。
     /// </summary>
     Task<Stream> DownloadFileAsync(string path, long offset = 0, long length = -1, CancellationToken ct = default);
     Task<UploadResult> UploadFileAsync(string path, Stream content, CancellationToken ct = default);

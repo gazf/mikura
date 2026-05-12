@@ -35,6 +35,13 @@ public sealed class BackendFileSystem : FileSystemBase
     /// <summary>STATUS_OBJECT_NAME_NOT_FOUND の数値定数。Open での 404 マッピング用。</summary>
     private const int StatusObjectNotFound = unchecked((int)0xC0000034);
 
+    /// <summary>
+    /// STATUS_FILE_DELETED — handle に紐づくファイルが I/O 中に削除された。
+    /// Read 中に path が消えた場合(例: Excel save dance の temp rename)に返す。
+    /// kernel は handle を invalidate して retry をやめる。
+    /// </summary>
+    private const int StatusFileDeleted = unchecked((int)0xC0000123);
+
     private readonly IFileSystemBackend _backend;
     private readonly OnlineGate _gate;
     private readonly DateTime _createdAt = DateTime.UtcNow;
@@ -292,8 +299,14 @@ public sealed class BackendFileSystem : FileSystemBase
             }
             catch (FileNotFoundException ex)
             {
-                System.Diagnostics.Trace.WriteLine($"[ERROR] Read 404: {handle.Path}: {ex.Message}");
-                status = StatusObjectNotFound;
+                // Read 中に path が消えた(典型: Excel save dance で temp rename された)。
+                // STATUS_FILE_DELETED は「handle は valid だったが I/O 中に file が
+                // 削除された」を表す専用 status。kernel は handle を invalidate して
+                // retry をやめる。STATUS_END_OF_FILE は「EOF 到達で正常完了」と
+                // 解釈されてしまい、空の content を app に渡す副作用がある。
+                System.Diagnostics.Trace.WriteLine($"[INFO] Read on deleted path: {handle.Path}: {ex.Message}");
+                status = StatusFileDeleted;
+                bytesRead = 0;
             }
             catch (Exception ex)
             {
@@ -600,22 +613,31 @@ public sealed class BackendFileSystem : FileSystemBase
         info.LastAccessTime = (ulong)entry.LastWriteTimeUtc.ToFileTimeUtc();
         info.LastWriteTime = (ulong)entry.LastWriteTimeUtc.ToFileTimeUtc();
         info.ChangeTime = info.LastWriteTime;
-        info.IndexNumber = ComputeIndexNumber(entry.Path);
+        info.IndexNumber = ComputeIndexNumber(entry.Path, info.CreationTime);
         info.HardLinks = 1;
     }
 
-    private static ulong ComputeIndexNumber(ReadOnlySpan<char> path)
+    /// <summary>
+    /// path と creation time を混ぜた 64-bit ID。content-based ではないが、
+    /// 「同名で削除→再作成」を NTFS の MFT エントリ再割当てと同じく別 ID として扱う
+    /// (creation time が変わるため)。mtime mix と違って通常の編集では ID が変わらない。
+    /// rename で path が変われば ID も変わる(NTFS の MFT 永続性とは別物)が、
+    /// 業務 app の path-based 操作には十分。
+    /// </summary>
+    private static ulong ComputeIndexNumber(ReadOnlySpan<char> path, ulong creationTime)
     {
         const ulong prime1 = 0x9E3779B185EBCA87UL;
         const ulong prime2 = 0xC2B2AE3D27D4EB4FUL;
-        
+
         ReadOnlySpan<byte> data = MemoryMarshal.AsBytes(path);
         ref byte ptr = ref MemoryMarshal.GetReference(data);
         int len = data.Length;
-        
-        ulong hash = (ulong)len * prime1;
+
+        // path のサイズと creation time を初期値に混ぜる。同 path で生成時刻が
+        // 違う(削除→再作成)場合に異なる hash 開始点になる。
+        ulong hash = ((ulong)len * prime1) ^ (creationTime * prime2);
         int i = 0;
-        
+
         while (i + 8 <= len)
         {
             ulong k = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref ptr, i));
@@ -623,14 +645,14 @@ public sealed class BackendFileSystem : FileSystemBase
             hash = BitOperations.RotateLeft(hash, 31) * prime1;
             i += 8;
         }
-        
+
         while (i < len)
         {
             hash ^= (ulong)Unsafe.Add(ref ptr, i) * prime2;
             hash = BitOperations.RotateLeft(hash, 11) * prime1;
             i++;
         }
-        
+
         hash ^= hash >> 33;
         hash *= prime2;
         hash ^= hash >> 29;
