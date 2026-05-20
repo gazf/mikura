@@ -1,4 +1,5 @@
 using System.Net.Http.Headers;
+using System.Net.Http.Json;
 using System.Text.Json;
 using Mikura.Core.Abstractions;
 using Mikura.Core.Models;
@@ -27,8 +28,7 @@ public class HttpServerApi(HttpClient http, string baseUrl) : IServerApi, IDispo
         var url = $"{_baseUrl}/tree";
         using var response = await _http.GetAsync(url, ct).ConfigureAwait(false);
         await EnsureSuccess(response, ct).ConfigureAwait(false);
-        var json = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-        return JsonSerializer.Deserialize<List<TreeNode>>(json) ?? [];
+        return await response.Content.ReadFromJsonAsync(TransportJsonContext.Default.ListTreeNode, ct).ConfigureAwait(false) ?? [];
     }
 
     public async Task<IReadOnlyList<FileNode>> ListDirectoryAsync(string path, CancellationToken ct = default)
@@ -36,8 +36,7 @@ public class HttpServerApi(HttpClient http, string baseUrl) : IServerApi, IDispo
         var url = $"{_baseUrl}/files{NormalizePath(path)}";
         using var response = await _http.GetAsync(url, ct).ConfigureAwait(false);
         await EnsureSuccess(response, ct).ConfigureAwait(false);
-        var json = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-        return JsonSerializer.Deserialize<List<FileNode>>(json) ?? [];
+        return await response.Content.ReadFromJsonAsync(TransportJsonContext.Default.ListFileNode, ct).ConfigureAwait(false) ?? [];
     }
 
     public async Task<FileNode> GetFileInfoAsync(string path, CancellationToken ct = default)
@@ -45,8 +44,7 @@ public class HttpServerApi(HttpClient http, string baseUrl) : IServerApi, IDispo
         var url = $"{_baseUrl}/files{NormalizePath(path)}";
         using var response = await _http.GetAsync(url, ct).ConfigureAwait(false);
         await EnsureSuccess(response, ct).ConfigureAwait(false);
-        var json = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-        return JsonSerializer.Deserialize<FileNode>(json)
+        return await response.Content.ReadFromJsonAsync(TransportJsonContext.Default.FileNode, ct).ConfigureAwait(false)
             ?? throw new ApiException("Failed to parse response", 500);
     }
 
@@ -130,8 +128,7 @@ public class HttpServerApi(HttpClient http, string baseUrl) : IServerApi, IDispo
         streamContent.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
         using var response = await _http.PutAsync(url, streamContent, ct).ConfigureAwait(false);
         await EnsureSuccess(response, ct).ConfigureAwait(false);
-        var json = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-        return JsonSerializer.Deserialize<UploadResult>(json)
+        return await response.Content.ReadFromJsonAsync(TransportJsonContext.Default.UploadResult, ct).ConfigureAwait(false)
             ?? throw new ApiException("Failed to parse upload response", 500);
     }
 
@@ -155,12 +152,11 @@ public class HttpServerApi(HttpClient http, string baseUrl) : IServerApi, IDispo
     public async Task RenameAsync(string oldPath, string newPath, CancellationToken ct = default)
     {
         var url = $"{_baseUrl}/files{NormalizePath(oldPath)}";
-        var body = JsonSerializer.Serialize(new { newPath = NormalizePath(newPath) });
-        using var request = new HttpRequestMessage(HttpMethod.Patch, url)
-        {
-            Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json"),
-        };
-        using var response = await _http.SendAsync(request, ct).ConfigureAwait(false);
+        using var response = await _http.PatchAsJsonAsync(
+            url,
+            new RenameRequest(NormalizePath(newPath)),
+            TransportJsonContext.Default.RenameRequest,
+            ct).ConfigureAwait(false);
         await EnsureSuccess(response, ct).ConfigureAwait(false);
     }
 
@@ -171,8 +167,7 @@ public class HttpServerApi(HttpClient http, string baseUrl) : IServerApi, IDispo
         // 他ユーザーが保持中は HTTP 409 → 例外ではなく null で返す (呼び出し側でハンドル)
         if ((int)response.StatusCode == 409) return null;
         await EnsureSuccess(response, ct).ConfigureAwait(false);
-        var json = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-        return JsonSerializer.Deserialize<LockInfo>(json);
+        return await response.Content.ReadFromJsonAsync(TransportJsonContext.Default.LockInfo, ct).ConfigureAwait(false);
     }
 
     public async Task ReleaseLockAsync(string path, CancellationToken ct = default)
@@ -187,24 +182,20 @@ public class HttpServerApi(HttpClient http, string baseUrl) : IServerApi, IDispo
         var url = $"{_baseUrl}/volume";
         using var response = await _http.GetAsync(url, ct).ConfigureAwait(false);
         await EnsureSuccess(response, ct).ConfigureAwait(false);
-        var json = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-        return JsonSerializer.Deserialize<VolumeStats>(json)
+        return await response.Content.ReadFromJsonAsync(TransportJsonContext.Default.VolumeStats, ct).ConfigureAwait(false)
             ?? throw new ApiException("Failed to parse volume stats", 500);
     }
 
     public async Task<string> StartUploadAsync(string path, bool baseFromExisting, CancellationToken ct = default)
     {
         var url = $"{_baseUrl}/uploads";
-        var body = JsonSerializer.Serialize(new
-        {
-            path = NormalizePath(path),
-            baseFromExisting,
-        });
-        using var content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
-        using var response = await _http.PostAsync(url, content, ct).ConfigureAwait(false);
+        using var response = await _http.PostAsJsonAsync(
+            url,
+            new StartUploadRequest(NormalizePath(path), baseFromExisting),
+            TransportJsonContext.Default.StartUploadRequest,
+            ct).ConfigureAwait(false);
         await EnsureSuccess(response, ct).ConfigureAwait(false);
-        var json = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-        var result = JsonSerializer.Deserialize<StartUploadResponse>(json)
+        var result = await response.Content.ReadFromJsonAsync(TransportJsonContext.Default.StartUploadResponse, ct).ConfigureAwait(false)
             ?? throw new ApiException("Failed to parse start-upload response", 500);
         return result.UploadId;
     }
@@ -231,12 +222,13 @@ public class HttpServerApi(HttpClient http, string baseUrl) : IServerApi, IDispo
     public async Task<UploadResult> FinalizeUploadAsync(string uploadId, long finalSize, CancellationToken ct = default)
     {
         var url = $"{_baseUrl}/uploads/{uploadId}/finalize";
-        var body = JsonSerializer.Serialize(new { size = finalSize });
-        using var content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
-        using var response = await _http.PostAsync(url, content, ct).ConfigureAwait(false);
+        using var response = await _http.PostAsJsonAsync(
+            url,
+            new FinalizeRequest(finalSize),
+            TransportJsonContext.Default.FinalizeRequest,
+            ct).ConfigureAwait(false);
         await EnsureSuccess(response, ct).ConfigureAwait(false);
-        var json = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-        return JsonSerializer.Deserialize<UploadResult>(json)
+        return await response.Content.ReadFromJsonAsync(TransportJsonContext.Default.UploadResult, ct).ConfigureAwait(false)
             ?? throw new ApiException("Failed to parse finalize response", 500);
     }
 
@@ -248,11 +240,6 @@ public class HttpServerApi(HttpClient http, string baseUrl) : IServerApi, IDispo
         if ((int)response.StatusCode == 404) return;
         await EnsureSuccess(response, ct).ConfigureAwait(false);
     }
-
-    private sealed record StartUploadResponse(
-        [property: System.Text.Json.Serialization.JsonPropertyName("uploadId")] string UploadId,
-        [property: System.Text.Json.Serialization.JsonPropertyName("path")] string Path
-    );
 
     private static string NormalizePath(string path)
     {
@@ -270,7 +257,7 @@ public class HttpServerApi(HttpClient http, string baseUrl) : IServerApi, IDispo
             string message;
             try
             {
-                var error = JsonSerializer.Deserialize<ErrorResponse>(body);
+                var error = JsonSerializer.Deserialize(body, TransportJsonContext.Default.ErrorResponse);
                 message = error?.Message ?? body;
             }
             catch
