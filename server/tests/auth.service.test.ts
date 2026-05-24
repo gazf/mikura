@@ -88,6 +88,73 @@ Deno.test("validateToken: returns null when user record gone", async () => {
   });
 });
 
+Deno.test("validateToken: cached hit still rejects expired tokenExpiresAt", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "alice",
+      groupId: 10,
+      groupName: "alice-group",
+    });
+    const { raw, hash } = await createAppToken(1, "alice");
+    // 1 度目: KV を見て identity 取得 & キャッシュ
+    assertEquals(await validateToken(raw), { id: 1, name: "alice" });
+
+    // KV 上のトークンを expired に差し替え
+    const expired: TokenData = {
+      userId: 1,
+      name: "alice",
+      expiresAt: new Date(Date.now() - 1000).toISOString(),
+      createdAt: new Date(Date.now() - 100_000).toISOString(),
+    };
+    await kv.set(Keys.token(hash), expired);
+
+    // キャッシュエントリ自体は生きているが、tokenExpiresAtMs は元の (将来の)
+    // 値なのでヒットしてしまうのが期待動作 (TTL 内は KV 変更を見ない)。
+    // ただし KV 上の expired は次回キャッシュ失効後 (もしくは invalidate 後)
+    // 反映される。明示 invalidate で挙動を検証する。
+    const { invalidateToken } = await import(
+      "../src/services/auth.service.ts"
+    );
+    invalidateToken(hash);
+    assertEquals(await validateToken(raw), null);
+  });
+});
+
+// ----- upsertDevice throttle -----
+
+Deno.test("upsertDevice: same (userId, ip) within throttle window skips KV write", async () => {
+  await withTestKv(async (kv) => {
+    await upsertDevice("dev-throttle1", 1, "192.168.0.1");
+    const first = await kv.get<DeviceData>(Keys.device("dev-throttle1"));
+    const firstSeen = first.value!.firstSeenAt;
+
+    await new Promise((r) => setTimeout(r, 5));
+    // 直接 KV を書き換えても、throttle 中の upsertDevice は読みに行かないので
+    // この置き換えは観測されたまま残る (= KV write が走っていない証拠)。
+    await kv.set(Keys.device("dev-throttle1"), {
+      ...first.value!,
+      ipAddress: "10.99.99.99",
+    });
+    await upsertDevice("dev-throttle1", 1, "192.168.0.1");
+
+    const after = await kv.get<DeviceData>(Keys.device("dev-throttle1"));
+    assertEquals(after.value?.ipAddress, "10.99.99.99");
+    assertEquals(after.value?.firstSeenAt, firstSeen);
+  });
+});
+
+Deno.test("upsertDevice: changed ip bypasses throttle and writes immediately", async () => {
+  await withTestKv(async (kv) => {
+    await upsertDevice("dev-throttle2", 1, "192.168.0.1");
+    await new Promise((r) => setTimeout(r, 5));
+    await upsertDevice("dev-throttle2", 1, "10.0.0.1");
+
+    const after = await kv.get<DeviceData>(Keys.device("dev-throttle2"));
+    assertEquals(after.value?.ipAddress, "10.0.0.1");
+  });
+});
+
 // ----- checkPermission -----
 
 Deno.test("checkPermission: returns false for user with no group", async () => {

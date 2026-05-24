@@ -33,27 +33,107 @@ export interface AuthUser extends TokenIdentity {
   deviceId: string;
 }
 
+// ----- in-memory caches -----
+//
+// validateToken は全リクエストで呼ばれるが、トークンの内容はそうそう変わらない
+// (mikura 現状では revoke API も無く、expiresAt はデフォルト 365 日)。
+// 60 秒キャッシュで KV 2 ops × 全 request を抑える。
+//
+// 防御策:
+//   - エントリに本物の expiresAt を焼き込み、ヒット時に毎回チェック (キャッシュ
+//     寿命内に切れた場合も即弾く)
+//   - bounded LRU (TOKEN_CACHE_MAX) で悪意ある急増を抑える
+//   - negative cache は持たない (失敗は KV 直撃)
+//   - invalidateToken() で外部から個別に追い出せる (将来 revoke 用)
+const TOKEN_CACHE_TTL_MS = 60 * 1000;
+const TOKEN_CACHE_MAX = 1024;
+
+interface CachedToken {
+  identity: TokenIdentity;
+  tokenExpiresAtMs: number;
+  cacheUntilMs: number;
+}
+
+const tokenCache = new Map<string, CachedToken>();
+
+function tokenCacheTouch(hash: string): CachedToken | undefined {
+  const e = tokenCache.get(hash);
+  if (!e) return undefined;
+  // LRU recency: re-insert to move to the end.
+  tokenCache.delete(hash);
+  tokenCache.set(hash, e);
+  return e;
+}
+
+function tokenCachePut(hash: string, entry: CachedToken): void {
+  tokenCache.delete(hash);
+  tokenCache.set(hash, entry);
+  if (tokenCache.size > TOKEN_CACHE_MAX) {
+    const oldest = tokenCache.keys().next().value;
+    if (oldest !== undefined) tokenCache.delete(oldest);
+  }
+}
+
+/**
+ * 将来 token revoke API が入った場合のフック。今は呼び出し元なし。
+ */
+export function invalidateToken(tokenHash: string): void {
+  tokenCache.delete(tokenHash);
+}
+
+// upsertDevice の lastSeenAt 更新は診断情報。30 秒に 1 回で十分。
+// (userId, ipAddress) のいずれかが変わったら throttle を破って即書き込む。
+const DEVICE_UPSERT_THROTTLE_MS = 30 * 1000;
+
+interface DeviceUpsertCacheEntry {
+  userId: number;
+  ipAddress?: string;
+  atMs: number;
+}
+
+const deviceUpsertCache = new Map<string, DeviceUpsertCacheEntry>();
+
+/**
+ * テスト間でモジュールレベル cache を漏らさないためのリセット。
+ * `_helpers.ts` の withTestKv から呼ばれる。
+ */
+export function _resetAuthCachesForTesting(): void {
+  tokenCache.clear();
+  deviceUpsertCache.clear();
+}
+
 export async function upsertDevice(
   deviceId: string,
   userId: number,
   ipAddress?: string,
 ): Promise<void> {
+  const now = Date.now();
+  const last = deviceUpsertCache.get(deviceId);
+  if (
+    last !== undefined &&
+    last.userId === userId &&
+    last.ipAddress === ipAddress &&
+    now - last.atMs < DEVICE_UPSERT_THROTTLE_MS
+  ) {
+    return;
+  }
+
   const kv = await getKv();
-  const now = new Date().toISOString();
+  const nowIso = new Date(now).toISOString();
   const existing = await kv.get<DeviceData>(Keys.device(deviceId));
 
   const device: DeviceData = existing.value
     ? {
       ...existing.value,
       userId,
-      lastSeenAt: now,
+      lastSeenAt: nowIso,
       ipAddress,
     }
     : {
       deviceId,
       userId,
-      firstSeenAt: now,
-      lastSeenAt: now,
+      firstSeenAt: nowIso,
+      lastSeenAt: nowIso,
       ipAddress,
     };
 
@@ -62,27 +142,59 @@ export async function upsertDevice(
     .set(Keys.device(deviceId), device)
     .set(Keys.deviceByUser(userId, deviceId), true)
     .commit();
+
+  deviceUpsertCache.set(deviceId, { userId, ipAddress, atMs: now });
 }
 
 export async function validateToken(
   rawToken: string,
 ): Promise<TokenIdentity | null> {
+  const hash = await hashToken(rawToken);
+  const now = Date.now();
+
+  const cached = tokenCacheTouch(hash);
+  if (cached) {
+    // 本物の expiresAt はキャッシュ寿命より優先 (TTL 内に切れたら即弾く)。
+    if (cached.tokenExpiresAtMs < now) {
+      tokenCache.delete(hash);
+      return null;
+    }
+    if (cached.cacheUntilMs > now) {
+      return cached.identity;
+    }
+    // 寿命切れ: KV で再検証 (cache は下で put し直す)
+  }
+
   const kv = await getKv();
-  const tokenHash = await hashToken(rawToken);
-  const entry = await kv.get<TokenData>(Keys.token(tokenHash));
-  if (!entry.value) return null;
+  const entry = await kv.get<TokenData>(Keys.token(hash));
+  if (!entry.value) {
+    tokenCache.delete(hash);
+    return null;
+  }
 
   const tokenData = entry.value;
-
-  // Check expiry
-  if (new Date(tokenData.expiresAt) < new Date()) {
+  const tokenExpiresAtMs = new Date(tokenData.expiresAt).getTime();
+  if (tokenExpiresAtMs < now) {
+    tokenCache.delete(hash);
     return null;
   }
 
   const user = await kv.get<User>(Keys.user(tokenData.userId));
-  if (!user.value) return null;
+  if (!user.value) {
+    tokenCache.delete(hash);
+    return null;
+  }
 
-  return { id: user.value.id, name: user.value.name };
+  const identity: TokenIdentity = {
+    id: user.value.id,
+    name: user.value.name,
+  };
+  tokenCachePut(hash, {
+    identity,
+    tokenExpiresAtMs,
+    cacheUntilMs: now + TOKEN_CACHE_TTL_MS,
+  });
+  return identity;
 }
 
 export async function createAppToken(
