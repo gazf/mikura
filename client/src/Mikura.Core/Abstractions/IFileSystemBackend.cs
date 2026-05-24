@@ -91,6 +91,23 @@ public interface IFileHandle : IDisposable
 
     /// <summary>Current authoritative metadata. Mutated by Write/SetSize/etc.</summary>
     FileEntry Entry { get; }
+
+    /// <summary>
+    /// Per-handle in-flight I/O トラッカ。WinFsp の async response パターンで
+    /// Read/Write callback が STATUS_PENDING を返した後の継続処理を Cleanup から
+    /// 待ち合わせるために使う。
+    /// <para>使い方: Read/Write 完了経路(SendReadResponse / SendWriteResponse の直前
+    /// finally)で返却された <see cref="IDisposable"/> を Dispose することで counter を
+    /// 減らす。<see cref="DrainInFlightAsync"/> は counter が 0 になるまで await する。</para>
+    /// </summary>
+    IDisposable EnterIo();
+
+    /// <summary>
+    /// 当 handle で <see cref="EnterIo"/> された全 I/O が完了するまで await する。
+    /// Cleanup 経路から呼んで、async dispatch された Read/Write の完了を保証してから
+    /// session の finalize / lock 解放に進む。
+    /// </summary>
+    Task DrainInFlightAsync(CancellationToken ct = default);
 }
 
 public enum FileAccessIntent

@@ -42,25 +42,18 @@ public sealed class BackendFileSystem : FileSystemBase
     /// </summary>
     private const int StatusFileDeleted = unchecked((int)0xC0000123);
 
+    /// <summary>STATUS_PENDING — async response パターンで callback を保留する。</summary>
+    private const int StatusPending = 0x00000103;
+
     private readonly IFileSystemBackend _backend;
     private readonly OnlineGate _gate;
     private readonly DateTime _createdAt = DateTime.UtcNow;
 
-    /// <summary>STATUS_PENDING — async response パターンで callback を保留する。</summary>
-    private const int StatusPending = 0x00000103;
-
     /// <summary>
-    /// SendReadResponse / SendWriteResponse / Notify を呼ぶために Mounted で
-    /// 受け取った host を保持する。Unmounted で null クリア。
+    /// SendReadResponse / SendWriteResponse / Notify を呼ぶための host 参照。
+    /// Mount 完了後でないと kernel 側 API は使えないので Mounted callback で取得。
     /// </summary>
     private FileSystemHost? _host;
-
-    // [spike] kernel Cache Manager がこの FS にどれだけ並列 IRP を投げてくるかの観測用。
-    // STATUS_PENDING 化前は ~2 が天井という観測。本 spike で増えるかを peak 値で見る。
-    private int _readInFlight;
-    private int _writeInFlight;
-    private int _maxReadInFlight;
-    private int _maxWriteInFlight;
 
     public BackendFileSystem(IFileSystemBackend backend, OnlineGate gate)
     {
@@ -106,8 +99,8 @@ public sealed class BackendFileSystem : FileSystemBase
     }
 
     /// <summary>
-    /// Mount 成功後に kernel 側へ NotifyBegin/SendReadResponse 等を呼べる状態になる。
-    /// Init 時点では host 参照は volume params 設定用途で、kernel 側 API は未稼働。
+    /// Mount 成功後 = kernel 側 API (NotifyBegin 等) を呼べる状態。Init は VolumeParams
+    /// 設定専用で kernel 側 API は未稼働なので、host 参照はここで取る。
     /// </summary>
     public override int Mounted(object host0)
     {
@@ -266,27 +259,26 @@ public sealed class BackendFileSystem : FileSystemBase
         var handle = (IFileHandle)fileDesc0;
         if (handle.IsDirectory) return STATUS_INVALID_DEVICE_REQUEST;
 
-        // [spike] async response: callback は hint を取って即 StatusPending を返し、実 I/O は
-        // ProcessReadAsync が WinFsp dispatch thread 上で sync 部分を進めた後、最初の await
-        // (HTTP send) で yield する → dispatch thread は次の IRP に進める。
-        // 旧版は Task.Run で ThreadPool に明示 hop してたが、最初の await まで dispatch
-        // thread を借りるだけで済むので 1 段省略。Task / closure alloc も async state machine
-        // 1 つに集約される。
+        // async response: callback は hint を取って即 StatusPending を返す。実 I/O は
+        // ProcessReadAsync で進行、完了時に SendReadResponse で kernel に通知。
+        // race fix: handle.EnterIo() で in-flight counter を上げ、Cleanup は
+        // DrainInFlightAsync で counter ゼロまで待ち合わせる。
         var hint = _host!.GetOperationRequestHint();
-        _ = ProcessReadAsync(hint, buffer, (int)length, (long)offset, handle);
+        var ioToken = handle.EnterIo();
+        _ = ProcessReadAsync(hint, buffer, (int)length, (long)offset, handle, ioToken);
         return StatusPending;
     }
 
     /// <summary>
-    /// [spike A] memcpy 削減: IRP buffer (unmanaged IntPtr) を UnmanagedMemoryManager で
-    /// Memory&lt;byte&gt; として wrap し、ServerBackend.ReadAsync が直接書き込む。
-    /// 寿命: SendReadResponse 呼び出しまでに mgr を Dispose する順序を厳守。
+    /// IRP buffer (unmanaged IntPtr) を UnmanagedMemoryManager で Memory&lt;byte&gt; に
+    /// wrap して ServerBackend.ReadAsync が直接書き込む(中間 byte[] と Marshal.Copy
+    /// 廃止)。寿命: SendReadResponse 呼び出しまでに mgr を Dispose する順序を厳守。
+    /// ioToken は SendResponse 直後 finally で Dispose して in-flight counter を戻す。
     /// </summary>
     private async Task ProcessReadAsync(
-        ulong hint, IntPtr buffer, int length, long offset, IFileHandle handle)
+        ulong hint, IntPtr buffer, int length, long offset,
+        IFileHandle handle, IDisposable ioToken)
     {
-        var inFlight = System.Threading.Interlocked.Increment(ref _readInFlight);
-        UpdateMaxIfHigher(ref _maxReadInFlight, inFlight, "read");
         int status = STATUS_SUCCESS;
         int bytesRead = 0;
         try
@@ -299,11 +291,6 @@ public sealed class BackendFileSystem : FileSystemBase
             }
             catch (FileNotFoundException ex)
             {
-                // Read 中に path が消えた(典型: Excel save dance で temp rename された)。
-                // STATUS_FILE_DELETED は「handle は valid だったが I/O 中に file が
-                // 削除された」を表す専用 status。kernel は handle を invalidate して
-                // retry をやめる。STATUS_END_OF_FILE は「EOF 到達で正常完了」と
-                // 解釈されてしまい、空の content を app に渡す副作用がある。
                 System.Diagnostics.Trace.WriteLine($"[INFO] Read on deleted path: {handle.Path}: {ex.Message}");
                 status = StatusFileDeleted;
                 bytesRead = 0;
@@ -323,10 +310,10 @@ public sealed class BackendFileSystem : FileSystemBase
         }
         finally
         {
-            // mgr は using で既に Dispose 済み。SendReadResponse は IRP buffer への
-            // 書き込みが完了し、Memory wrap も解除された後に呼ぶ。
+            // mgr の Dispose は using により completed。SendReadResponse → ioToken Dispose
+            // の順で「kernel に応答 → Cleanup に handle 解放」を表現する。
             _host!.SendReadResponse(hint, status, status == STATUS_SUCCESS ? (uint)bytesRead : 0);
-            System.Threading.Interlocked.Decrement(ref _readInFlight);
+            ioToken.Dispose();
         }
     }
 
@@ -348,25 +335,23 @@ public sealed class BackendFileSystem : FileSystemBase
         var handle = (IFileHandle)fileDesc0;
         if (handle.IsDirectory) return STATUS_INVALID_DEVICE_REQUEST;
 
-        // Read と同じパターン: hint だけ取って StatusPending を返し、実 I/O は
-        // ProcessWriteAsync。Task.Run の dispatch hop を省略する。
+        // Read と同じ async response パターン。EnterIo で in-flight tracker に登録。
         var hint = _host!.GetOperationRequestHint();
+        var ioToken = handle.EnterIo();
         _ = ProcessWriteAsync(hint, buffer, (int)length, (long)offset,
-            writeToEndOfFile, constrainedIo, handle);
+            writeToEndOfFile, constrainedIo, handle, ioToken);
         return StatusPending;
     }
 
     /// <summary>
-    /// [spike A] memcpy 削減: IRP buffer (unmanaged IntPtr) を UnmanagedMemoryManager で
-    /// ReadOnlyMemory&lt;byte&gt; として wrap し、ServerBackend.WriteAsync が直接読み出す。
-    /// 寿命: SendWriteResponse まで mgr は alive を保つ。
+    /// IRP buffer を ReadOnlyMemory&lt;byte&gt; として wrap して ServerBackend.WriteAsync に
+    /// 直接読ませる。完了経路で SendWriteResponse(成功時は新 FileInfo を ref で返す)
+    /// → ioToken Dispose の順で WinFsp 応答と in-flight 解放を行う。
     /// </summary>
     private async Task ProcessWriteAsync(
         ulong hint, IntPtr buffer, int length, long offset,
-        bool writeToEnd, bool constrainedIo, IFileHandle handle)
+        bool writeToEnd, bool constrainedIo, IFileHandle handle, IDisposable ioToken)
     {
-        var inFlight = System.Threading.Interlocked.Increment(ref _writeInFlight);
-        UpdateMaxIfHigher(ref _maxWriteInFlight, inFlight, "write");
         int status = STATUS_SUCCESS;
         FileInfo infoOut = default;
         try
@@ -393,26 +378,10 @@ public sealed class BackendFileSystem : FileSystemBase
         }
         finally
         {
-            // mgr は using で既に Dispose 済み。SendWriteResponse は HTTP body 送信完了後。
             _host!.SendWriteResponse(hint, status,
                 status == STATUS_SUCCESS ? (uint)length : 0, ref infoOut);
-            System.Threading.Interlocked.Decrement(ref _writeInFlight);
+            ioToken.Dispose();
         }
-    }
-
-    /// <summary>
-    /// [spike] in-flight counter の peak 値を atomic に更新。新しい peak を踏んだ
-    /// 時だけ Trace に流す (= Q32 で 2 を超える瞬間を log で見たい)。
-    /// </summary>
-    private static void UpdateMaxIfHigher(ref int max, int candidate, string label)
-    {
-        int prev;
-        do
-        {
-            prev = max;
-            if (candidate <= prev) return;
-        } while (System.Threading.Interlocked.CompareExchange(ref max, candidate, prev) != prev);
-        System.Diagnostics.Trace.WriteLine($"[spike] new max in-flight {label}: {candidate}");
     }
 
     public override int GetFileInfo(object fileNode, object fileDesc0, out FileInfo fileInfo)

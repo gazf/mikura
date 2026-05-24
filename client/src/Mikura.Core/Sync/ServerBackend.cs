@@ -473,6 +473,12 @@ public sealed class ServerBackend : IFileSystemBackend
     {
         var h = (ServerHandle)handle;
 
+        // WinFsp の async response (STATUS_PENDING) で Read/Write callback が即 return
+        // した後の背景 task を待ち合わせる。これを await しないと finalize 中に
+        // 残存 Write の chunk が PATCH に行って "Session not found" を踏む。
+        // Channel 内の chunk drain は FinalizeAsync の中の uploader.DrainAsync が担当。
+        await h.DrainInFlightAsync(ct).ConfigureAwait(false);
+
         try
         {
             if ((flags & CleanupFlags.Delete) != 0)
@@ -748,6 +754,55 @@ public sealed class ServerBackend : IFileSystemBackend
             _sessionGate.Dispose();
             // _uploader は CleanupAsync で finalize / abort 済みの想定。
             // 例外経路で漏れた場合は AbortAsync を非同期で呼ばずに諦める。
+        }
+
+        // ─────────────────────────────────── async I/O in-flight tracker ────
+        // WinFsp の STATUS_PENDING 経路で Read/Write callback が即 return した後の
+        // 背景 task を Cleanup から待ち合わせるための counter + TCS。
+        // 想定: Cleanup は handle 単位で 1 回だけ呼ばれ、Cleanup 後に新たな
+        // Read/Write IRP は来ない(WinFsp の契約)。よって DrainInFlightAsync の
+        // 再エントリは考慮不要。
+
+        private int _inFlight;
+        private TaskCompletionSource? _drainTcs;
+
+        public IDisposable EnterIo()
+        {
+            Interlocked.Increment(ref _inFlight);
+            return new IoReleaser(this);
+        }
+
+        public Task DrainInFlightAsync(CancellationToken ct = default)
+        {
+            var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            // 最初に Drain を呼んだ caller の TCS を採用(2 回呼ばれた場合は最初の TCS を共有)。
+            var existing = Interlocked.CompareExchange(ref _drainTcs, tcs, null);
+            var actual = existing ?? tcs;
+            // CompareExchange の直後に in-flight が 0 だった場合、ExitIo は既に
+            // 走り終えていて _drainTcs を取り損ねている可能性がある → ここで補填。
+            if (Volatile.Read(ref _inFlight) == 0)
+                actual.TrySetResult();
+            return ct.CanBeCanceled ? actual.Task.WaitAsync(ct) : actual.Task;
+        }
+
+        private void ExitIo()
+        {
+            if (Interlocked.Decrement(ref _inFlight) == 0)
+            {
+                Volatile.Read(ref _drainTcs)?.TrySetResult();
+            }
+        }
+
+        private sealed class IoReleaser : IDisposable
+        {
+            private readonly ServerHandle _handle;
+            private int _disposed;
+            public IoReleaser(ServerHandle handle) { _handle = handle; }
+            public void Dispose()
+            {
+                if (Interlocked.Exchange(ref _disposed, 1) == 0)
+                    _handle.ExitIo();
+            }
         }
     }
 }
