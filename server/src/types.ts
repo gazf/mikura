@@ -55,7 +55,11 @@ export interface FileEntry {
 
 /**
  * ADR-025: range PATCH ベースの chunked upload セッション。
- * (uploadId, deviceId) で識別、TTL は lock TTL と同期する。
+ * (uploadId, deviceId) で識別。生存判定は KV の alive marker
+ * (uploadByDevice key の expireIn) が SSOT。session value 自体は
+ * 長 TTL の safety net で保持され、heartbeat の TTL extension は
+ * value に触らず alive marker だけを延長する設計
+ * (upload.service.ts 参照)。
  */
 export interface UploadSession {
   uploadId: string;
@@ -64,5 +68,4 @@ export interface UploadSession {
   path: string;
   tempPath: string;
   createdAt: string;
-  expiresAt: string;
 }

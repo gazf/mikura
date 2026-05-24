@@ -258,6 +258,16 @@ public sealed class InMemoryFileSystemBackend : IFileSystemBackend
         public bool IsDirectory => Node.IsDirectory;
         public FileEntry Entry => Node.ToEntry();
 
+        // In-memory backend は全 op が同期完了するので in-flight tracking は no-op。
+        public IDisposable EnterIo() => NoopDisposable.Instance;
+        public Task DrainInFlightAsync(CancellationToken ct = default) => Task.CompletedTask;
+
         public void Dispose() { }
+
+        private sealed class NoopDisposable : IDisposable
+        {
+            public static readonly NoopDisposable Instance = new();
+            public void Dispose() { }
+        }
     }
 }

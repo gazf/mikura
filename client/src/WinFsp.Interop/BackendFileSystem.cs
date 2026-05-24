@@ -36,18 +36,24 @@ public sealed class BackendFileSystem : FileSystemBase
     private const int StatusObjectNotFound = unchecked((int)0xC0000034);
 
     /// <summary>
-    /// per-IRP の Marshal.Copy 中継バッファ専用 pool。
-    /// ArrayPool&lt;byte&gt;.Shared を使うとプロセス全体で per-CPU stack がリテンション
-    /// を効かせていて、handle close 後も大きな byte[] を握り続ける挙動が観測された
-    /// (実機: 数十 MB のファイル copy で常駐メモリが数倍に膨らむ)。サイズと
-    /// retention を絞った dedicated pool にすることで idle 時のメモリを bound する。
+    /// STATUS_FILE_DELETED — handle に紐づくファイルが I/O 中に削除された。
+    /// Read 中に path が消えた場合(例: Excel save dance の temp rename)に返す。
+    /// kernel は handle を invalidate して retry をやめる。
     /// </summary>
-    private static readonly ArrayPool<byte> _ioPool =
-        ArrayPool<byte>.Create(maxArrayLength: 4 * 1024 * 1024, maxArraysPerBucket: 4);
+    private const int StatusFileDeleted = unchecked((int)0xC0000123);
+
+    /// <summary>STATUS_PENDING — async response パターンで callback を保留する。</summary>
+    private const int StatusPending = 0x00000103;
 
     private readonly IFileSystemBackend _backend;
     private readonly OnlineGate _gate;
     private readonly DateTime _createdAt = DateTime.UtcNow;
+
+    /// <summary>
+    /// SendReadResponse / SendWriteResponse / Notify を呼ぶための host 参照。
+    /// Mount 完了後でないと kernel 側 API は使えないので Mounted callback で取得。
+    /// </summary>
+    private FileSystemHost? _host;
 
     public BackendFileSystem(IFileSystemBackend backend, OnlineGate gate)
     {
@@ -61,7 +67,7 @@ public sealed class BackendFileSystem : FileSystemBase
         host.SectorSize = AllocationUnit;
         host.SectorsPerAllocationUnit = 1;
         host.MaxComponentLength = 255;
-        host.FileInfoTimeout = 1000;
+        host.FileInfoTimeout = 1500;
         host.CaseSensitiveSearch = false;
         host.CasePreservedNames = true;
         host.UnicodeOnDisk = true;
@@ -90,6 +96,21 @@ public sealed class BackendFileSystem : FileSystemBase
         // (TrayAppContext.StartAsync) is responsible for awaiting initialization
         // before calling Mount.
         return STATUS_SUCCESS;
+    }
+
+    /// <summary>
+    /// Mount 成功後 = kernel 側 API (NotifyBegin 等) を呼べる状態。Init は VolumeParams
+    /// 設定専用で kernel 側 API は未稼働なので、host 参照はここで取る。
+    /// </summary>
+    public override int Mounted(object host0)
+    {
+        _host = (FileSystemHost)host0;
+        return STATUS_SUCCESS;
+    }
+
+    public override void Unmounted(object host0)
+    {
+        _host = null;
     }
 
     public override int GetVolumeInfo(out VolumeInfo info)
@@ -238,34 +259,61 @@ public sealed class BackendFileSystem : FileSystemBase
         var handle = (IFileHandle)fileDesc0;
         if (handle.IsDirectory) return STATUS_INVALID_DEVICE_REQUEST;
 
-        // Marshalling buffer rented from ArrayPool to keep per-IRP allocation
-        // pressure off the GC. Critical for large file copies (10 MB / 64 KB
-        // chunks = 160 reads — without pooling each one is a fresh byte[]).
-        var pooled = _ioPool.Rent((int)length);
+        // async response: callback は hint を取って即 StatusPending を返す。実 I/O は
+        // ProcessReadAsync で進行、完了時に SendReadResponse で kernel に通知。
+        // race fix: handle.EnterIo() で in-flight counter を上げ、Cleanup は
+        // DrainInFlightAsync で counter ゼロまで待ち合わせる。
+        var hint = _host!.GetOperationRequestHint();
+        var ioToken = handle.EnterIo();
+        _ = ProcessReadAsync(hint, buffer, (int)length, (long)offset, handle, ioToken);
+        return StatusPending;
+    }
+
+    /// <summary>
+    /// IRP buffer (unmanaged IntPtr) を UnmanagedMemoryManager で Memory&lt;byte&gt; に
+    /// wrap して ServerBackend.ReadAsync が直接書き込む(中間 byte[] と Marshal.Copy
+    /// 廃止)。寿命: SendReadResponse 呼び出しまでに mgr を Dispose する順序を厳守。
+    /// ioToken は SendResponse 直後 finally で Dispose して in-flight counter を戻す。
+    /// </summary>
+    private async Task ProcessReadAsync(
+        ulong hint, IntPtr buffer, int length, long offset,
+        IFileHandle handle, IDisposable ioToken)
+    {
+        int status = STATUS_SUCCESS;
+        int bytesRead = 0;
         try
         {
-            var bytesRead = _backend.ReadAsync(handle, (long)offset, pooled.AsMemory(0, (int)length))
-                .GetAwaiter().GetResult();
-            if (bytesRead <= 0) return STATUS_END_OF_FILE;
-            Marshal.Copy(pooled, 0, buffer, bytesRead);
-            pBytesTransferred = (uint)bytesRead;
-            return STATUS_SUCCESS;
-        }
-        catch (FileNotFoundException ex)
-        {
-            System.Diagnostics.Trace.WriteLine($"[ERROR] Read 404: {handle.Path}: {ex.Message}");
-            return StatusObjectNotFound;
-        }
-        catch (Exception ex)
-        {
-            // backend / transport が投げた例外を WinFsp に漏らさないことが目的。
-            // 漏らすとデバッガで unhandled になる + WinFsp 側の挙動が不定。
-            System.Diagnostics.Trace.WriteLine($"[ERROR] Read failed: {handle.Path} @{offset}+{length}: {ex.GetType().Name}: {ex.Message}");
-            return StatusUnexpectedIoError;
+            using var mgr = new UnmanagedMemoryManager(buffer, length);
+            try
+            {
+                bytesRead = await _backend.ReadAsync(handle, offset, mgr.Memory)
+                    .ConfigureAwait(false);
+            }
+            catch (FileNotFoundException ex)
+            {
+                System.Diagnostics.Trace.WriteLine($"[INFO] Read on deleted path: {handle.Path}: {ex.Message}");
+                status = StatusFileDeleted;
+                bytesRead = 0;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"[ERROR] Read failed: {handle.Path} @{offset}+{length}: {ex.GetType().Name}: {ex.Message}");
+                status = StatusUnexpectedIoError;
+            }
+
+            if (status == STATUS_SUCCESS && bytesRead <= 0)
+            {
+                status = STATUS_END_OF_FILE;
+                bytesRead = 0;
+            }
         }
         finally
         {
-            _ioPool.Return(pooled);
+            // mgr の Dispose は using により completed。SendReadResponse → ioToken Dispose
+            // の順で「kernel に応答 → Cleanup に handle 解放」を表現する。
+            _host!.SendReadResponse(hint, status, status == STATUS_SUCCESS ? (uint)bytesRead : 0);
+            ioToken.Dispose();
         }
     }
 
@@ -287,29 +335,52 @@ public sealed class BackendFileSystem : FileSystemBase
         var handle = (IFileHandle)fileDesc0;
         if (handle.IsDirectory) return STATUS_INVALID_DEVICE_REQUEST;
 
-        var pooled = _ioPool.Rent((int)length);
+        // Read と同じ async response パターン。EnterIo で in-flight tracker に登録。
+        var hint = _host!.GetOperationRequestHint();
+        var ioToken = handle.EnterIo();
+        _ = ProcessWriteAsync(hint, buffer, (int)length, (long)offset,
+            writeToEndOfFile, constrainedIo, handle, ioToken);
+        return StatusPending;
+    }
+
+    /// <summary>
+    /// IRP buffer を ReadOnlyMemory&lt;byte&gt; として wrap して ServerBackend.WriteAsync に
+    /// 直接読ませる。完了経路で SendWriteResponse(成功時は新 FileInfo を ref で返す)
+    /// → ioToken Dispose の順で WinFsp 応答と in-flight 解放を行う。
+    /// </summary>
+    private async Task ProcessWriteAsync(
+        ulong hint, IntPtr buffer, int length, long offset,
+        bool writeToEnd, bool constrainedIo, IFileHandle handle, IDisposable ioToken)
+    {
+        int status = STATUS_SUCCESS;
+        FileInfo infoOut = default;
         try
         {
-            Marshal.Copy(buffer, pooled, 0, (int)length);
-            _backend.WriteAsync(handle, (long)offset, pooled.AsMemory(0, (int)length), writeToEndOfFile, constrainedIo)
-                .GetAwaiter().GetResult();
-            pBytesTransferred = length;
-            FillFileInfo(handle.Entry, out fileInfo);
-            return STATUS_SUCCESS;
-        }
-        catch (UnauthorizedAccessException ex)
-        {
-            System.Diagnostics.Trace.WriteLine($"[ERROR] Write denied: {handle.Path}: {ex.Message}");
-            return STATUS_ACCESS_DENIED;
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Trace.WriteLine($"[ERROR] Write failed: {handle.Path} @{offset}+{length}: {ex.GetType().Name}: {ex.Message}");
-            return StatusUnexpectedIoError;
+            using var mgr = new UnmanagedMemoryManager(buffer, length);
+            try
+            {
+                await _backend.WriteAsync(
+                    handle, offset, mgr.Memory, writeToEnd, constrainedIo)
+                    .ConfigureAwait(false);
+                FillFileInfo(handle.Entry, out infoOut);
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                System.Diagnostics.Trace.WriteLine($"[ERROR] Write denied: {handle.Path}: {ex.Message}");
+                status = STATUS_ACCESS_DENIED;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"[ERROR] Write failed: {handle.Path} @{offset}+{length}: {ex.GetType().Name}: {ex.Message}");
+                status = StatusUnexpectedIoError;
+            }
         }
         finally
         {
-            _ioPool.Return(pooled);
+            _host!.SendWriteResponse(hint, status,
+                status == STATUS_SUCCESS ? (uint)length : 0, ref infoOut);
+            ioToken.Dispose();
         }
     }
 
@@ -511,22 +582,31 @@ public sealed class BackendFileSystem : FileSystemBase
         info.LastAccessTime = (ulong)entry.LastWriteTimeUtc.ToFileTimeUtc();
         info.LastWriteTime = (ulong)entry.LastWriteTimeUtc.ToFileTimeUtc();
         info.ChangeTime = info.LastWriteTime;
-        info.IndexNumber = ComputeIndexNumber(entry.Path);
+        info.IndexNumber = ComputeIndexNumber(entry.Path, info.CreationTime);
         info.HardLinks = 1;
     }
 
-    private static ulong ComputeIndexNumber(ReadOnlySpan<char> path)
+    /// <summary>
+    /// path と creation time を混ぜた 64-bit ID。content-based ではないが、
+    /// 「同名で削除→再作成」を NTFS の MFT エントリ再割当てと同じく別 ID として扱う
+    /// (creation time が変わるため)。mtime mix と違って通常の編集では ID が変わらない。
+    /// rename で path が変われば ID も変わる(NTFS の MFT 永続性とは別物)が、
+    /// 業務 app の path-based 操作には十分。
+    /// </summary>
+    private static ulong ComputeIndexNumber(ReadOnlySpan<char> path, ulong creationTime)
     {
         const ulong prime1 = 0x9E3779B185EBCA87UL;
         const ulong prime2 = 0xC2B2AE3D27D4EB4FUL;
-        
+
         ReadOnlySpan<byte> data = MemoryMarshal.AsBytes(path);
         ref byte ptr = ref MemoryMarshal.GetReference(data);
         int len = data.Length;
-        
-        ulong hash = (ulong)len * prime1;
+
+        // path のサイズと creation time を初期値に混ぜる。同 path で生成時刻が
+        // 違う(削除→再作成)場合に異なる hash 開始点になる。
+        ulong hash = ((ulong)len * prime1) ^ (creationTime * prime2);
         int i = 0;
-        
+
         while (i + 8 <= len)
         {
             ulong k = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref ptr, i));
@@ -534,14 +614,14 @@ public sealed class BackendFileSystem : FileSystemBase
             hash = BitOperations.RotateLeft(hash, 31) * prime1;
             i += 8;
         }
-        
+
         while (i < len)
         {
             hash ^= (ulong)Unsafe.Add(ref ptr, i) * prime2;
             hash = BitOperations.RotateLeft(hash, 11) * prime1;
             i++;
         }
-        
+
         hash ^= hash >> 33;
         hash *= prime2;
         hash ^= hash >> 29;

@@ -21,6 +21,7 @@ import {
   refreshDeviceSessions,
 } from "../src/services/upload.service.ts";
 import { seedUser, withTestKv } from "./_helpers.ts";
+import { Keys } from "../src/kv/keys.ts";
 
 const FIXTURE_DIR = "__test_uploads__";
 
@@ -516,7 +517,7 @@ Deno.test("baseFromExisting=true: 既存ファイルを temp に複製してか�
   });
 });
 
-Deno.test("refreshDeviceSessions: session の expiresAt を更新する (heartbeat 連動)", async () => {
+Deno.test("refreshDeviceSessions: alive marker の TTL を延長する (heartbeat 連動)", async () => {
   await withTestKv(async (kv) => {
     const tokens = await setupUsers(kv);
     const fx = await ensureFixtureDir();
@@ -526,15 +527,27 @@ Deno.test("refreshDeviceSessions: session の expiresAt を更新する (heartbe
       const start = await startUpload(tokens.alice, "dev-alice", target);
       assert(start.uploadId);
 
-      const before = (await _listSessionsForTesting("dev-alice"))[0].expiresAt;
-      await new Promise((r) => setTimeout(r, 30));
+      // TTL 延長は Deno KV の expireIn 更新で行うため、外から残り時間は
+      // 観測できない。代わりに alive marker (Keys.uploadByDevice) を再 set
+      // した結果として versionstamp が advance することを検証する。
+      const aliveKey = Keys.uploadByDevice("dev-alice", start.uploadId);
+      const before = await kv.get(aliveKey);
+      assert(
+        before.versionstamp !== null,
+        "alive marker should exist after startUpload",
+      );
+
       const refreshed = await refreshDeviceSessions("dev-alice");
       assertEquals(refreshed, 1);
 
-      const after = (await _listSessionsForTesting("dev-alice"))[0].expiresAt;
+      const after = await kv.get(aliveKey);
       assert(
-        new Date(after).getTime() > new Date(before).getTime(),
-        "expiresAt should advance after heartbeat refresh",
+        after.versionstamp !== null,
+        "alive marker should still exist after refresh",
+      );
+      assert(
+        after.versionstamp !== before.versionstamp,
+        "alive marker versionstamp should change after re-set",
       );
     } finally {
       await releaseLock(target, 1, "dev-alice");

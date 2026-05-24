@@ -2,9 +2,15 @@
  * ADR-025: range PATCH ベースの chunked upload セッション。
  *
  * 設計の要点:
- *   - session の TTL は ADR-018 の lock TTL と一致させ、WSS heartbeat の
- *     refresh で同期延長する。lock 失効 = session 失効、孤児セッションの
- *     発生源を SSOT 化する (lock service が腰)。
+ *   - session の生存判定は WSS heartbeat の refresh で延長される alive marker
+ *     (Keys.uploadByDevice の TTL) が SSOT。lock 失効 = session 失効、孤児
+ *     セッションの発生源を SSOT 化する (lock service と同じ device 単位)。
+ *   - **TTL を value から分離**: value 本体 (Keys.upload) は長 TTL の safety net、
+ *     alive marker (Keys.uploadByDevice) が短 TTL で heartbeat で延長される。
+ *     これにより heartbeat refresh は alive marker への unconditional set だけで
+ *     済み、value への atomic check と競合しない (旧設計では heartbeat refresh が
+ *     value を re-set する必要があったため並行 refresh で atomic check 競合 →
+ *     silent fail → session expire の race を踏んでいた)。
  *   - 認可は POST /uploads (start) で 1 回だけ。以後の PATCH/finalize は
  *     (uploadId, deviceId) の照合 = 認証で十分とする。
  *   - finalize は DATA_ROOT と同一 FS にある STAGING_ROOT からの
@@ -28,7 +34,14 @@ import type { UploadSession } from "../types.ts";
 
 const STAGING_ROOT = Deno.env.get("MIKURA_STAGING_ROOT") ??
   path.join(Deno.cwd(), "staging");
-const SESSION_TTL_MS = 30 * 1000; // ADR-018 lock TTL と一致
+// alive marker (Keys.uploadByDevice) の TTL: heartbeat (10s) で延長される。
+// 切れたら session は dead 扱い、loadSession が "Session expired" を返す。
+// ADR-018 lock TTL と同期。
+const SESSION_ALIVE_TTL_MS = 30 * 1000;
+// session value (Keys.upload) の TTL: 長 safety net。device 完全死亡時に最終的に
+// KV から消えるよう設定。実運用では alive marker が先に切れるので、これが効くのは
+// 「heartbeat も terminate も来ない unclean shutdown」のみ。
+const SESSION_VALUE_TTL_MS = 60 * 60 * 1000; // 1 hour
 const MAX_PATH_LEN = 4096;
 
 export function getStagingRoot(): string {
@@ -152,14 +165,14 @@ export async function createSession(
     path: filePath,
     tempPath,
     createdAt: now.toISOString(),
-    expiresAt: new Date(now.getTime() + SESSION_TTL_MS).toISOString(),
   };
 
   const kv = await getKv();
+  // value 本体は長 TTL、alive marker は短 TTL。生存は alive marker が SSOT。
   const tx = await kv.atomic()
-    .set(Keys.upload(uploadId), session, { expireIn: SESSION_TTL_MS })
+    .set(Keys.upload(uploadId), session, { expireIn: SESSION_VALUE_TTL_MS })
     .set(Keys.uploadByDevice(deviceId, uploadId), null, {
-      expireIn: SESSION_TTL_MS,
+      expireIn: SESSION_ALIVE_TTL_MS,
     })
     .commit();
 
@@ -177,10 +190,18 @@ async function loadSession(
   deviceId: string,
 ): Promise<UploadSession> {
   const kv = await getKv();
+  // 順序が semantics を決める:
+  //   1. value 不在 → 404 (never created か long TTL も切れた)
+  //   2. value あり、deviceId 不一致 → 403 (別 device の session)
+  //   3. value あり、deviceId 一致、alive marker 不在 → 404 (heartbeat 止まり expired)
   const entry = await kv.get<UploadSession>(Keys.upload(uploadId));
   if (!entry.value) throw new UploadServiceError("Session not found", 404);
   if (entry.value.deviceId !== deviceId) {
     throw new UploadServiceError("Session not owned by this device", 403);
+  }
+  const alive = await kv.get(Keys.uploadByDevice(deviceId, uploadId));
+  if (alive.versionstamp === null) {
+    throw new UploadServiceError("Session not found", 404);
   }
   return entry.value;
 }
@@ -292,8 +313,15 @@ export async function abortSession(
 }
 
 /**
- * heartbeat 連動: 当該 device が保持する全セッションの TTL を再設定する。
- * lock service の refreshDeviceLocks と同じタイミングで呼ばれる前提。
+ * heartbeat 連動: 当該 device が保持する全セッションの alive marker の TTL を
+ * 延長する。lock service の refreshDeviceLocks と同じタイミングで呼ばれる前提。
+ *
+ * <p>**設計上の重要点**: value 本体 (Keys.upload) には触らず、alive marker
+ * (Keys.uploadByDevice) を無条件 set で expireIn だけ更新する。これにより:
+ *   - 並行 heartbeat があっても atomic check 競合で失敗することがない
+ *     (value=null を書くだけなので write race の意味が無い)
+ *   - PATCH 等の value 読み取り経路と完全に独立(干渉ゼロ)
+ *   - heartbeat 流量に対して常に確実に TTL が延びる</p>
  */
 export async function refreshDeviceSessions(
   deviceId: string,
@@ -302,27 +330,9 @@ export async function refreshDeviceSessions(
   let refreshed = 0;
   const iter = kv.list({ prefix: Keys.uploadsByDevicePrefix(deviceId) });
   for await (const entry of iter) {
-    const uploadId = entry.key[2] as string;
-    const sessionEntry = await kv.get<UploadSession>(Keys.upload(uploadId));
-    if (!sessionEntry.value) {
-      // 既に finalize/abort 済み → 残骸の逆引きを掃除。
-      await kv.delete(entry.key);
-      continue;
-    }
-    const refreshedSession: UploadSession = {
-      ...sessionEntry.value,
-      expiresAt: new Date(Date.now() + SESSION_TTL_MS).toISOString(),
-    };
-    const tx = await kv.atomic()
-      .check(sessionEntry)
-      .set(Keys.upload(uploadId), refreshedSession, {
-        expireIn: SESSION_TTL_MS,
-      })
-      .set(Keys.uploadByDevice(deviceId, uploadId), null, {
-        expireIn: SESSION_TTL_MS,
-      })
-      .commit();
-    if (tx.ok) refreshed++;
+    // alive marker を無条件で set し直すだけ(value は null、競合不可)。
+    await kv.set(entry.key, null, { expireIn: SESSION_ALIVE_TTL_MS });
+    refreshed++;
   }
   return refreshed;
 }
