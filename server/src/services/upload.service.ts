@@ -25,7 +25,7 @@
  *     disposability を誤って示唆するので避ける)。
  */
 import * as path from "@std/path";
-import { getKv } from "../kv/store.ts";
+import { getEphemeralKv } from "../kv/store.ts";
 import { Keys } from "../kv/keys.ts";
 import { getDataRoot } from "./file.service.ts";
 import { getLock } from "./lock.service.ts";
@@ -167,7 +167,7 @@ export async function createSession(
     createdAt: now.toISOString(),
   };
 
-  const kv = await getKv();
+  const kv = await getEphemeralKv();
   // value 本体は長 TTL、alive marker は短 TTL。生存は alive marker が SSOT。
   const tx = await kv.atomic()
     .set(Keys.upload(uploadId), session, { expireIn: SESSION_VALUE_TTL_MS })
@@ -189,7 +189,7 @@ async function loadSession(
   uploadId: string,
   deviceId: string,
 ): Promise<UploadSession> {
-  const kv = await getKv();
+  const kv = await getEphemeralKv();
   // 順序が semantics を決める:
   //   1. value 不在 → 404 (never created か long TTL も切れた)
   //   2. value あり、deviceId 不一致 → 403 (別 device の session)
@@ -286,7 +286,7 @@ export async function finalizeSession(
   }, session.deviceId);
 
   // KV エントリを掃除。
-  const kv = await getKv();
+  const kv = await getEphemeralKv();
   await kv.atomic()
     .delete(Keys.upload(uploadId))
     .delete(Keys.uploadByDevice(deviceId, uploadId))
@@ -305,7 +305,7 @@ export async function abortSession(
 ): Promise<void> {
   const session = await loadSession(uploadId, deviceId);
   await Deno.remove(session.tempPath).catch(() => {});
-  const kv = await getKv();
+  const kv = await getEphemeralKv();
   await kv.atomic()
     .delete(Keys.upload(uploadId))
     .delete(Keys.uploadByDevice(deviceId, uploadId))
@@ -326,7 +326,7 @@ export async function abortSession(
 export async function refreshDeviceSessions(
   deviceId: string,
 ): Promise<number> {
-  const kv = await getKv();
+  const kv = await getEphemeralKv();
   let refreshed = 0;
   const iter = kv.list({ prefix: Keys.uploadsByDevicePrefix(deviceId) });
   for await (const entry of iter) {
@@ -344,7 +344,7 @@ export async function refreshDeviceSessions(
 export async function abortDeviceSessions(
   deviceId: string,
 ): Promise<number> {
-  const kv = await getKv();
+  const kv = await getEphemeralKv();
   let aborted = 0;
   const iter = kv.list({ prefix: Keys.uploadsByDevicePrefix(deviceId) });
   for await (const entry of iter) {
@@ -366,7 +366,7 @@ export async function abortDeviceSessions(
 export async function _listSessionsForTesting(
   deviceId: string,
 ): Promise<UploadSession[]> {
-  const kv = await getKv();
+  const kv = await getEphemeralKv();
   const sessions: UploadSession[] = [];
   const iter = kv.list({ prefix: Keys.uploadsByDevicePrefix(deviceId) });
   for await (const entry of iter) {

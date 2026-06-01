@@ -1,4 +1,4 @@
-import { getKv } from "../kv/store.ts";
+import { getEphemeralKv } from "../kv/store.ts";
 import { Keys } from "../kv/keys.ts";
 import { broadcastLockEvent } from "./wsBroadcast.service.ts";
 import type { LockData } from "../types.ts";
@@ -19,7 +19,7 @@ export async function acquireLock(
   deviceId: string,
   timeoutMs: number = LOCK_TTL_MS,
 ): Promise<LockResult> {
-  const kv = await getKv();
+  const kv = await getEphemeralKv();
   const key = Keys.lock(filePath);
 
   const existing = await kv.get<LockData>(key);
@@ -74,7 +74,7 @@ export async function releaseLock(
   userId: number,
   deviceId: string,
 ): Promise<boolean> {
-  const kv = await getKv();
+  const kv = await getEphemeralKv();
   const key = Keys.lock(filePath);
   const existing = await kv.get<LockData>(key);
 
@@ -111,7 +111,7 @@ export async function releaseLock(
  * 一括解除し、それぞれ lock_released を broadcast する。
  */
 export async function releaseDeviceLocks(deviceId: string): Promise<number> {
-  const kv = await getKv();
+  const kv = await getEphemeralKv();
   let released = 0;
   const iter = kv.list({ prefix: Keys.deviceLocksPrefix(deviceId) });
 
@@ -147,7 +147,7 @@ export async function releaseDeviceLocks(deviceId: string): Promise<number> {
 }
 
 export async function getLock(filePath: string): Promise<LockData | null> {
-  const kv = await getKv();
+  const kv = await getEphemeralKv();
   const entry = await kv.get<LockData>(Keys.lock(filePath));
   // KV expireIn により満期判定は不要。値があれば有効。
   return entry.value ?? null;
@@ -158,7 +158,7 @@ export async function getLock(filePath: string): Promise<LockData | null> {
  * Map<path, LockData> を返す。
  */
 export async function getAllLocks(): Promise<Map<string, LockData>> {
-  const kv = await getKv();
+  const kv = await getEphemeralKv();
   const result = new Map<string, LockData>();
   const iter = kv.list<LockData>({ prefix: ["locks"] });
   for await (const entry of iter) {
@@ -183,7 +183,7 @@ export async function isLockedByOther(
  * 同じ値で再 set することで TTL がリフレッシュされる)。
  */
 export async function refreshDeviceLocks(deviceId: string): Promise<number> {
-  const kv = await getKv();
+  const kv = await getEphemeralKv();
   let refreshed = 0;
   const iter = kv.list({ prefix: Keys.deviceLocksPrefix(deviceId) });
 
