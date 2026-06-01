@@ -56,12 +56,15 @@ export async function broadcastLockEvent(
   filePath: string,
   holder: { userId: number; deviceId: string },
 ): Promise<void> {
+  // peers.size===0 (single-client 運用) なら log もスキップ。fileLogger は async
+  // 化済みだが、broadcast burst (Excel save dance で 14 lock × 2 log) は黙らせる
+  // 価値がある (log ファイルのノイズ削減 + GC 圧)。
+  if (peers.size === 0) return;
   console.log(
     `[broadcast] ${event} path=${filePath} holder=${
       holder.deviceId.slice(0, 8)
     } peers=${peers.size}`,
   );
-  if (peers.size === 0) return;
 
   const name = await resolveHolderName(holder.userId);
   const payload = JSON.stringify({

@@ -113,9 +113,9 @@ Deno.test("writeFile + readFile + listDirectory: roundtrip via real data dir", a
     const list = await listDirectory(TEST_DIR);
     assert(list.some((e) => e.name === "sample.txt"));
 
-    const { stream, size } = await readFile(TEST_FILE);
+    const { body: readBody, size } = await readFile(TEST_FILE);
     assertEquals(size, 5);
-    const content = await new Response(stream).text();
+    const content = await new Response(readBody as BodyInit).text();
     assertEquals(content, "hello");
 
     await deleteFile(TEST_FILE);

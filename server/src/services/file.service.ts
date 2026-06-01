@@ -119,6 +119,8 @@ export async function getFileInfo(
  * Range 指定 (= 末尾までではなく途中で打ち切りたい) の readFile で使う。
  * pipeThrough 上で terminate すると upstream の file.readable が cancel され、
  * 結果として fd も閉じられる (Deno の resource lifecycle 規約)。
+ *
+ * 末尾までの長いストリームでのみ使用。bounded Range read は eager path を通る。
  */
 function takeBytes(
   maxBytes: number,
@@ -143,11 +145,21 @@ function takeBytes(
   });
 }
 
+/**
+ * Range read の上限。これ以下の length 指定 read は eager に Uint8Array へ
+ * 詰めて返す。WinFsp の典型 IRP buffer (1MB) を超えても 4MB あれば、まとめ
+ * 配送のリクエストもカバーできる。これより大きい / length 不明な read は
+ * stream で返して中間バッファを 1 本に抑える。
+ */
+const EAGER_READ_MAX = 4 * 1024 * 1024;
+
+export type ReadFileBody = ReadableStream<Uint8Array> | Uint8Array;
+
 export async function readFile(
   relativePath: string,
   offset?: number,
   length?: number,
-): Promise<{ stream: ReadableStream<Uint8Array>; size: number }> {
+): Promise<{ body: ReadFileBody; size: number }> {
   const fullPath = resolveAndValidate(relativePath);
 
   let file: Deno.FsFile;
@@ -167,23 +179,43 @@ export async function readFile(
   }
 
   const totalSize = stat.size;
+  const startOffset = offset ?? 0;
+  const remainingFromOffset = Math.max(0, totalSize - startOffset);
+  const requestedLength = length ?? remainingFromOffset;
+  const actualLength = Math.min(requestedLength, remainingFromOffset);
 
-  if (offset !== undefined && offset > 0) {
-    await file.seek(offset, Deno.SeekMode.Start);
+  if (startOffset > 0) {
+    await file.seek(startOffset, Deno.SeekMode.Start);
   }
 
-  const actualLength = length ?? totalSize - (offset ?? 0);
-  const remainingFromOffset = totalSize - (offset ?? 0);
+  // Range read (length 既知) かつサイズが上限以下なら、TransformStream を介さず
+  // 直接 buffer に詰めて返す。per-IRP read の主経路 — TransformStream の生成 /
+  // chunk queueing / cancel handshake が消える。
+  if (length !== undefined && actualLength <= EAGER_READ_MAX) {
+    try {
+      const buf = new Uint8Array(actualLength);
+      let read = 0;
+      while (read < actualLength) {
+        const n = await file.read(buf.subarray(read));
+        if (n === null) break;
+        read += n;
+      }
+      return {
+        body: read === actualLength ? buf : buf.subarray(0, read),
+        size: totalSize,
+      };
+    } finally {
+      file.close();
+    }
+  }
 
-  // file.readable は Deno 内部で chunk size / buffer reuse / fd の lifecycle を
-  // 管理してくれる。Range なし (= 末尾まで) なら直接、Range 指定なら
-  // takeBytes で打ち切る。stream が終わる / cancel される / 上限到達で
-  // terminate される、いずれの経路でも fd は Deno が close する。
+  // 末尾まで / length 不明 / 巨大 range は stream で。file.readable は EOF /
+  // cancel / takeBytes terminate のいずれでも fd を close する。
   const stream = actualLength >= remainingFromOffset
     ? file.readable
     : file.readable.pipeThrough(takeBytes(actualLength));
 
-  return { stream, size: totalSize };
+  return { body: stream, size: totalSize };
 }
 
 export async function writeFile(

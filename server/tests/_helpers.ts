@@ -1,13 +1,18 @@
-import { setKvForTesting } from "../src/kv/store.ts";
+import { setEphemeralKvForTesting, setKvForTesting } from "../src/kv/store.ts";
 import { Keys } from "../src/kv/keys.ts";
 import { _clearPeersForTesting } from "../src/services/wsBroadcast.service.ts";
+import { _resetAuthCachesForTesting } from "../src/services/auth.service.ts";
 import type { AccessLevel, Group, Permission, User } from "../src/types.ts";
 
 // 安全網: このヘルパが import された時点 (= テスト実行プロセスに乗った時点) で
 // シングルトンを in-memory KV で埋めておき、もし誰かが withTestKv を経由せず
-// getKv() を呼んでも永続 KV を触らせない。withTestKv は毎回これを上書きする。
+// getKv() / getEphemeralKv() を呼んでも永続 KV を触らせない。
+// テストでは persistent と ephemeral の区別は不要 (key namespace で衝突しない)
+// ので同じインスタンスを共有させる。本番では別物だが、service ごとの routing
+// が正しいかは型と route + コードレビューで保証する。
 const failsafeKv = await Deno.openKv(":memory:");
 setKvForTesting(failsafeKv);
+setEphemeralKvForTesting(failsafeKv);
 
 /**
  * 各テストでクリーンな in-memory KV を用意し、シングルトンを差し替える。
@@ -20,16 +25,20 @@ export async function withTestKv<T>(
 ): Promise<T> {
   // テスト開始前にも一応掃除 (前テストが finally に到達せず終わったケースの保険)
   _clearPeersForTesting();
+  _resetAuthCachesForTesting();
 
   const kv = await Deno.openKv(":memory:");
   setKvForTesting(kv);
+  setEphemeralKvForTesting(kv);
   try {
     return await fn(kv);
   } finally {
     kv.close();
     // null に戻すと次の getKv() で永続パスが開かれてしまうので、failsafe に戻す。
     setKvForTesting(failsafeKv);
+    setEphemeralKvForTesting(failsafeKv);
     _clearPeersForTesting();
+    _resetAuthCachesForTesting();
   }
 }
 

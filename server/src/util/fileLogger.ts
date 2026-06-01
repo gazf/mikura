@@ -11,6 +11,23 @@ const LOG_FILE = "mikura-server.log";
 let logFile: Deno.FsFile | null = null;
 const encoder = new TextEncoder();
 
+// ファイル書き込みを async 直列化する。writeSync で event loop を blocking する
+// 旧実装は heartbeat / broadcast burst のたびに ~10-50µs ずつ event loop を
+// 止めて並行 PATCH 処理に微小な jitter を載せていた。async 化 + Promise chain
+// で順序は維持しつつ書き込み中に他の async タスクを止めない。
+//
+// 失敗 (disk full 等) は黙って捨てる: 元の console 出力は stdout に残るし、
+// fileLogger は tee なので片肺になっても致命ではない。
+let writeChain: Promise<void> = Promise.resolve();
+
+async function writeAllAsync(bytes: Uint8Array): Promise<void> {
+  if (!logFile) return;
+  let written = 0;
+  while (written < bytes.length) {
+    written += await logFile.write(bytes.subarray(written));
+  }
+}
+
 function ts(): string {
   const d = new Date();
   // [HH:MM:SS.mmm]
@@ -27,12 +44,8 @@ function writeLine(level: string, args: unknown[]): void {
       a,
     ) => (typeof a === "string" ? a : Deno.inspect(a, { colors: false })))
     .join(" ");
-  const line = `${ts()} ${level} ${text}\n`;
-  try {
-    logFile.writeSync(encoder.encode(line));
-  } catch {
-    // ファイル書き込みに失敗しても元の console 動作は維持される。
-  }
+  const bytes = encoder.encode(`${ts()} ${level} ${text}\n`);
+  writeChain = writeChain.then(() => writeAllAsync(bytes)).catch(() => {});
 }
 
 export function initFileLogger(): void {

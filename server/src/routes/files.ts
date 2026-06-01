@@ -211,7 +211,7 @@ export function registerFileRoutes(app: Hono<Env>) {
         }
       }
 
-      const { stream, size } = await readFile(filePath, offset, length);
+      const { body, size } = await readFile(filePath, offset, length);
       // console.log(`[diag] GET /content dev=${user.deviceId} ${filePath} range=${rangeHeader ?? "-"} size=${size} ${(performance.now() - t0).toFixed(1)}ms`);
 
       const headers: Record<string, string> = {
@@ -222,15 +222,23 @@ export function registerFileRoutes(app: Hono<Env>) {
       // ロック衝突は OpenAsync 段階で STATUS_ACCESS_DENIED で弾けるため
       // RO 属性ヘッダ経由の通知が不要になった、ADR-019 supersede)。
 
+      // body が Uint8Array (eager-read 経路) の場合、length は
+      // 実 read バイト数を直接使う。EOF より短く返ったときも整合する。
+      const bodyLength = body instanceof Uint8Array
+        ? body.byteLength
+        : undefined;
+      const responseBody = body as BodyInit;
+
       if (rangeHeader && offset !== undefined) {
-        const end = length ? offset + length - 1 : size - 1;
+        const len = bodyLength ?? length ?? size - offset;
+        const end = offset + len - 1;
         headers["Content-Range"] = `bytes ${offset}-${end}/${size}`;
-        headers["Content-Length"] = String(length ?? size - offset);
-        return new Response(stream, { status: 206, headers });
+        headers["Content-Length"] = String(len);
+        return new Response(responseBody, { status: 206, headers });
       }
 
-      headers["Content-Length"] = String(size);
-      return new Response(stream, { status: 200, headers });
+      headers["Content-Length"] = String(bodyLength ?? size);
+      return new Response(responseBody, { status: 200, headers });
     } catch (e) {
       if (e instanceof FileServiceError) {
         return c.json({ message: e.message }, e.statusCode as 400);
