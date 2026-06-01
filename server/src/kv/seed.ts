@@ -92,13 +92,52 @@ export async function seedIfEmpty(rawToken?: string): Promise<void> {
   console.log(`  App token: ${token}`);
 }
 
+/**
+ * 既 seed 状態の admin 情報をダンプする (CLI 用)。
+ * 注意: raw token は hash 化して保存しているので復元不可。表示できるのは
+ * token name / expiresAt / hash prefix のみ。新しい token が欲しい場合は
+ * KV を削除して再 seed するか、別途 issue-token コマンドを用意する。
+ */
+async function printExistingSeed(kv: Deno.Kv, adminId: number): Promise<void> {
+  const userEntry = await kv.get<User>(Keys.user(adminId));
+  const user = userEntry.value;
+  if (!user) {
+    console.log(`  Admin user record missing for id=${adminId}`);
+    return;
+  }
+
+  console.log(`  Admin user: ${user.name} (id=${user.id})`);
+  console.log(`    createdAt: ${user.createdAt}`);
+
+  const tokenIter = kv.list<true>({ prefix: Keys.tokensByUserPrefix(adminId) });
+  let count = 0;
+  for await (const entry of tokenIter) {
+    const tokenHash = entry.key[2] as string;
+    const tokenEntry = await kv.get<TokenData>(Keys.token(tokenHash));
+    const token = tokenEntry.value;
+    if (!token) continue;
+    count++;
+    console.log(`  Token ${count}: ${token.name}`);
+    console.log(`    hash (prefix): ${tokenHash.slice(0, 16)}...`);
+    console.log(`    expiresAt: ${token.expiresAt}`);
+  }
+  if (count === 0) {
+    console.log("  (no tokens)");
+  }
+  console.log("");
+  console.log(
+    "Raw token values are not stored; re-seed (wipe + retry) or issue a new token to obtain one.",
+  );
+}
+
 // CLI 実行時のみ最後に close する。プロセス常駐の main.ts から呼ぶ時は close しない。
-// CLI 経由なら既 seed の no-op も明示ログを出す (deno task seed の体感のため)。
+// CLI 経由なら既 seed の no-op でも分かる情報を吐く (deno task seed の体感のため)。
 if (import.meta.main) {
   const kv = await getKv();
-  const existing = await kv.get(Keys.userByName("admin"));
+  const existing = await kv.get<number>(Keys.userByName("admin"));
   if (existing.value !== null) {
     console.log("Database already seeded. Skipping.");
+    await printExistingSeed(kv, existing.value);
   } else {
     await seedIfEmpty();
   }
