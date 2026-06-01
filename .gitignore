@@ -5,6 +5,8 @@
 server/data/
 server/staging/
 server/mikura-server.log
+server/dev-cert.pem
+server/dev-key.pem
 
 # Client build output
 client/src/*/bin/
