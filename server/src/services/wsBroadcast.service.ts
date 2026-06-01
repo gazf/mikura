@@ -1,5 +1,5 @@
 import { checkPermission } from "./auth.service.ts";
-import { getEphemeralKv } from "../kv/store.ts";
+import { getKv } from "../kv/store.ts";
 import { Keys } from "../kv/keys.ts";
 import type { User } from "../types.ts";
 
@@ -46,8 +46,7 @@ export interface LockHolder {
 }
 
 async function resolveHolderName(userId: number): Promise<string> {
-  // users は ephemeral KV にミラー済み (startup warmup)。
-  const kv = await getEphemeralKv();
+  const kv = await getKv();
   const user = await kv.get<User>(Keys.user(userId));
   return user.value?.name ?? `user#${userId}`;
 }
