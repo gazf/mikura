@@ -7,7 +7,8 @@ public class AppSettings
     // 既定は IPv4 直指定。`localhost` だと Windows が IPv6 (`::1`) を先に
     // 試すが、WSL2 は Windows 側の `::1` を VM 内へフォワードしないため、
     // SYN リトライで ~21 秒のスタートアップ遅延を踏む。
-    public string ServerUrl { get; set; } = "http://127.0.0.1:8700";
+    // server は TLS + HTTP/2 (ALPN) 必須。HTTP cleartext は受け付けない。
+    public string ServerUrl { get; set; } = "https://127.0.0.1:8700";
     public string BearerToken { get; set; } = "";
     public string SyncRootPath { get; set; } = "";
     public int SyncIntervalSeconds { get; set; } = 300;

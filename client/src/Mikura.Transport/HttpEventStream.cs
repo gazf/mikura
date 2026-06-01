@@ -33,6 +33,8 @@ public sealed class HttpEventStream : IEventStream
         var ws = new ClientWebSocket();
         ws.Options.SetRequestHeader("Authorization", $"Bearer {bearerToken}");
         ws.Options.SetRequestHeader("X-Device-Id", deviceId);
+        // dev 用 self-signed cert を素通り (HttpServerApi 側と同方針)。
+        ws.Options.RemoteCertificateValidationCallback = (_, _, _, _) => true;
 
         var wsUrl = serverUrl.TrimEnd('/')
             .Replace("https://", "wss://")

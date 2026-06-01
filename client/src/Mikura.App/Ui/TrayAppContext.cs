@@ -87,15 +87,28 @@ public sealed class TrayAppContext : ApplicationContext
             // Http1Connection 内部に _writeBuffer / _readBuffer (ArrayBuffer)
             // を持ち、4MB チャンクの PATCH を流すたびにそれらが auto-grow して
             // 巨大なまま (実機: 複数 connection × 数十 MB ≈ 100MB 超) 居座る。
-            // chunked upload 4 並列 + WSS + その他で MaxConnections を 8 に絞り、
-            // 短めの lifetime で循環させて、接続側のメモリを bound する。
+            // HTTP/2 で多重化するので 1 接続でも捌けるが、念のため複数許可
+            // (EnableMultipleHttp2Connections + MaxConnectionsPerServer=8)。
+            // SSL は dev 用 self-signed cert を素通り、本番では正規 cert に
+            // 切り替えてこの callback を削除すること。
             var handler = new SocketsHttpHandler
             {
                 PooledConnectionLifetime = TimeSpan.FromMinutes(1),
                 PooledConnectionIdleTimeout = TimeSpan.FromSeconds(15),
                 MaxConnectionsPerServer = 8,
+                EnableMultipleHttp2Connections = true,
+                SslOptions = new System.Net.Security.SslClientAuthenticationOptions
+                {
+                    RemoteCertificateValidationCallback = (_, _, _, _) => true,
+                },
             };
-            var http = new HttpClient(handler);
+            // ALPN で h2 を強制する。サーバ側で h2 が提示されなければ接続失敗
+            // (== HTTP/1.1 fallback を意図せず取らない)。
+            var http = new HttpClient(handler)
+            {
+                DefaultRequestVersion = System.Net.HttpVersion.Version20,
+                DefaultVersionPolicy = HttpVersionPolicy.RequestVersionExact,
+            };
             http.DefaultRequestHeaders.Authorization =
                 new AuthenticationHeaderValue("Bearer", _settings.BearerToken);
             http.DefaultRequestHeaders.Add("X-Device-Id", _deviceId);
