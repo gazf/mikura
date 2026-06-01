@@ -31,14 +31,16 @@ async function nextId(kv: Deno.Kv, entity: string): Promise<number> {
   return nextValue;
 }
 
-async function seed() {
+/**
+ * idempotent seed。既に seed 済みなら no-op。
+ * rawToken が指定されればそれを admin token として使う (in-memory KV で
+ * 起動の度に同じトークンを保ちたい用途)。未指定なら randomUUID。
+ */
+export async function seedIfEmpty(rawToken?: string): Promise<void> {
   const kv = await getKv();
 
-  // Check if already seeded
   const existingUser = await kv.get(Keys.userByName("admin"));
   if (existingUser.value !== null) {
-    console.log("Database already seeded. Skipping.");
-    closeKv();
     return;
   }
 
@@ -61,9 +63,8 @@ async function seed() {
     accessLevel: "admin",
   };
 
-  // Generate an initial app token
-  const rawToken = crypto.randomUUID();
-  const tokenHash = await hashToken(rawToken);
+  const token = rawToken ?? crypto.randomUUID();
+  const tokenHash = await hashToken(token);
   const tokenData: TokenData = {
     userId: adminId,
     name: "initial-admin-token",
@@ -71,7 +72,6 @@ async function seed() {
     createdAt: new Date().toISOString(),
   };
 
-  // Atomic write: all or nothing
   const result = await kv
     .atomic()
     .set(Keys.user(adminId), adminUser)
@@ -84,20 +84,16 @@ async function seed() {
     .commit();
 
   if (!result.ok) {
-    console.error("Failed to seed database.");
-    closeKv();
-    Deno.exit(1);
+    throw new Error("Failed to seed database");
   }
 
-  console.log("Database seeded successfully.");
+  console.log("Database seeded.");
   console.log(`  Admin user: admin (password: admin)`);
-  console.log(`  Admin group: admins`);
-  console.log(`  Root permission: / -> admins (admin)`);
-  console.log(`  App token: ${rawToken}`);
-  console.log("");
-  console.log("Save this token! It will not be shown again.");
-
-  closeKv();
+  console.log(`  App token: ${token}`);
 }
 
-seed();
+// CLI 実行時のみ最後に close する。プロセス常駐の main.ts から呼ぶ時は close しない。
+if (import.meta.main) {
+  await seedIfEmpty();
+  closeKv();
+}
