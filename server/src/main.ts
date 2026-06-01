@@ -2,6 +2,7 @@ import app from "./app.ts";
 import { initFileLogger } from "./util/fileLogger.ts";
 import { ensureDataRoot, getDataRoot } from "./services/file.service.ts";
 import { initializeStagingRoot } from "./services/upload.service.ts";
+import { warmupEphemeralFromPersistent } from "./kv/store.ts";
 
 initFileLogger();
 
@@ -13,6 +14,12 @@ const port = parseInt(Deno.env.get("MIKURA_PORT") ?? "8700", 10);
 // 揃えておく方が診断時に状態が読み取りやすい。
 await ensureDataRoot();
 await initializeStagingRoot();
+
+// users / groups / permissions の hot path read を :memory: KV に乗せる。
+// mikura はこれらを runtime に書き換える API を持たないので、startup の
+// 1 回 mirror で persistent と同一スナップショットを取れる。
+const warmed = await warmupEphemeralFromPersistent();
+console.log(`mikura ephemeral KV warmed: ${warmed} entries`);
 
 console.log(`mikura server starting on port ${port} (data=${getDataRoot()})`);
 

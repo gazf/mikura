@@ -1,4 +1,4 @@
-import { getKv } from "../kv/store.ts";
+import { getEphemeralKv, getKv } from "../kv/store.ts";
 import { Keys } from "../kv/keys.ts";
 import type {
   AccessLevel,
@@ -165,6 +165,8 @@ export async function validateToken(
     // 寿命切れ: KV で再検証 (cache は下で put し直す)
   }
 
+  // tokens は raw 値が hash 保存で再現不能のため persistent KV に残す。
+  // users は ephemeral KV にミラー済み (startup warmup) なので ephemeral から読む。
   const kv = await getKv();
   const entry = await kv.get<TokenData>(Keys.token(hash));
   if (!entry.value) {
@@ -179,7 +181,8 @@ export async function validateToken(
     return null;
   }
 
-  const user = await kv.get<User>(Keys.user(tokenData.userId));
+  const eKv = await getEphemeralKv();
+  const user = await eKv.get<User>(Keys.user(tokenData.userId));
   if (!user.value) {
     tokenCache.delete(hash);
     return null;
@@ -224,8 +227,12 @@ export async function createAppToken(
   return { raw, hash };
 }
 
+// checkPermission の hot path: user_groups と permissions は ephemeral KV から
+// 読む (startup warmup でミラー済み)。runtime に書き換える API は今は無いので
+// stale risk なし。将来 admin API を作る時は ephemeral も更新する wrapper を
+// 噛ませる。
 async function getUserGroupIds(userId: number): Promise<number[]> {
-  const kv = await getKv();
+  const kv = await getEphemeralKv();
   const groupIds: number[] = [];
   const iter = kv.list<boolean>({ prefix: Keys.userGroupsPrefix(userId) });
   for await (const entry of iter) {
@@ -244,7 +251,7 @@ export async function checkPermission(
   const groupIds = await getUserGroupIds(userId);
   if (groupIds.length === 0) return false;
 
-  const kv = await getKv();
+  const kv = await getEphemeralKv();
 
   // Walk up the path hierarchy to find the most specific permission
   const pathParts = path.split("/").filter(Boolean);
