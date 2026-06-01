@@ -93,7 +93,14 @@ export async function seedIfEmpty(rawToken?: string): Promise<void> {
 }
 
 // CLI 実行時のみ最後に close する。プロセス常駐の main.ts から呼ぶ時は close しない。
+// CLI 経由なら既 seed の no-op も明示ログを出す (deno task seed の体感のため)。
 if (import.meta.main) {
-  await seedIfEmpty();
+  const kv = await getKv();
+  const existing = await kv.get(Keys.userByName("admin"));
+  if (existing.value !== null) {
+    console.log("Database already seeded. Skipping.");
+  } else {
+    await seedIfEmpty();
+  }
   closeKv();
 }
