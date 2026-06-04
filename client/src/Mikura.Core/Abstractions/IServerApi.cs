@@ -58,7 +58,7 @@ public interface IServerApi
     Task UploadChunkAsync(string uploadId, long offset, ReadOnlyMemory<byte> data, CancellationToken ct = default);
 
     /// <summary>
-    /// 複数 range を 1 PATCH (multipart/byteranges) でまとめて送る。WriteCoalescer
+    /// 複数 range を 1 PATCH (multipart/mixed) でまとめて送る。WriteCoalescer
     /// が非連続な小 IRP をバッファに pack し、1 リクエストで HTTP round-trip を 1 回に
     /// 集約する経路。<paramref name="ranges"/> の各 entry は <paramref name="buffer"/>
     /// 内の <c>BufferOffset..BufferOffset+Length</c> を、サーバ側 staging の

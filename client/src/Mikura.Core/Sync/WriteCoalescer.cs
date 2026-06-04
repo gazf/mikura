@@ -9,7 +9,7 @@ namespace Mikura.Core.Sync;
 /// kernel Write IRP を後段の HTTP PATCH に流す前段の write cache。
 /// <para>
 /// 連続/非連続を問わず handle 単位で IRP を集約し、target サイズに達するか
-/// idle timeout / Cleanup で 1 リクエスト (multipart/byteranges PATCH) として
+/// idle timeout / Cleanup で 1 リクエスト (multipart/mixed PATCH) として
 /// 送出する。range metadata と実バイナリを分離して持ち、同じハンドルへの
 /// 散発的な小書き込みも 1 PATCH に潰れる (RND 4K Q=32 等が支配する benchmark
 /// の RTT 数を IRP 単位から chunk 単位に圧縮する目的)。

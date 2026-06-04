@@ -1464,14 +1464,14 @@ target サイズ超 (≥4MB) の 1 IRP は coalesce せず単 range PATCH に直
 
 順序保証: 同一 buffer 内は range list 順、buffer 間は flush 順で submit するが server 到着順は保証しない。HTTP/1.1 multi-connection で 4 リクエストが別 TCP 接続に乗るため completion order はネットワーク次第。実 server は seek+write が fd 独立なので **非重複 range なら問題なし**、重複は **last write wins** = ADR-025 旧 ChunkedUploader 並列 worker と同じ semantics。
 
-#### Layer 2: multipart/byteranges を request body に流用
+#### Layer 2: multipart/mixed を request body として採用
 
-複数 range を 1 PATCH で送るために、RFC 7233 §A の `multipart/byteranges` (本来は response 用 media type) を request body として転用する。
+複数 range を 1 PATCH で送るために、RFC 2046 §5.1.3 の `multipart/mixed` (汎用 multipart container) を request body として使う。各 part が `Content-Range` header を持ち、対応する file offset への書込みを表す。
 
 **形式**:
 ```
 PATCH /uploads/:uploadId
-Content-Type: multipart/byteranges; boundary=mikura-<guid>
+Content-Type: multipart/mixed; boundary=mikura-<guid>
 
 \r\n--BOUNDARY\r\n
 Content-Type: application/octet-stream\r\n
@@ -1484,8 +1484,8 @@ Content-Range: bytes 1000-1499/*\r\n
 <500 bytes>\r\n--BOUNDARY--\r\n
 ```
 
-- **server side**: `server/src/util/multipartByteranges.ts` に streaming parser。各 part の `Content-Range` から `(offset, length)` を抜き、body 本体は逐次 sink (Deno.write per chunk) へ流して RAM 展開しない
-- **client side**: `System.Net.Http.MultipartContent("byteranges", boundary)` がそのまま使える。`ReadOnlyMemoryContent` で coalescer の 4MB バッファをスライスして part を作るので zero-copy
+- **server side**: `server/src/util/multipartRanges.ts` に streaming parser (media type 非依存)。各 part の `Content-Range` から `(offset, length)` を抜き、body 本体は逐次 sink (Deno.write per chunk) へ流して RAM 展開しない
+- **client side**: `System.Net.Http.MultipartContent("mixed", boundary)` がそのまま使える。`ReadOnlyMemoryContent` で coalescer の 4MB バッファをスライスして part を作るので zero-copy
 
 **part 1 つあたりのオーバーヘッド**: ~110B (boundary + Content-Type + Content-Range + 2× CRLF)。実用ケースの比率:
 
@@ -1495,7 +1495,13 @@ Content-Range: bytes 1000-1499/*\r\n
 | CDM RND 4K Q=32 batched | 64 | 256KB | 2.7% |
 | Excel sparse save batched | 16 | 200KB | 0.9% |
 
-**仕様面の選択**: HTTP 標準は Content-Range 多 range を request 側で規定していないので、独自 Content-Range 多 range 値 (`bytes 0-30,45-50/*`) は L7 WAF が malformed と判断するリスクがある (Cloudflare backend 等で実例)。一方 `multipart/byteranges` は RFC 7233 で正式に定義された media type なので、Content-Type だけ見て pass する WAF を通る公算が高い。両端を mikura で制御するが、将来 reverse proxy 経由運用を想定して標準準拠側を選択。
+**媒体型の選択経緯**: HTTP 標準は request body の複数 range 書込みを規定していないため、以下 3 案を検討した:
+
+1. **独自 Content-Range 多 range 値** (`Content-Range: bytes 0-30,45-50/*`): wire 形式は最小だが HTTP 仕様外。L7 WAF が malformed と判断するリスクあり (Cloudflare backend 等で実例)。**却下**
+2. **`multipart/byteranges`** (RFC 7233 §A) **を request body に流用**: 当初の設計案。Content-Range per part の semantics が RFC 7233 §A で明示されている強みがあるが、**IANA registry の登録に "This media type is not generally useful outside the context of HTTP messages with the response status code 206" と明記**されており、本来の用途 (206 response) から逸脱する。実装は両端 mikura なので動くが、registry 記述に反する設計を残すのは将来 reverse proxy 経由運用や外部 audit で説明負債になる。**却下**
+3. **`multipart/mixed`** (RFC 2046 §5.1.3): 汎用 multipart container として "the body parts are independent and need to be bundled in a particular order" を定義しているのみで、方向制限・用途制限なし。Content-Range per part は本媒体型では ad-hoc な application-level 拡張になるが、これは PATCH 標準が複数 range の概念を持たない以上どの案でも避けられない。**採用**
+
+選択は (3)。媒体型自体に方向制限を持たないので IANA registry に抵触せず、汎用 multipart の意味として正しい。Content-Type が `multipart/` で始まる点は (2) と変わらないため WAF/proxy 通過性のメリットも同じ。
 
 #### Layer 3: per-path SessionSlot (refcount + TCS)
 
@@ -1559,7 +1565,8 @@ Dictionary<string, SessionSlot> _activeSessions   // path keyed
 
 ### 却下した代替案
 
-- **独自 Content-Range 多 range 値** (`Content-Range: bytes 0-30,45-50/*`): wire 形式は最小だが HTTP 仕様外で WAF/proxy 通過性が不透明。multipart/byteranges を選択
+- **独自 Content-Range 多 range 値** (`Content-Range: bytes 0-30,45-50/*`): wire 形式は最小だが HTTP 仕様外で WAF/proxy 通過性が不透明
+- **`multipart/byteranges` を request body に流用**: IANA registry の usage restriction (206 response 以外で一般的に有用でない) に抵触するため見送り。詳細は「媒体型の選択経緯」項参照
 - **per-thread / global キャッシュ**: SessionSlot を path 単位ではなく thread / process global に持つ案。session lifecycle (start/finalize/abort) の同期が複雑化し、Cleanup 順と finalize 順がずれるケースで _tree 整合が取れなくなる。per-path で十分
 - **MaxInFlight=8 以上の更に深い pipeline**: メモリ消費が比例で増える割に、SEQ 1M の 120 MB/s 天井が server / WSL2 側にあるなら効果は薄い。HTTP/2 検証先行
 

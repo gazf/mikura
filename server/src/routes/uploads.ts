@@ -9,7 +9,7 @@ import {
 } from "../services/upload.service.ts";
 import { checkPermission } from "../services/auth.service.ts";
 import type { AuthUser } from "../services/auth.service.ts";
-import { extractBoundary } from "../util/multipartByteranges.ts";
+import { extractBoundary } from "../util/multipartRanges.ts";
 
 type Env = {
   Variables: {
@@ -65,8 +65,11 @@ export function registerUploadRoutes(app: Hono<Env>) {
 
   // PATCH /uploads/:uploadId — chunk 書込み。2 形式を受ける:
   //   1. 単一 range (既存): Content-Range: bytes <off>-<end>/* + raw body
-  //   2. 複数 range: Content-Type: multipart/byteranges; boundary=B + multipart body
-  //      (ADR は別途、client 側 WriteCoalescer の散発 IRP を 1 PATCH に束ねるための独自拡張)
+  //   2. 複数 range: Content-Type: multipart/mixed; boundary=B + multipart body
+  //      各 part は Content-Range header を持ち、対応する file offset への
+  //      書込みを表す (ADR-029)。multipart/byteranges を request body に流用する
+  //      設計案は IANA registry の usage restriction に抵触するため見送り、
+  //      RFC 2046 §5.1.3 の generic container である multipart/mixed を採用。
   app.patch("/uploads/:uploadId", async (c) => {
     const user = c.get("user");
     const uploadId = c.req.param("uploadId");
@@ -75,11 +78,11 @@ export function registerUploadRoutes(app: Hono<Env>) {
     if (!body) return c.json({ message: "Body required" }, 400);
 
     const contentType = c.req.header("Content-Type") ?? "";
-    if (contentType.toLowerCase().startsWith("multipart/byteranges")) {
+    if (contentType.toLowerCase().startsWith("multipart/mixed")) {
       const boundary = extractBoundary(contentType);
       if (!boundary) {
         return c.json(
-          { message: "multipart/byteranges requires boundary= parameter" },
+          { message: "multipart/mixed requires boundary= parameter" },
           400,
         );
       }
@@ -102,7 +105,7 @@ export function registerUploadRoutes(app: Hono<Env>) {
       return c.json(
         {
           message:
-            "Content-Range header (bytes <off>-<end>/*) or multipart/byteranges body required",
+            "Content-Range header (bytes <off>-<end>/*) or multipart/mixed body required",
         },
         400,
       );

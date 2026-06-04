@@ -146,7 +146,7 @@ internal sealed class FakeServerApi : IServerApi
         public byte[] Buffer = Array.Empty<byte>();
         public int Length;
         public int ChunkPatchCount;
-        // multipart/byteranges PATCH の累積カウント (新 coalescer 経路)。
+        // multipart/mixed PATCH の累積カウント (新 coalescer 経路)。
         public int MultipartPatchCount;
         public int MultipartRangeCount;
         public bool Finalized;

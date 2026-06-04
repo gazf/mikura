@@ -12,7 +12,7 @@ namespace Mikura.Core.Sync;
 ///
 /// <para>Write 経路は ADR-025 に従い chunked upload session に直流する
 /// (<see cref="WriteCoalescer"/>)。kernel の <c>Write</c> IRP は handle 単位の
-/// 4MB バッファに range pack されて 1 PATCH (multipart/byteranges) として送出される。
+/// 4MB バッファに range pack されて 1 PATCH (multipart/mixed) として送出される。
 /// handle のメモリ占有はファイルサイズに比例せず最大 4MB に bound される。</para>
 /// Read 経路は引き続き whole-file hydrate を使うため、Read+Write を同一 handle
 /// で行う場合は (1) 既存ファイル open は server で baseFromExisting コピーが効く、

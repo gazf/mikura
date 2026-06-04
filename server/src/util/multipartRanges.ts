@@ -1,8 +1,10 @@
 /**
- * `multipart/byteranges` (RFC 7233 §A) を request body として受け取るための
- * streaming parser。HTTP の応答 (206 Partial Content) で複数 range を返す媒体
- * 型を、こちらでは「単一 PATCH に複数 range の書込みを束ねる」用途で request
- * body として再利用している (ADR は別途記載)。
+ * 各 part が <c>Content-Range</c> を持つ multipart body を request 側で受け取る
+ * ための streaming parser。媒体型に依存しない汎用パーサで、現状は
+ * <c>multipart/mixed</c> (RFC 2046 §5.1.3) を contained type として ADR-029 が
+ * 採用している (旧設計の <c>multipart/byteranges</c> は IANA registry の usage
+ * restriction で「206 response 以外には一般的に有用でない」と明示されているため
+ * 流用は断念した)。
  *
  * 設計:
  *   - body 全体を RAM に展開しない。各 part の header 行はバッファに溜めるが、
@@ -12,7 +14,7 @@
  *     バイト列があっても誤検出しない (汎用 multipart parser より単純で速い)。
  *   - boundary は Content-Type の `boundary=` パラメータから抽出して渡す。
  *
- * 入力フォーマット (RFC 7233 §A):
+ * 入力フォーマット (RFC 2046 §5.1):
  *
  *     \r\n--BOUNDARY\r\n
  *     Content-Type: application/octet-stream\r\n
@@ -30,7 +32,7 @@
  * 任意なので skip する。
  */
 
-export class MultipartByterangesError extends Error {
+export class MultipartRangesError extends Error {
   constructor(message: string) {
     super(message);
   }
@@ -90,7 +92,7 @@ class StreamReader {
       if (this.buf.length === 0) {
         const r = await this.reader.read();
         if (r.done) {
-          throw new MultipartByterangesError(
+          throw new MultipartRangesError(
             `Premature EOF: ${remaining} bytes short`,
           );
         }
@@ -127,10 +129,10 @@ class StreamReader {
 const CONTENT_RANGE_RE = /^bytes (\d+)-(\d+)\/(\d+|\*)$/;
 
 /**
- * `multipart/byteranges` body を逐次パースし、各 part に対して handler を呼ぶ。
- * 戻り値はパースした part 数。
+ * boundary 付きの multipart body (現状 <c>multipart/mixed</c>) を逐次パースし、
+ * 各 part について handler を呼ぶ。戻り値はパースした part 数。
  */
-export async function parseMultipartByteranges(
+export async function parseMultipartRanges(
   body: ReadableStream<Uint8Array>,
   boundary: string,
   handler: PartHandler,
@@ -144,7 +146,7 @@ export async function parseMultipartByteranges(
   while (true) {
     const line = await reader.readLine();
     if (line === null) {
-      throw new MultipartByterangesError("No boundary found in body");
+      throw new MultipartRangesError("No boundary found in body");
     }
     if (line === delim) break;
     if (line === tail) return { rangeCount: 0 };
@@ -157,7 +159,7 @@ export async function parseMultipartByteranges(
     while (true) {
       const line = await reader.readLine();
       if (line === null) {
-        throw new MultipartByterangesError("Truncated part headers");
+        throw new MultipartRangesError("Truncated part headers");
       }
       if (line === "") break;
       const colon = line.indexOf(":");
@@ -167,19 +169,19 @@ export async function parseMultipartByteranges(
       if (name === "content-range") contentRange = value;
     }
     if (!contentRange) {
-      throw new MultipartByterangesError("Missing Content-Range in part");
+      throw new MultipartRangesError("Missing Content-Range in part");
     }
 
     const m = contentRange.match(CONTENT_RANGE_RE);
     if (!m) {
-      throw new MultipartByterangesError(
+      throw new MultipartRangesError(
         `Invalid Content-Range: ${contentRange}`,
       );
     }
     const start = parseInt(m[1], 10);
     const end = parseInt(m[2], 10);
     if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) {
-      throw new MultipartByterangesError(
+      throw new MultipartRangesError(
         `Invalid Content-Range bounds: ${contentRange}`,
       );
     }
@@ -195,15 +197,15 @@ export async function parseMultipartByteranges(
     // 食い、続く 1 行で boundary or terminator を判定する。
     const sep = await reader.readLine();
     if (sep !== "") {
-      throw new MultipartByterangesError(
+      throw new MultipartRangesError(
         `Expected CRLF after part body, got: ${sep}`,
       );
     }
     const next = await reader.readLine();
-    if (next === null) throw new MultipartByterangesError("Truncated after part");
+    if (next === null) throw new MultipartRangesError("Truncated after part");
     if (next === tail) return { rangeCount };
     if (next !== delim) {
-      throw new MultipartByterangesError(`Bad boundary line: ${next}`);
+      throw new MultipartRangesError(`Bad boundary line: ${next}`);
     }
   }
 }

@@ -231,7 +231,11 @@ public class HttpServerApi(HttpClient http, string baseUrl) : IServerApi, IDispo
         // ランダムバイナリは衝突可能性がゼロでない。実用上は GUID 形式で十分
         // (128bit 衝突空間 + boundary プレフィクスを工夫すれば事実上ゼロ)。
         var boundary = $"mikura-{Guid.NewGuid():N}";
-        using var multipart = new MultipartContent("byteranges", boundary);
+        // ADR-029: multipart/mixed (RFC 2046 §5.1.3) を採用。各 part が
+        // Content-Range header を持ち、対応する file offset への書込みを表す。
+        // multipart/byteranges を流用する設計案は IANA registry の usage
+        // restriction (206 response 以外で一般的でない) に抵触するため見送り。
+        using var multipart = new MultipartContent("mixed", boundary);
         foreach (var range in ranges)
         {
             var part = new ReadOnlyMemoryContent(buffer.Slice(range.BufferOffset, range.Length));

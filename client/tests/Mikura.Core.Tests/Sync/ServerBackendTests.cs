@@ -591,7 +591,7 @@ public class ServerBackendTests
     public async Task NonContiguousWrites_CoalesceIntoSingleMultipartPatch()
     {
         // 散発的な非連続 IRP (Excel/SQLite/RND 4K Q=32 ベンチが踏むパターン) を
-        // 同一 handle にまとめる: 1 PATCH に multipart/byteranges で束ねて送られる。
+        // 同一 handle にまとめる: 1 PATCH に multipart/mixed で束ねて送られる。
         var server = new FakeServerApi();
         var backend = await NewInitializedBackendAsync(server);
 
