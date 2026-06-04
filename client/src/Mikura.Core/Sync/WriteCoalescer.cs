@@ -51,10 +51,16 @@ internal sealed class WriteCoalescer : IAsyncDisposable
     private int _bufFilled;
     private readonly List<UploadRange> _ranges = new(capacity: 64);
 
-    // 1-deep pipeline: 直前のバッチ送信タスク。新規 flush の前にこれを await して
-    // 順序保証 + バッファ多重保有 (= メモリ膨張) を防ぐ。送信中に append が走れる
-    // のでスループットは「append 時間 と send 時間 の max」が下限になる。
-    private Task? _inFlightFlush;
+    // N-deep pipeline: 同時 in-flight PATCH 本数の上限。Read 側が HttpClient の
+    // MaxConnectionsPerServer=8 並列で 342 MB/s 出ているのに対し、Write は serial
+    // PATCH だと 80 MB/s 頭打ち。N を増やせば HTTP/1.1 multi-connection を使い切れる。
+    // 順序: 同一 buffer 内は range list 順で保証、buffer 間は flush 順で submit するが
+    // server 側到着順は GC されない (実 server は seek+write が fd 独立なので
+    // 非重複 range なら問題ない。重複は最後勝ち = 旧 ChunkedUploader 並列 worker と同じ)。
+    private const int MaxInFlight = 4;
+    private readonly SemaphoreSlim _sendSlots = new(MaxInFlight, MaxInFlight);
+    private readonly List<Task> _inFlightSends = new(capacity: MaxInFlight);
+    private readonly object _inFlightSendsGate = new();
 
     private volatile bool _shutdown;
     private volatile Exception? _firstError;
@@ -82,17 +88,12 @@ internal sealed class WriteCoalescer : IAsyncDisposable
         {
             // target 超の単一 IRP は coalesce せず単 range PATCH に直流。
             // FlushLocked が背景 send を kick するだけで return するので、ここで
-            // 必ず drain してから直流に出す (順序保証)。
+            // 全 in-flight を drain してから直流に出す (順序保証)。大 IRP は元々
+            // データサイズ自体が支配的なので pipeline 化の旨味は薄く、シンプルに同期で OK。
             if (data.Length >= TargetBufferSize)
             {
                 await FlushLocked(ct).ConfigureAwait(false);
-                var pending = _inFlightFlush;
-                _inFlightFlush = null;
-                if (pending is not null)
-                {
-                    try { await pending.ConfigureAwait(false); }
-                    catch { /* error は _firstError に記録済 */ }
-                }
+                await DrainPendingAsync().ConfigureAwait(false);
                 await _server.UploadChunkAsync(_uploadId, fileOffset, data, ct).ConfigureAwait(false);
                 return;
             }
@@ -159,7 +160,7 @@ internal sealed class WriteCoalescer : IAsyncDisposable
 
     // _gate 保有前提。現バッファを切り離して send タスクに渡す。
     // send 自体は別 Task で背景進行し、await はせず即 return する (pipeline)。
-    // 直前 batch が in-flight なら、それを await してから新 batch を kick (= 1-deep)。
+    // in-flight 数が <see cref="MaxInFlight"/> に達していたら _sendSlots で待つ。
     private async Task FlushLocked(CancellationToken ct)
     {
         if (_buf is null || _ranges.Count == 0)
@@ -176,16 +177,11 @@ internal sealed class WriteCoalescer : IAsyncDisposable
 
         _idleTimer.Change(Timeout.Infinite, Timeout.Infinite);
 
-        // 直前 send を待つ (順序保証 + バッファ占有 1 本に bound)。
+        // in-flight 上限に達していたら、どれかが終わって slot が空くまで待つ。
         // この await の間 _gate は保有したままなので、新 append は queue で待つ。
-        // send が append より遅い場合は依然として律速されるが、send と append が
-        // 同程度の workload では並列化により実効スループットが約 2 倍になる。
-        var prev = _inFlightFlush;
-        if (prev is not null && !prev.IsCompleted)
-        {
-            try { await prev.ConfigureAwait(false); }
-            catch { /* error は _firstError に記録済 */ }
-        }
+        // ただし MaxInFlight 本走らせている間に append が gate で詰まる事は事実上ない
+        // (kernel IRP より HTTP send の方が遅いケース = 元々の bottleneck パターン)。
+        await _sendSlots.WaitAsync(ct).ConfigureAwait(false);
 
         var buf = _buf;
         var bufLen = _bufFilled;
@@ -194,9 +190,14 @@ internal sealed class WriteCoalescer : IAsyncDisposable
         _bufFilled = 0;
         _ranges.Clear();
 
-        // ここで新 send を kick して背景に放す。gate 解放後すぐに append が
-        // 新バッファに対して走れる。
-        _inFlightFlush = SendBatchAsync(buf, bufLen, ranges, ct);
+        // ここで新 send を kick して背景に放す。slot は send 完了時に SendBatchAsync 内で release。
+        var task = SendBatchAsync(buf, bufLen, ranges, ct);
+        lock (_inFlightSendsGate)
+        {
+            // 完了済みエントリは drain せず溜まり続けるので、ここで間引く。
+            _inFlightSends.RemoveAll(t => t.IsCompleted);
+            _inFlightSends.Add(task);
+        }
     }
 
     private async Task SendBatchAsync(byte[] buf, int bufLen, UploadRange[] ranges, CancellationToken ct)
@@ -231,6 +232,7 @@ internal sealed class WriteCoalescer : IAsyncDisposable
         finally
         {
             _pool.Return(buf, clearArray: false);
+            _sendSlots.Release();
         }
     }
 
@@ -241,17 +243,15 @@ internal sealed class WriteCoalescer : IAsyncDisposable
     /// </summary>
     private async Task DrainPendingAsync()
     {
-        Task? pending;
-        await _gate.WaitAsync().ConfigureAwait(false);
-        try
+        Task[] snapshot;
+        lock (_inFlightSendsGate)
         {
-            pending = _inFlightFlush;
-            _inFlightFlush = null;
+            snapshot = _inFlightSends.ToArray();
+            _inFlightSends.Clear();
         }
-        finally { _gate.Release(); }
-        if (pending is not null)
+        if (snapshot.Length > 0)
         {
-            try { await pending.ConfigureAwait(false); }
+            try { await Task.WhenAll(snapshot).ConfigureAwait(false); }
             catch { /* error は _firstError に記録済 */ }
         }
         ThrowIfBroken();

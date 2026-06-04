@@ -1460,7 +1460,9 @@ flush 時:
 
 target サイズ超 (≥4MB) の 1 IRP は coalesce せず単 range PATCH に直送。
 
-**1-deep pipeline**: flush が始まった瞬間、background `Task` に send を放して `_inFlightFlush` に保管。直後の append は新バッファに対して走れる (`_gate` は瞬時に解放される)。次の flush は前 send を await してから自分の send を kick することで、(a) **1 本だけ in-flight** に bound、(b) **PATCH 順序保証** を両立する。
+**N-deep pipeline (N=4)**: flush 時に `SemaphoreSlim(4, 4)` から slot を 1 つ取り、background `Task` で send。slot は send 完了時に release。同時に最大 4 PATCH が in-flight になる。Read 経路が HttpClient の `MaxConnectionsPerServer=8` 並列を使い切って 342 MB/s を出していたのに対し、Write を serial PATCH で運用すると 80 MB/s 頭打ちで非対称になっていたのを解消する。
+
+順序保証: 同一 buffer 内は range list 順、buffer 間は flush 順で submit するが server 到着順は保証しない。HTTP/1.1 multi-connection で 4 リクエストが別 TCP 接続に乗るため completion order はネットワーク次第。実 server は seek+write が fd 独立なので **非重複 range なら問題なし**、重複は **last write wins** = ADR-025 旧 ChunkedUploader 並列 worker と同じ semantics。
 
 #### Layer 2: multipart/byteranges を request body に流用
 
@@ -1519,35 +1521,47 @@ Dictionary<string, SessionSlot> _activeSessions   // path keyed
 
 **Mixed baseFromExisting** (1 handle が `CreateAsync`、別 handle が `OpenAsync` で write) は **最初の caller の判定を採用**。実用上は 16 個同時 open がすべて同じ intent なので影響なし。万一 mixed の場合は最初の caller の `baseFromExisting=true` が採用されて 1GB copy が 1 回だけ走る。
 
-### 計測 (CDM 9.0.2, 1 GiB×3, WSL2 LAN)
+### 計測 (CDM 9.0.2, 1 GiB×3, WSL2 LAN, Release build)
 
-|  | ADR-025 baseline (HTTP/1.1) | ADR-029 (write cache) |
-|---|---|---|
-| SEQ 1M Q=8 Write | 80 MB/s | 81 MB/s |
-| SEQ 128K Q=32 Write | 54 MB/s | 76 MB/s (+40%) |
-| **RND 4K Q=32 T=16 Write** | **0.007 MB/s** | **22.6 MB/s** (**~3000×**) |
-| RND 4K Q=1 T=1 Write | 16.7 MB/s | 21.8 MB/s (+30%) |
-| SEQ 1M Q=8 Read | 326 MB/s | 342 MB/s |
-| RND 4K Q=32 T=16 Read | 2.33 MB/s | 2.57 MB/s |
+|  | ADR-025 baseline | ADR-029 1-deep | ADR-029 4-deep (採用) |
+|---|---|---|---|
+| SEQ 1M Q=8 Write | 80 MB/s | 81 MB/s | **120 MB/s** |
+| SEQ 128K Q=32 Write | 54 MB/s | 76 MB/s | **108 MB/s** |
+| **RND 4K Q=32 T=16 Write** | **0.007 MB/s** | 22.6 MB/s | **51 MB/s** |
+| RND 4K Q=1 T=1 Write | 16.7 MB/s | 21.8 MB/s | **50 MB/s** |
+| SEQ 1M Q=8 Read | 326 MB/s | 342 MB/s | 301 MB/s |
+| RND 4K Q=32 T=16 Read | 2.33 MB/s | 2.57 MB/s | 2.51 MB/s |
 
-クライアントプロセス常駐メモリ (RND Q=32 Write 中): **~300 MB → ~50 MB** (16 個の per-handle coalescer + 1-deep pipeline buf が 1 個に集約された結果)。
+クライアントプロセス常駐メモリ (RND Q=32 Write 中):
+- baseline: ~300 MB
+- 1-deep (session-sharing のみ): ~50 MB
+- 4-deep pipeline: ~114 MB (+64 MB)
 
-3000× の支配的要因は **per-path session sharing**。Layer 1/2 (coalesce + multipart) は単体では SEQ 128K Q=32 で +40% 程度の効きで、Layer 3 が無いとそもそも測定窓が base copy で埋まって観測できなかった。
+メモリ増 +64 MB は in-flight buffer 4 本 (~16 MB) + MultipartContent serialize 中間 + HttpClient per-connection send buffer の合算。**RND の 2.2x / SEQ 128K の 1.4x スループット向上に対する trade として妥当**。
 
-### 残存する天井
+### 段階別の支配的要因 (重要)
 
-SEQ 1M Write 80 MB/s 頭打ちは依然 transport-bound (HTTP/1.1 single connection + multipart serialize + WSL2)。server 側 disk は ~300 MB/s 出ているので、さらなる write スループット改善は:
+各層単独の寄与を分離すると:
 
-- **並列 PATCH を許可** (1-deep pipeline → N-deep): 順序保証のために in-flight 中の PATCH 間で server 側 atomic 化が必要
-- **HTTP/2 stream multiplex 復活**: ADR-028 のブロッカー (Deno.serve の HTTP/2 settings 非公開) が解消すれば候補
+1. **per-path session sharing** が RND Q=32 の **~3000x の支配的要因** (0.007 → 22.6)。これがないと測定窓が baseFromExisting copy で埋まり、他の最適化は観測すらできない
+2. **range-coalesce + multipart** は単独では SEQ 128K で +40% 程度。session sharing と組み合わせて初めて効く
+3. **N-deep (1→4) pipeline** が更に **2.2x** を載せる。1-deep 時の WriteCoalescer は MaxConnectionsPerServer=8 を 1 本しか使わず、Read 経路 (8 並列 GET = 342 MB/s) との非対称が SEQ Write の見えない天井だった
 
-のいずれか。優先度は ADR-028 の再開条件に従う。
+### 残存する天井 (~120 MB/s)
+
+4-deep でも SEQ 1M Write は ~120 MB/s で頭打ち。server-side disk は実機 ~300 MB/s 出ているので、残る候補は:
+
+- **WSL2 networking の write 方向帯域** (Read 342 MB/s vs Write 120 MB/s の非対称)
+- **Deno.serve の async I/O thread pool 上限** (file.write が pool 経由で serial 化)
+- **HTTP/2 stream multiplex 復活** (ADR-028 の再評価。1-deep 時代に検証した時の "-80%" は **per-IRP PATCH 構造が前提**だったので、4MB chunk + N-deep pipeline 体制では再計測する価値あり)
+
+優先度は ADR-028 の再開条件と本 ADR の measurement リランで決定。
 
 ### 却下した代替案
 
 - **独自 Content-Range 多 range 値** (`Content-Range: bytes 0-30,45-50/*`): wire 形式は最小だが HTTP 仕様外で WAF/proxy 通過性が不透明。multipart/byteranges を選択
 - **per-thread / global キャッシュ**: SessionSlot を path 単位ではなく thread / process global に持つ案。session lifecycle (start/finalize/abort) の同期が複雑化し、Cleanup 順と finalize 順がずれるケースで _tree 整合が取れなくなる。per-path で十分
-- **N-deep pipeline (in-flight PATCH 並列度を 2 以上)**: 1-deep でも RND Q=32 Write が 22.6 MB/s 出るので必要性が低い。順序保証の追加コストに見合わない
+- **MaxInFlight=8 以上の更に深い pipeline**: メモリ消費が比例で増える割に、SEQ 1M の 120 MB/s 天井が server / WSL2 側にあるなら効果は薄い。HTTP/2 検証先行
 
 ### 関連 ADR
 
