@@ -1,6 +1,10 @@
+using System.Buffers;
+using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
+using System.Text;
 using System.Text.Json;
+using System.Text.Unicode;
 using Mikura.Core.Abstractions;
 using Mikura.Core.Models;
 
@@ -22,6 +26,13 @@ public class HttpServerApi(HttpClient http, string baseUrl) : IServerApi, IDispo
 {
     private readonly HttpClient _http = http;
     private readonly string _baseUrl = baseUrl.TrimEnd('/');
+
+    // PATCH chunk + multipart part の Content-Type は固定 octet-stream。
+    // MediaTypeHeaderValue は parameters を mutate しない限り read-only に扱えるので、
+    // 全リクエストで共有して per-part alloc を回避する (multipart で 1 PATCH あたり
+    // 64 part 以上になるケースで効果)。
+    private static readonly MediaTypeHeaderValue OctetStreamContentType =
+        new("application/octet-stream");
 
     public async Task<IReadOnlyList<TreeNode>> GetTreeAsync(CancellationToken ct = default)
     {
@@ -125,7 +136,7 @@ public class HttpServerApi(HttpClient http, string baseUrl) : IServerApi, IDispo
     {
         var url = $"{_baseUrl}/content{NormalizePath(path)}";
         using var streamContent = new StreamContent(content);
-        streamContent.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+        streamContent.Headers.ContentType = OctetStreamContentType;
         using var response = await _http.PutAsync(url, streamContent, ct).ConfigureAwait(false);
         await EnsureSuccess(response, ct).ConfigureAwait(false);
         return await response.Content.ReadFromJsonAsync(TransportJsonContext.Default.UploadResult, ct).ConfigureAwait(false)
@@ -213,7 +224,7 @@ public class HttpServerApi(HttpClient http, string baseUrl) : IServerApi, IDispo
         };
         // chunk byte は session の意味で連続している必要はない (random offset)。
         // total は不明なので '*' を使う。
-        request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+        request.Content.Headers.ContentType = OctetStreamContentType;
         request.Content.Headers.Add("Content-Range", $"bytes {offset}-{end}/*");
         using var response = await _http.SendAsync(request, ct).ConfigureAwait(false);
         await EnsureSuccess(response, ct).ConfigureAwait(false);
@@ -231,24 +242,120 @@ public class HttpServerApi(HttpClient http, string baseUrl) : IServerApi, IDispo
         // ランダムバイナリは衝突可能性がゼロでない。実用上は GUID 形式で十分
         // (128bit 衝突空間 + boundary プレフィクスを工夫すれば事実上ゼロ)。
         var boundary = $"mikura-{Guid.NewGuid():N}";
-        // ADR-029: multipart/mixed (RFC 2046 §5.1.3) を採用。各 part が
-        // Content-Range header を持ち、対応する file offset への書込みを表す。
-        // multipart/byteranges を流用する設計案は IANA registry の usage
-        // restriction (206 response 以外で一般的でない) に抵触するため見送り。
-        using var multipart = new MultipartContent("mixed", boundary);
-        foreach (var range in ranges)
-        {
-            var part = new ReadOnlyMemoryContent(buffer.Slice(range.BufferOffset, range.Length));
-            part.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-            // Content-Range total は session 全体長が不定なので '*'。
-            part.Headers.Add(
-                "Content-Range",
-                $"bytes {range.FileOffset}-{range.FileOffset + range.Length - 1}/*");
-            multipart.Add(part);
-        }
-        using var request = new HttpRequestMessage(HttpMethod.Patch, url) { Content = multipart };
+        using var content = new MultipartRangesContent(boundary, buffer, ranges);
+        using var request = new HttpRequestMessage(HttpMethod.Patch, url) { Content = content };
         using var response = await _http.SendAsync(request, ct).ConfigureAwait(false);
         await EnsureSuccess(response, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// ADR-029: multipart/mixed (RFC 2046 §5.1.3) body を直接 stream に書き出す
+    /// <see cref="HttpContent"/>。<see cref="MultipartContent"/> + per-part
+    /// <see cref="ReadOnlyMemoryContent"/> 構成より alloc を 1 PATCH あたり数十
+    /// オブジェクト → 数個に削減する。
+    ///
+    /// <para>per-part の payload は buffer の slice をそのまま <c>stream.WriteAsync</c>
+    /// に渡すので zero-copy。header bytes は ArrayPool 貸出の小バッファに
+    /// <c>Utf8.TryWrite</c> で format して書く (中間 string 0 個)。
+    /// <see cref="TryComputeLength"/> を実装しているので Content-Length 確定 →
+    /// chunked transfer-encoding を回避できる。媒体型自体に方向制限のない
+    /// multipart/mixed を採用したのは IANA registry が multipart/byteranges の
+    /// "206 response 以外での流用" を非推奨としているため (ADR-029 参照)。</para>
+    /// </summary>
+    private sealed class MultipartRangesContent : HttpContent
+    {
+        // 全 PATCH で共有する不変 header bytes。
+        private static readonly byte[] PartHeaderPrefix =
+            "Content-Type: application/octet-stream\r\nContent-Range: "u8.ToArray();
+        private static readonly byte[] HeaderTerminator = "\r\n\r\n"u8.ToArray();
+
+        private readonly string _boundary;
+        private readonly ReadOnlyMemory<byte> _buffer;
+        private readonly IReadOnlyList<UploadRange> _ranges;
+
+        public MultipartRangesContent(string boundary, ReadOnlyMemory<byte> buffer, IReadOnlyList<UploadRange> ranges)
+        {
+            _boundary = boundary;
+            _buffer = buffer;
+            _ranges = ranges;
+            Headers.ContentType = new MediaTypeHeaderValue("multipart/mixed");
+            Headers.ContentType.Parameters.Add(new NameValueHeaderValue("boundary", boundary));
+        }
+
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) =>
+            SerializeAsync(stream, CancellationToken.None);
+
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context, CancellationToken cancellationToken) =>
+            SerializeAsync(stream, cancellationToken);
+
+        private async Task SerializeAsync(Stream stream, CancellationToken ct)
+        {
+            // boundary を含む 3 種類の delimiter 行は per-PATCH 1 個ずつ alloc
+            // (boundary が GUID で request 固有のため使い回し不可)。
+            var firstBoundary = Encoding.ASCII.GetBytes($"--{_boundary}\r\n");
+            var midBoundary = Encoding.ASCII.GetBytes($"\r\n--{_boundary}\r\n");
+            var finalBoundary = Encoding.ASCII.GetBytes($"\r\n--{_boundary}--\r\n");
+
+            // Content-Range の数値部分用の小バッファ。"bytes X-Y/*" は long 最大でも
+            // 9 + 19 + 19 = 47 byte に収まる。
+            var rangeBuf = ArrayPool<byte>.Shared.Rent(64);
+            try
+            {
+                for (int i = 0; i < _ranges.Count; i++)
+                {
+                    var r = _ranges[i];
+                    await stream.WriteAsync(i == 0 ? firstBoundary : midBoundary, ct).ConfigureAwait(false);
+                    await stream.WriteAsync(PartHeaderPrefix, ct).ConfigureAwait(false);
+
+                    long end = r.FileOffset + r.Length - 1;
+                    if (!Utf8.TryWrite(rangeBuf, $"bytes {r.FileOffset}-{end}/*", out int written))
+                        throw new InvalidOperationException("Content-Range buffer too small");
+                    await stream.WriteAsync(rangeBuf.AsMemory(0, written), ct).ConfigureAwait(false);
+
+                    await stream.WriteAsync(HeaderTerminator, ct).ConfigureAwait(false);
+                    await stream.WriteAsync(_buffer.Slice(r.BufferOffset, r.Length), ct).ConfigureAwait(false);
+                }
+                await stream.WriteAsync(finalBoundary, ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(rangeBuf);
+            }
+        }
+
+        protected override bool TryComputeLength(out long length)
+        {
+            if (_ranges.Count == 0) { length = 0; return true; }
+
+            int b = _boundary.Length;
+            // first boundary "--<B>\r\n" = 4 + B
+            // mid boundary   "\r\n--<B>\r\n" = 6 + B
+            // final boundary "\r\n--<B>--\r\n" = 8 + B
+            long total = (4 + b)                              // first boundary
+                       + (long)(_ranges.Count - 1) * (6 + b)  // mid boundaries
+                       + (8 + b);                             // final boundary
+
+            int prefixLen = PartHeaderPrefix.Length;
+            int terminatorLen = HeaderTerminator.Length;
+            foreach (var r in _ranges)
+            {
+                long end = r.FileOffset + r.Length - 1;
+                // "bytes X-Y/*" = 6 + digits(X) + 1 + digits(Y) + 2 = 9 + digits(X) + digits(Y)
+                int contentRangeLen = 9 + CountDigits(r.FileOffset) + CountDigits(end);
+                total += prefixLen + contentRangeLen + terminatorLen + r.Length;
+            }
+            length = total;
+            return true;
+        }
+
+        private static int CountDigits(long n)
+        {
+            if (n == 0) return 1;
+            if (n < 0) n = -n; // file offset は非負前提だが防御的に。
+            int count = 0;
+            while (n > 0) { count++; n /= 10; }
+            return count;
+        }
     }
 
     public async Task<UploadResult> FinalizeUploadAsync(string uploadId, long finalSize, CancellationToken ct = default)

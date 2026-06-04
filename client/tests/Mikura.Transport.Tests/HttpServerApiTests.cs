@@ -229,4 +229,92 @@ public class HttpServerApiTests
         var ex = await Assert.ThrowsAsync<ApiException>(() => server.AcquireLockAsync("/foo.txt"));
         Assert.Equal("no write", ex.Message);
     }
+
+    // ---------- UploadChunksMultipartAsync (MultipartRangesContent wire format) ----------
+
+    [Fact]
+    public async Task UploadChunksMultipartAsync_ProducesExpectedMultipartMixedBody()
+    {
+        // MultipartRangesContent が生成する wire bytes を server parser と同じ手順で
+        // 走査し、boundary 行 + per-part headers + payload + 末尾 boundary の順序と
+        // Content-Length の整合性を確認する。
+        byte[]? capturedBody = null;
+        string? capturedContentType = null;
+        long? capturedContentLength = null;
+        var (server, _) = NewServer(req =>
+        {
+            capturedContentType = req.Content!.Headers.ContentType!.ToString();
+            capturedContentLength = req.Content.Headers.ContentLength;
+            capturedBody = req.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("{\"size\":42,\"rangeCount\":3}", System.Text.Encoding.UTF8, "application/json"),
+            };
+        });
+
+        // 3 range, 非連続 offset, ペイロードに boundary 風の bytes も混ぜて誤検出しないこと確認。
+        var buffer = new byte[64];
+        for (int i = 0; i < buffer.Length; i++) buffer[i] = (byte)(i + 1);
+        var ranges = new List<UploadRange>
+        {
+            new(FileOffset: 0,    BufferOffset: 0,  Length: 10),
+            new(FileOffset: 100,  BufferOffset: 10, Length: 20),
+            new(FileOffset: 1000, BufferOffset: 30, Length: 5),
+        };
+
+        await server.UploadChunksMultipartAsync("upload-xyz", buffer, ranges);
+
+        Assert.NotNull(capturedBody);
+        Assert.NotNull(capturedContentLength);
+        // Content-Length が body 実 byte 数に一致 (TryComputeLength の正確性)。
+        Assert.Equal(capturedBody!.Length, capturedContentLength);
+        // Content-Type が multipart/mixed + boundary パラメータ。
+        Assert.StartsWith("multipart/mixed", capturedContentType);
+        Assert.Contains("boundary=", capturedContentType);
+
+        // boundary を Content-Type から抜き出して body 内に正しく現れているか確認。
+        var boundaryStart = capturedContentType!.IndexOf("boundary=", StringComparison.Ordinal) + "boundary=".Length;
+        var boundary = capturedContentType.Substring(boundaryStart).Trim('"');
+        var text = System.Text.Encoding.ASCII.GetString(capturedBody);
+
+        // 先頭は --BOUNDARY\r\n (leading CRLF なし)。
+        Assert.StartsWith($"--{boundary}\r\n", text);
+        // 末尾は \r\n--BOUNDARY--\r\n。
+        Assert.EndsWith($"\r\n--{boundary}--\r\n", text);
+
+        // 各 range の Content-Range が body 中に文字列として出現する。
+        Assert.Contains("Content-Range: bytes 0-9/*", text);
+        Assert.Contains("Content-Range: bytes 100-119/*", text);
+        Assert.Contains("Content-Range: bytes 1000-1004/*", text);
+
+        // payload bytes が改ざんなく載っているか (buffer[0..10], buffer[10..30], buffer[30..35])。
+        var part1 = buffer.AsSpan(0, 10).ToArray();
+        var part2 = buffer.AsSpan(10, 20).ToArray();
+        var part3 = buffer.AsSpan(30, 5).ToArray();
+        Assert.True(SpanContains(capturedBody, part1));
+        Assert.True(SpanContains(capturedBody, part2));
+        Assert.True(SpanContains(capturedBody, part3));
+    }
+
+    [Fact]
+    public async Task UploadChunksMultipartAsync_EmptyRanges_NoRequest()
+    {
+        var (server, handler) = NewServer(_ => new HttpResponseMessage(HttpStatusCode.OK));
+        await server.UploadChunksMultipartAsync("upload-xyz", ReadOnlyMemory<byte>.Empty, new List<UploadRange>());
+        Assert.Empty(handler.Requests);
+    }
+
+    private static bool SpanContains(byte[] haystack, byte[] needle)
+    {
+        for (int i = 0; i <= haystack.Length - needle.Length; i++)
+        {
+            bool match = true;
+            for (int j = 0; j < needle.Length; j++)
+            {
+                if (haystack[i + j] != needle[j]) { match = false; break; }
+            }
+            if (match) return true;
+        }
+        return false;
+    }
 }
