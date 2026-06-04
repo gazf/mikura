@@ -30,6 +30,10 @@ import { Keys } from "../kv/keys.ts";
 import { getDataRoot } from "./file.service.ts";
 import { getLock } from "./lock.service.ts";
 import { broadcastFileEvent } from "./wsBroadcast.service.ts";
+import {
+  MultipartRangesError,
+  parseMultipartRanges,
+} from "../util/multipartRanges.ts";
 import type { UploadSession } from "../types.ts";
 
 const STAGING_ROOT = Deno.env.get("MIKURA_STAGING_ROOT") ??
@@ -238,6 +242,56 @@ export async function writeChunk(
     }
     const stat = await file.stat();
     return { writtenAt: offset, size: stat.size };
+  } finally {
+    file.close();
+  }
+}
+
+/**
+ * (PATCH /uploads/:uploadId, Content-Type: multipart/mixed) 複数 range を
+ * 1 リクエストで書き込む。
+ *
+ * <p>各 part は Content-Range header を持ち、対応する file offset への書込みを
+ * 表す (ADR-029)。client 側で散らばった write IRP を 1 PATCH に束ねて RTT を
+ * 削減する write cache 用の経路。multipart/mixed は RFC 2046 §5.1.3 の汎用
+ * container で、媒体型自体に方向制限はない。</p>
+ *
+ * <p>file は 1 度だけ open し、part ごとに seek+write。Deno.write は POSIX
+ * pwrite ではないので「seek してから write」をペアにする必要があり、複数 part
+ * の並行処理はできない (handler は逐次呼ばれるのでこの parser は要件に合う)。</p>
+ */
+export async function writeChunksMultipart(
+  uploadId: string,
+  deviceId: string,
+  body: ReadableStream<Uint8Array>,
+  boundary: string,
+): Promise<{ size: number; rangeCount: number }> {
+  const session = await loadSession(uploadId, deviceId);
+
+  const file = await Deno.open(session.tempPath, { write: true, read: true });
+  try {
+    let rangeCount = 0;
+    try {
+      const result = await parseMultipartRanges(body, boundary, {
+        async onStart(offset: number, _length: number) {
+          await file.seek(offset, Deno.SeekMode.Start);
+        },
+        async onData(chunk: Uint8Array) {
+          let written = 0;
+          while (written < chunk.length) {
+            written += await file.write(chunk.subarray(written));
+          }
+        },
+      });
+      rangeCount = result.rangeCount;
+    } catch (e) {
+      if (e instanceof MultipartRangesError) {
+        throw new UploadServiceError(e.message, 400);
+      }
+      throw e;
+    }
+    const stat = await file.stat();
+    return { size: stat.size, rangeCount };
   } finally {
     file.close();
   }

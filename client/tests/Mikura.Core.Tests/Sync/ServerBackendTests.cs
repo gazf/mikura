@@ -457,6 +457,8 @@ public class ServerBackendTests
     {
         // ADR-025 の核: 新規作成 (FreshlyCreated) は session 開始時に
         // baseFromExisting=false で開かれ、kernel write は PATCH で素通しする。
+        // 連続 offset の Write は WriteCoalescer により単一 PATCH に集約される
+        // (kernel IRP 単位の往復を削減する write cache)。
         var server = new FakeServerApi();
         var backend = await NewInitializedBackendAsync(server);
 
@@ -471,7 +473,8 @@ public class ServerBackendTests
         var session = server.SessionsByUploadId.Values.Single(s => s.Path == "/fresh.bin");
         Assert.False(session.BaseFromExisting);
         Assert.True(session.Finalized);
-        Assert.Equal(2, session.ChunkPatchCount); // 2 つの Write は 2 PATCH に対応
+        // 2 つの連続 Write は coalesce されて 1 PATCH に集約。
+        Assert.Equal(1, session.ChunkPatchCount);
     }
 
     [Fact]
@@ -492,6 +495,135 @@ public class ServerBackendTests
 
         var session = server.SessionsByUploadId.Values.Single(s => s.Path == "/doc.bin");
         Assert.True(session.BaseFromExisting);
+    }
+
+    [Fact]
+    public async Task ConcurrentHandles_SamePath_ShareSingleSession()
+    {
+        // 同一 path に対して複数 handle が write open されても、StartUpload は
+        // 最初の 1 回だけ走り、finalize も最後の handle が代表で 1 回だけ走る。
+        // CDM T=16 が 16 個の handle を開いて 16 個の base copy を走らせる回帰の防止。
+        var server = new FakeServerApi();
+        var backend = await NewInitializedBackendAsync(server);
+
+        var h1 = await backend.CreateAsync("/shared.bin", isDirectory: false);
+        await backend.WriteAsync(h1!, 0, new byte[] { 0x10, 0x20 }, appendToEnd: false, constrainedIo: false);
+
+        var h2 = await backend.OpenAsync("/shared.bin", FileAccessIntent.Write);
+        await backend.WriteAsync(h2!, 2, new byte[] { 0x30, 0x40 }, appendToEnd: false, constrainedIo: false);
+
+        // h1 を先に Cleanup → 自分は最後ではないので skip。
+        await backend.CleanupAsync(h1!, CleanupFlags.Modified);
+        // 中間状態: session はまだ open、staging には両 handle 分の write が積まれている。
+        Assert.Single(server.SessionsByUploadId);
+        var session = server.SessionsByUploadId.Values.Single();
+        Assert.False(session.Finalized);
+        Assert.False(session.Aborted);
+
+        // h2 を Cleanup → 自分が最後なので実 finalize。
+        await backend.CleanupAsync(h2!, CleanupFlags.Modified);
+
+        Assert.True(session.Finalized);
+        Assert.Equal(new byte[] { 0x10, 0x20, 0x30, 0x40 }, server.Files["/shared.bin"]);
+        // baseFromExisting は最初の caller (CreateAsync → FreshlyCreated) が採用される。
+        Assert.False(session.BaseFromExisting);
+
+        h1!.Dispose();
+        h2!.Dispose();
+    }
+
+    [Fact]
+    public async Task ContiguousSmallWrites_CoalesceIntoSinglePatch()
+    {
+        // WriteCoalescer: 連続 offset の小さい IRP を 4MB target chunk に積み、
+        // 単一 PATCH として server に送る。SEQ Write の HTTP round-trip 数削減。
+        var server = new FakeServerApi();
+        var backend = await NewInitializedBackendAsync(server);
+
+        using var handle = await backend.CreateAsync("/seq.bin", isDirectory: false);
+        const int IrpSize = 64 * 1024;
+        const int IrpCount = 32; // 32 × 64KB = 2MB < 4MB target → 全て 1 chunk に集約
+        var rng = new Random(42);
+        var expected = new byte[IrpSize * IrpCount];
+        rng.NextBytes(expected);
+        for (int i = 0; i < IrpCount; i++)
+        {
+            var slice = expected.AsMemory(i * IrpSize, IrpSize);
+            await backend.WriteAsync(handle!, i * IrpSize, slice, appendToEnd: false, constrainedIo: false);
+        }
+        await backend.CleanupAsync(handle!, CleanupFlags.Modified);
+        handle!.Dispose();
+
+        Assert.Equal(expected, server.Files["/seq.bin"]);
+        var session = server.SessionsByUploadId.Values.Single(s => s.Path == "/seq.bin");
+        Assert.Equal(1, session.ChunkPatchCount);
+    }
+
+    [Fact]
+    public async Task ContiguousWrites_OverFourMb_SplitAtTargetBoundary()
+    {
+        // 連続 6MB の書き込み: target 4MB で chunk が flush され、新バッファに残り 2MB。
+        // 結果 2 PATCH。kernel 1MB IRP × 6 でも同じ結果になることを確認。
+        var server = new FakeServerApi();
+        var backend = await NewInitializedBackendAsync(server);
+
+        using var handle = await backend.CreateAsync("/big.bin", isDirectory: false);
+        const int IrpSize = 1024 * 1024;
+        const int IrpCount = 6;
+        var rng = new Random(7);
+        var expected = new byte[IrpSize * IrpCount];
+        rng.NextBytes(expected);
+        for (int i = 0; i < IrpCount; i++)
+        {
+            var slice = expected.AsMemory(i * IrpSize, IrpSize);
+            await backend.WriteAsync(handle!, i * IrpSize, slice, appendToEnd: false, constrainedIo: false);
+        }
+        await backend.CleanupAsync(handle!, CleanupFlags.Modified);
+        handle!.Dispose();
+
+        Assert.Equal(expected, server.Files["/big.bin"]);
+        var session = server.SessionsByUploadId.Values.Single(s => s.Path == "/big.bin");
+        // 4MB + 残 2MB = 2 PATCH。
+        Assert.Equal(2, session.ChunkPatchCount);
+    }
+
+    [Fact]
+    public async Task NonContiguousWrites_CoalesceIntoSingleMultipartPatch()
+    {
+        // 散発的な非連続 IRP (Excel/SQLite/RND 4K Q=32 ベンチが踏むパターン) を
+        // 同一 handle にまとめる: 1 PATCH に multipart/mixed で束ねて送られる。
+        var server = new FakeServerApi();
+        var backend = await NewInitializedBackendAsync(server);
+
+        using var handle = await backend.CreateAsync("/scatter.bin", isDirectory: false);
+        var rng = new Random(3);
+        const int N = 16;
+        var offsets = new long[N];
+        var datas = new byte[N][];
+        for (int i = 0; i < N; i++)
+        {
+            // 4KB IRP を 64KB 飛びの非連続 offset に散らす。
+            offsets[i] = i * 64L * 1024;
+            datas[i] = new byte[4 * 1024];
+            rng.NextBytes(datas[i]);
+            await backend.WriteAsync(handle!, offsets[i], datas[i], appendToEnd: false, constrainedIo: false);
+        }
+        await backend.CleanupAsync(handle!, CleanupFlags.Modified);
+        handle!.Dispose();
+
+        var payload = server.Files["/scatter.bin"];
+        for (int i = 0; i < N; i++)
+        {
+            // 各 range の先頭/末尾を 1 byte ずつ突き合わせ。
+            Assert.Equal(datas[i][0], payload[offsets[i]]);
+            Assert.Equal(datas[i][^1], payload[offsets[i] + datas[i].Length - 1]);
+        }
+        var session = server.SessionsByUploadId.Values.Single(s => s.Path == "/scatter.bin");
+        // 全 16 件が 1 multipart PATCH に束なる。
+        Assert.Equal(1, session.MultipartPatchCount);
+        Assert.Equal(N, session.MultipartRangeCount);
+        // 単 range の UploadChunkAsync は呼ばれない。
+        Assert.Equal(0, session.ChunkPatchCount);
     }
 
     [Fact]

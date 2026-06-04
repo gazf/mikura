@@ -11,9 +11,9 @@ namespace Mikura.Core.Sync;
 /// (ADR-021).
 ///
 /// <para>Write 経路は ADR-025 に従い chunked upload session に直流する
-/// (<see cref="ChunkedUploader"/>)。kernel の <c>Write</c> IRP は handle 単位の
-/// in-memory バッファに溜めず、その都度 PATCH に載せて送る。これにより
-/// handle のメモリ占有がファイルサイズに比例しなくなる (ADR-023 supersede)。
+/// (<see cref="WriteCoalescer"/>)。kernel の <c>Write</c> IRP は handle 単位の
+/// 4MB バッファに range pack されて 1 PATCH (multipart/mixed) として送出される。
+/// handle のメモリ占有はファイルサイズに比例せず最大 4MB に bound される。</para>
 /// Read 経路は引き続き whole-file hydrate を使うため、Read+Write を同一 handle
 /// で行う場合は (1) 既存ファイル open は server で baseFromExisting コピーが効く、
 /// (2) Read は hydrate buffer の値を返す (Write の反映は次回 open まで遅延する)、
@@ -29,6 +29,13 @@ public sealed class ServerBackend : IFileSystemBackend
     private readonly Dictionary<string, LockSlot> _activeLocks =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly object _activeLocksGate = new();
+
+    // path 単位の upload session 共有。同一 file への複数 handle (CDM の T=16 等)
+    // が個別 session を開いて baseFromExisting で 1GB × N の copy を走らせる回帰
+    // を防ぐ。LockSlot と同じ refcount + TCS パターン。
+    private readonly Dictionary<string, SessionSlot> _activeSessions =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _activeSessionsGate = new();
 
     public ServerBackend(IServerApi server)
     {
@@ -231,12 +238,163 @@ public sealed class ServerBackend : IFileSystemBackend
         }
     }
 
+    /// <summary>
+    /// path 単位の session slot を取得する。最初の caller のみ <see cref="IServerApi.StartUploadAsync"/>
+    /// を実走し、後続は <see cref="SessionSlot.StartResult"/> を await して同じ slot を共有する。
+    /// 失敗は first caller が exception を伝播、後続は同じ exception を再 throw して取り合いに失敗する。
+    /// </summary>
+    private async Task<SessionSlot?> AcquireSessionSlotAsync(string path, bool baseFromExisting, CancellationToken ct)
+    {
+        SessionSlot slot;
+        bool isFirst;
+        lock (_activeSessionsGate)
+        {
+            if (_activeSessions.TryGetValue(path, out var existing))
+            {
+                existing.Refcount++;
+                slot = existing;
+                isFirst = false;
+            }
+            else
+            {
+                slot = new SessionSlot { Refcount = 1 };
+                _activeSessions[path] = slot;
+                isFirst = true;
+            }
+        }
+
+        if (!isFirst)
+        {
+            var ok = await slot.StartResult.Task.ConfigureAwait(false);
+            return ok ? slot : null;
+        }
+
+        try
+        {
+            var uploadId = await _server.StartUploadAsync(path, baseFromExisting, ct).ConfigureAwait(false);
+            slot.UploadId = uploadId;
+            slot.Coalescer = new WriteCoalescer(_server, uploadId);
+            slot.StartResult.TrySetResult(true);
+            return slot;
+        }
+        catch (Exception ex)
+        {
+            // start 失敗: 自分の refcount を巻き戻し、待ち合わせていた後続にも失敗を伝える。
+            lock (_activeSessionsGate)
+            {
+                if (--slot.Refcount <= 0) _activeSessions.Remove(path);
+            }
+            slot.StartResult.TrySetException(ex);
+            Trace.WriteLine($"StartUpload failed: {path}: {ex.Message}");
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// handle の Cleanup から呼ばれる: slot の refcount を減らし、0 になった (= 自分が
+    /// 最後の handle) ケースだけ実 finalize を走らせる。それ以外は null を返し、caller
+    /// は <c>_tree</c> 更新をスキップする。
+    /// </summary>
+    private async Task<UploadResult?> ReleaseSessionSlotForFinalizeAsync(
+        string path,
+        SessionSlot slot,
+        long handleFinalSize,
+        CancellationToken ct)
+    {
+        bool isLast;
+        long finalSize;
+        lock (_activeSessionsGate)
+        {
+            if (handleFinalSize > slot.MaxFinalSize) slot.MaxFinalSize = handleFinalSize;
+            slot.AnyModified = true;
+            isLast = --slot.Refcount <= 0;
+            if (isLast) _activeSessions.Remove(path);
+            finalSize = slot.MaxFinalSize;
+        }
+        if (!isLast) return null;
+
+        // 実 finalize: coalescer を flush + dispose してから FinalizeUploadAsync。
+        try
+        {
+            if (slot.Coalescer is not null)
+            {
+                await slot.Coalescer.FlushAsync(ct).ConfigureAwait(false);
+                await slot.Coalescer.DisposeAsync().ConfigureAwait(false);
+            }
+            return await _server.FinalizeUploadAsync(slot.UploadId!, finalSize, ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            // finalize 失敗時は session を捨てる (TTL に任せて緑に戻る)。例外は上位に。
+            if (slot.UploadId is not null)
+            {
+                try { await _server.AbortUploadAsync(slot.UploadId, CancellationToken.None).ConfigureAwait(false); }
+                catch (Exception inner) { Trace.WriteLine($"AbortUpload after finalize-fail: {path}: {inner.Message}"); }
+            }
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// handle の Abort 経路から呼ばれる: refcount を減らし、0 になった (= 最後の handle)
+    /// ケースで coalescer 破棄 + server 側 session abort を走らせる。Modified を踏まずに
+    /// 全 handle が閉じた場合や、Cleanup(Delete) 経路の合流で使う。
+    /// </summary>
+    private async Task ReleaseSessionSlotForAbortAsync(string path, SessionSlot slot)
+    {
+        bool isLast;
+        string? uploadId;
+        WriteCoalescer? coalescer;
+        lock (_activeSessionsGate)
+        {
+            isLast = --slot.Refcount <= 0;
+            if (isLast) _activeSessions.Remove(path);
+            uploadId = slot.UploadId;
+            coalescer = isLast ? slot.Coalescer : null;
+        }
+        if (!isLast) return;
+
+        if (coalescer is not null)
+        {
+            try { await coalescer.DisposeAsync().ConfigureAwait(false); }
+            catch (Exception ex) { Trace.WriteLine($"AbortSession coalescer dispose: {path}: {ex.Message}"); }
+        }
+        if (uploadId is not null)
+        {
+            try { await _server.AbortUploadAsync(uploadId, CancellationToken.None).ConfigureAwait(false); }
+            catch (Exception ex) { Trace.WriteLine($"AbortSession server: {path}: {ex.Message}"); }
+        }
+    }
+
     private sealed class LockSlot
     {
         public int Refcount = 1;
         public bool HasServerLock;
         public TaskCompletionSource<bool> AcquireResult { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+
+    /// <summary>
+    /// path 単位の chunked upload session 共有。同一 path への <see cref="ServerHandle"/>
+    /// が複数あっても <see cref="StartUploadAsync"/> は最初の 1 回だけ走り、
+    /// 全 handle が同じ <see cref="WriteCoalescer"/> に append する。
+    /// finalize は refcount が 0 になった handle (= 最後に閉じた handle) が代表で行う。
+    /// </summary>
+    private sealed class SessionSlot
+    {
+        public int Refcount;
+        // Start 完了で UploadId / Coalescer が埋まる。2 番目以降の Acquire は
+        // この task を await して値を読む。
+        public string? UploadId;
+        public WriteCoalescer? Coalescer;
+        public TaskCompletionSource<bool> StartResult { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        // 全 handle が CleanupAsync の Modified/FreshlyCreated 判定で報告する size の max。
+        // 最後の release で server.FinalizeUploadAsync に渡す。
+        public long MaxFinalSize;
+        // どれか 1 handle でも Modified の Cleanup を踏んだら true。すべて
+        // 未編集 Cleanup なら最後の release で abort 経路に流す。
+        public bool AnyModified;
     }
 
     public async Task<IFileHandle?> CreateAsync(string path, bool isDirectory, CancellationToken ct = default)
@@ -507,13 +665,18 @@ public sealed class ServerBackend : IFileSystemBackend
                     await h.EnsureSessionAsync(_server, baseFromExisting: !h.FreshlyCreated, ct)
                         .ConfigureAwait(false);
                     var result = await h.FinalizeAsync(_server, h.Length, ct).ConfigureAwait(false);
-                    _tree[h.Path] = new FileEntry(
-                        Path: h.Path,
-                        IsDirectory: false,
-                        Size: result.Size,
-                        CreationTimeUtc: h.Entry.CreationTimeUtc,
-                        LastWriteTimeUtc: result.LastModified.ToUniversalTime());
-                    Trace.WriteLine($"Uploaded (chunked): {h.Path} (size={result.Size}) IRP[{h.FormatWriteSizeHistogram()}]");
+                    // null = 同 path に他 handle が生きており自分は最後ではない。
+                    // 実 finalize は最後の handle の Cleanup でまとめて走るので _tree 更新は遅延。
+                    if (result is not null)
+                    {
+                        _tree[h.Path] = new FileEntry(
+                            Path: h.Path,
+                            IsDirectory: false,
+                            Size: result.Size,
+                            CreationTimeUtc: h.Entry.CreationTimeUtc,
+                            LastWriteTimeUtc: result.LastModified.ToUniversalTime());
+                        Trace.WriteLine($"Uploaded (chunked): {h.Path} (size={result.Size}) IRP[{h.FormatWriteSizeHistogram()}]");
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -612,11 +775,11 @@ public sealed class ServerBackend : IFileSystemBackend
 
     /// <summary>
     /// Per-handle backend state (ADR-025 改訂後):
-    ///   - <see cref="_buffer"/>: Read 用の hydrate cache。Read を 1 度も触らない
-    ///     pure-write フローでは empty のまま。
     ///   - <see cref="_uploader"/>: Write の pass-through 先 (Lazy)。最初の Write
     ///     または Cleanup-with-shouldUpload で <see cref="EnsureSessionAsync"/>
     ///     経由で生成される。
+    ///   - <see cref="_coalescer"/>: <c>_uploader</c> の前段。kernel IRP を 4MB
+    ///     chunk に集約して PATCH 数を削減する。
     /// </summary>
     private sealed class ServerHandle : IFileHandle
     {
@@ -626,9 +789,11 @@ public sealed class ServerBackend : IFileSystemBackend
         private readonly long _originalServerSize;
         private bool _hasLock;
 
-        // ADR-025: chunked upload session。最初の Write で開く。
-        private ChunkedUploader? _uploader;
-        private readonly SemaphoreSlim _sessionGate = new(1, 1);
+        // ADR-025: path 単位で共有される chunked upload session の slot。
+        // 同一 path に対して複数 handle が開いていても _slot は同じインスタンス
+        // (refcount は backend 側で管理)。<see cref="WriteCoalescer"/> も slot 経由で共有され、
+        // 全 handle の write は 1 つのバッファに append される。
+        private SessionSlot? _slot;
 
         public ServerHandle(ServerBackend backend, string path, FileEntry entry, bool hasLock)
         {
@@ -701,59 +866,46 @@ public sealed class ServerBackend : IFileSystemBackend
 
         public async Task EnsureSessionAsync(IServerApi server, bool baseFromExisting, CancellationToken ct)
         {
-            if (_uploader is not null) return;
-            await _sessionGate.WaitAsync(ct).ConfigureAwait(false);
-            try
-            {
-                if (_uploader is not null) return;
-                var uploadId = await server.StartUploadAsync(Path, baseFromExisting, ct).ConfigureAwait(false);
-                _uploader = new ChunkedUploader(server, uploadId);
-            }
-            finally { _sessionGate.Release(); }
+            if (_slot is not null) return;
+            _slot = await _backend.AcquireSessionSlotAsync(Path, baseFromExisting, ct).ConfigureAwait(false);
+            if (_slot is null)
+                throw new InvalidOperationException($"session acquisition failed for {Path}");
         }
 
         public Task EnqueueChunkAsync(long offset, ReadOnlyMemory<byte> data, CancellationToken ct)
         {
-            if (_uploader is null)
+            var slot = _slot;
+            if (slot?.Coalescer is null)
                 throw new InvalidOperationException("session not started");
-            return _uploader.EnqueueAsync(offset, data, ct);
+            return slot.Coalescer.AppendAsync(offset, data, ct);
         }
 
-        public async Task<UploadResult> FinalizeAsync(IServerApi server, long finalSize, CancellationToken ct)
+        /// <summary>
+        /// 自分の handle 分の refcount を返す。自分が最後の handle なら実 finalize 経路へ。
+        /// 戻り値が null なら他 handle がまだ生きているので caller は _tree 更新をスキップ。
+        /// </summary>
+        public async Task<UploadResult?> FinalizeAsync(IServerApi server, long finalSize, CancellationToken ct)
         {
-            if (_uploader is null)
-                throw new InvalidOperationException("session not started");
-            await _uploader.DrainAsync().ConfigureAwait(false);
-            var result = await server.FinalizeUploadAsync(_uploader.UploadId, finalSize, ct).ConfigureAwait(false);
-            _uploader = null;
-            return result;
+            var slot = _slot;
+            if (slot is null) throw new InvalidOperationException("session not started");
+            _slot = null;
+            return await _backend.ReleaseSessionSlotForFinalizeAsync(Path, slot, finalSize, ct).ConfigureAwait(false);
         }
 
         public async Task AbortSessionIfAnyAsync()
         {
-            var local = _uploader;
-            if (local is null) return;
-            _uploader = null;
-            try
-            {
-                await local.AbortAsync().ConfigureAwait(false);
-                await _backend._server.AbortUploadAsync(local.UploadId, CancellationToken.None).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                Trace.WriteLine($"AbortSession failed: {Path}: {ex.Message}");
-            }
-            finally
-            {
-                await local.DisposeAsync().ConfigureAwait(false);
-            }
+            var slot = _slot;
+            if (slot is null) return;
+            _slot = null;
+            await _backend.ReleaseSessionSlotForAbortAsync(Path, slot).ConfigureAwait(false);
         }
 
         public void Dispose()
         {
-            _sessionGate.Dispose();
-            // _uploader は CleanupAsync で finalize / abort 済みの想定。
-            // 例外経路で漏れた場合は AbortAsync を非同期で呼ばずに諦める。
+            // session slot は backend 側で path 単位に管理しているので、ここでは
+            // 何も持っていない。Cleanup 経路で必ず ReleaseSessionSlotFor*Async が
+            // 呼ばれ refcount が減算される。漏れた場合 (例: WinFsp 経路の例外で
+            // Cleanup post されず) は server 側 TTL に任せる。
         }
 
         // ─────────────────────────────────── async I/O in-flight tracker ────

@@ -146,6 +146,9 @@ internal sealed class FakeServerApi : IServerApi
         public byte[] Buffer = Array.Empty<byte>();
         public int Length;
         public int ChunkPatchCount;
+        // multipart/mixed PATCH の累積カウント (新 coalescer 経路)。
+        public int MultipartPatchCount;
+        public int MultipartRangeCount;
         public bool Finalized;
         public bool Aborted;
     }
@@ -190,17 +193,56 @@ internal sealed class FakeServerApi : IServerApi
     {
         if (!SessionsByUploadId.TryGetValue(uploadId, out var session))
             throw new InvalidOperationException("session not found");
-        session.ChunkPatchCount++;
 
-        var end = checked((int)(offset + data.Length));
-        if (end > session.Buffer.Length)
+        // 同一セッションへの concurrent PATCH (= 別 handle や test 上の並列呼び出し)
+        // が起きても、実 server は POSIX file への seek+write で順序化されているため
+        // race は出ない。ここでも振る舞いを合わせて lock で直列化する。
+        // (この lock を外すと Buffer 拡張時の read-modify-write 競合で
+        // 先勝ち分が drop されるケースがある)。
+        lock (session)
         {
-            var newBuf = new byte[end];
-            Array.Copy(session.Buffer, newBuf, session.Length);
-            session.Buffer = newBuf;
+            session.ChunkPatchCount++;
+
+            var end = checked((int)(offset + data.Length));
+            if (end > session.Buffer.Length)
+            {
+                var newBuf = new byte[end];
+                Array.Copy(session.Buffer, newBuf, session.Length);
+                session.Buffer = newBuf;
+            }
+            data.Span.CopyTo(session.Buffer.AsSpan((int)offset, data.Length));
+            if (end > session.Length) session.Length = end;
         }
-        data.Span.CopyTo(session.Buffer.AsSpan((int)offset, data.Length));
-        if (end > session.Length) session.Length = end;
+        return Task.CompletedTask;
+    }
+
+    public Task UploadChunksMultipartAsync(
+        string uploadId,
+        ReadOnlyMemory<byte> buffer,
+        IReadOnlyList<UploadRange> ranges,
+        CancellationToken ct = default)
+    {
+        if (!SessionsByUploadId.TryGetValue(uploadId, out var session))
+            throw new InvalidOperationException("session not found");
+
+        lock (session)
+        {
+            session.MultipartPatchCount++;
+            session.MultipartRangeCount += ranges.Count;
+            foreach (var range in ranges)
+            {
+                var end = checked((int)(range.FileOffset + range.Length));
+                if (end > session.Buffer.Length)
+                {
+                    var newBuf = new byte[end];
+                    Array.Copy(session.Buffer, newBuf, session.Length);
+                    session.Buffer = newBuf;
+                }
+                var src = buffer.Span.Slice(range.BufferOffset, range.Length);
+                src.CopyTo(session.Buffer.AsSpan((int)range.FileOffset, range.Length));
+                if (end > session.Length) session.Length = end;
+            }
+        }
         return Task.CompletedTask;
     }
 
