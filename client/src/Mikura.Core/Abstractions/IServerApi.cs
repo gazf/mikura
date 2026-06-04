@@ -58,6 +58,19 @@ public interface IServerApi
     Task UploadChunkAsync(string uploadId, long offset, ReadOnlyMemory<byte> data, CancellationToken ct = default);
 
     /// <summary>
+    /// 複数 range を 1 PATCH (multipart/byteranges) でまとめて送る。WriteCoalescer
+    /// が非連続な小 IRP をバッファに pack し、1 リクエストで HTTP round-trip を 1 回に
+    /// 集約する経路。<paramref name="ranges"/> の各 entry は <paramref name="buffer"/>
+    /// 内の <c>BufferOffset..BufferOffset+Length</c> を、サーバ側 staging の
+    /// <c>FileOffset</c> に書く。
+    /// </summary>
+    Task UploadChunksMultipartAsync(
+        string uploadId,
+        ReadOnlyMemory<byte> buffer,
+        IReadOnlyList<Mikura.Core.Models.UploadRange> ranges,
+        CancellationToken ct = default);
+
+    /// <summary>
     /// ADR-025: chunked upload session を確定する。
     /// <paramref name="finalSize"/> で末尾を ftruncate して、temp → 実 path に
     /// 原子 rename する。戻り値は確定後のサーバ side メタデータ。

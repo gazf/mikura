@@ -219,6 +219,34 @@ public class HttpServerApi(HttpClient http, string baseUrl) : IServerApi, IDispo
         await EnsureSuccess(response, ct).ConfigureAwait(false);
     }
 
+    public async Task UploadChunksMultipartAsync(
+        string uploadId,
+        ReadOnlyMemory<byte> buffer,
+        IReadOnlyList<UploadRange> ranges,
+        CancellationToken ct = default)
+    {
+        if (ranges.Count == 0) return;
+        var url = $"{_baseUrl}/uploads/{uploadId}";
+        // boundary は ASCII 印字可かつ body 中に出現しない事が前提だが、CDM 等の
+        // ランダムバイナリは衝突可能性がゼロでない。実用上は GUID 形式で十分
+        // (128bit 衝突空間 + boundary プレフィクスを工夫すれば事実上ゼロ)。
+        var boundary = $"mikura-{Guid.NewGuid():N}";
+        using var multipart = new MultipartContent("byteranges", boundary);
+        foreach (var range in ranges)
+        {
+            var part = new ReadOnlyMemoryContent(buffer.Slice(range.BufferOffset, range.Length));
+            part.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+            // Content-Range total は session 全体長が不定なので '*'。
+            part.Headers.Add(
+                "Content-Range",
+                $"bytes {range.FileOffset}-{range.FileOffset + range.Length - 1}/*");
+            multipart.Add(part);
+        }
+        using var request = new HttpRequestMessage(HttpMethod.Patch, url) { Content = multipart };
+        using var response = await _http.SendAsync(request, ct).ConfigureAwait(false);
+        await EnsureSuccess(response, ct).ConfigureAwait(false);
+    }
+
     public async Task<UploadResult> FinalizeUploadAsync(string uploadId, long finalSize, CancellationToken ct = default)
     {
         var url = $"{_baseUrl}/uploads/{uploadId}/finalize";
