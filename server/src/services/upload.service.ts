@@ -222,7 +222,7 @@ export async function writeChunk(
   deviceId: string,
   offset: number,
   body: ReadableStream<Uint8Array>,
-): Promise<{ writtenAt: number; size: number }> {
+): Promise<{ writtenAt: number }> {
   if (!Number.isFinite(offset) || offset < 0) {
     throw new UploadServiceError("Invalid offset", 400);
   }
@@ -240,8 +240,10 @@ export async function writeChunk(
         written += await file.write(r.value.subarray(written));
       }
     }
-    const stat = await file.stat();
-    return { writtenAt: offset, size: stat.size };
+    // staging file の size は finalizeSession 側で rename 後に Deno.stat で
+    // 取り直すので、PATCH 段階の fstat は client が response を捨てる前提では
+    // 完全に無駄。1 syscall ぶん削る。
+    return { writtenAt: offset };
   } finally {
     file.close();
   }
@@ -265,7 +267,7 @@ export async function writeChunksMultipart(
   deviceId: string,
   body: ReadableStream<Uint8Array>,
   boundary: string,
-): Promise<{ size: number; rangeCount: number }> {
+): Promise<{ rangeCount: number }> {
   const session = await loadSession(uploadId, deviceId);
 
   const file = await Deno.open(session.tempPath, { write: true, read: true });
@@ -290,8 +292,9 @@ export async function writeChunksMultipart(
       }
       throw e;
     }
-    const stat = await file.stat();
-    return { size: stat.size, rangeCount };
+    // staging file の size は finalizeSession 側で取り直すので PATCH 段階の
+    // fstat は不要 (上記 writeChunk 同様)。
+    return { rangeCount };
   } finally {
     file.close();
   }

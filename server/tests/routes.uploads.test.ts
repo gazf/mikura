@@ -131,7 +131,7 @@ async function patchMultipartChunks(
   deviceId: string,
   uploadId: string,
   ranges: Array<{ offset: number; data: Uint8Array }>,
-): Promise<{ status: number; body?: { size: number; rangeCount: number } }> {
+): Promise<{ status: number; body?: { rangeCount: number } }> {
   const boundary = `bench-boundary-${crypto.randomUUID()}`;
   const enc = new TextEncoder();
   const parts: Uint8Array[] = [];
@@ -166,7 +166,7 @@ async function patchMultipartChunks(
     await res.body?.cancel();
     return { status: res.status };
   }
-  const json = await res.json() as { size: number; rangeCount: number };
+  const json = await res.json() as { rangeCount: number };
   return { status: 200, body: json };
 }
 
