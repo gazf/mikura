@@ -9,10 +9,16 @@ type Env = {
   };
 };
 
+// hono の `*` ワイルドカード経由のパス抽出。`/^\/locks\/?/` を各 handler で
+// inline literal にしておくと V8 が cache する保証は弱いので、module-level に
+// 1 個を切り出して全 handler で共有する (lock acquire/release は CDM テストの
+// open/close リズムで秒間数十回叩かれるので per-call alloc を避けたい)。
+const LOCKS_PREFIX_RE = /^\/locks\/?/;
+
 export function registerLockRoutes(app: Hono<Env>) {
   // POST /locks/*path — acquire lock
   app.post("/locks/*", async (c) => {
-    const wildcard = c.req.path.replace(/^\/locks\/?/, "");
+    const wildcard = c.req.path.replace(LOCKS_PREFIX_RE, "");
     const filePath = "/" + wildcard;
     const user = c.get("user");
 
@@ -37,7 +43,7 @@ export function registerLockRoutes(app: Hono<Env>) {
 
   // DELETE /locks/*path — release lock
   app.delete("/locks/*", async (c) => {
-    const wildcard = c.req.path.replace(/^\/locks\/?/, "");
+    const wildcard = c.req.path.replace(LOCKS_PREFIX_RE, "");
     const filePath = "/" + wildcard;
     const user = c.get("user");
 
@@ -56,7 +62,7 @@ export function registerLockRoutes(app: Hono<Env>) {
 
   // GET /locks/*path — check lock status
   app.get("/locks/*", async (c) => {
-    const wildcard = c.req.path.replace(/^\/locks\/?/, "");
+    const wildcard = c.req.path.replace(LOCKS_PREFIX_RE, "");
     const filePath = "/" + wildcard;
     const lock = await getLock(filePath);
 

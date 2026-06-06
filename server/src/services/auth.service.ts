@@ -13,12 +13,20 @@ import type {
 // は呼ばれるので per-call alloc 削減の効果はほぼ全 request に乗る。
 const _tokenEncoder = new TextEncoder();
 
+// hex encoding 用の lookup。Array.from + map + padStart の 3 連 alloc を排除し、
+// 1 pass で 64-char string concat に落とす (intermediate Array / String も無し)。
+const HEX_CHARS = "0123456789abcdef";
+
 async function sha256(input: string): Promise<string> {
   const data = _tokenEncoder.encode(input);
   const hash = await crypto.subtle.digest("SHA-256", data);
-  return Array.from(new Uint8Array(hash))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
+  const bytes = new Uint8Array(hash);
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i];
+    out += HEX_CHARS[b >> 4] + HEX_CHARS[b & 0xF];
+  }
+  return out;
 }
 
 export function generateToken(): string {
@@ -178,7 +186,9 @@ export async function validateToken(
   }
 
   const tokenData = entry.value;
-  const tokenExpiresAtMs = new Date(tokenData.expiresAt).getTime();
+  // Date.parse は Date object を経由せず ISO 文字列から直接 ms 取得できる
+  // (cache miss 経路は per-request hot ではないが、構築せず捨てる Date は無駄)。
+  const tokenExpiresAtMs = Date.parse(tokenData.expiresAt);
   if (tokenExpiresAtMs < now) {
     tokenCache.delete(hash);
     return null;
