@@ -872,7 +872,7 @@ public sealed class ServerBackend : IFileSystemBackend
                 throw new InvalidOperationException($"session acquisition failed for {Path}");
         }
 
-        public Task EnqueueChunkAsync(long offset, ReadOnlyMemory<byte> data, CancellationToken ct)
+        public ValueTask EnqueueChunkAsync(long offset, ReadOnlyMemory<byte> data, CancellationToken ct)
         {
             var slot = _slot;
             if (slot?.Coalescer is null)
