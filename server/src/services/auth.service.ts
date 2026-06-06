@@ -8,8 +8,13 @@ import type {
   User,
 } from "../types.ts";
 
+// TextEncoder は stateless なので module-level で 1 個を共有 (validateToken は
+// 全 request の hot path で sha256 を経由する)。token cache hit でも hashToken
+// は呼ばれるので per-call alloc 削減の効果はほぼ全 request に乗る。
+const _tokenEncoder = new TextEncoder();
+
 async function sha256(input: string): Promise<string> {
-  const data = new TextEncoder().encode(input);
+  const data = _tokenEncoder.encode(input);
   const hash = await crypto.subtle.digest("SHA-256", data);
   return Array.from(new Uint8Array(hash))
     .map((b) => b.toString(16).padStart(2, "0"))

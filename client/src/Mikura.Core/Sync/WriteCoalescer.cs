@@ -77,8 +77,13 @@ internal sealed class WriteCoalescer : IAsyncDisposable
     /// 載らない場合は flush してから新バッファに retry する。1 IRP が
     /// <see cref="TargetBufferSize"/> 超のときはバッファを経由せず単 range の
     /// 単一 PATCH として直送 (multipart overhead を払わない)。
+    /// <para>
+    /// 戻り値が <see cref="ValueTask"/>: gate 非競合 + バッファ内 append (sync 完了)
+    /// が hot path で、その場合 Task の heap alloc を回避する。flush 経路に入る時だけ
+    /// 内部で async 状態機を heap promote する。
+    /// </para>
     /// </summary>
-    public async Task AppendAsync(long fileOffset, ReadOnlyMemory<byte> data, CancellationToken ct)
+    public async ValueTask AppendAsync(long fileOffset, ReadOnlyMemory<byte> data, CancellationToken ct)
     {
         if (data.Length == 0) return;
         ThrowIfBroken();
@@ -149,7 +154,7 @@ internal sealed class WriteCoalescer : IAsyncDisposable
     /// 現バッファを送信して、in-flight PATCH を完走まで待つ。Finalize で呼ぶ。
     /// Abort 経路では <see cref="DisposeAsync"/> 側で同じ流れを踏む。
     /// </summary>
-    public async Task FlushAsync(CancellationToken ct)
+    public async ValueTask FlushAsync(CancellationToken ct)
     {
         await _gate.WaitAsync(ct).ConfigureAwait(false);
         try { await FlushLocked(ct).ConfigureAwait(false); }
@@ -161,7 +166,7 @@ internal sealed class WriteCoalescer : IAsyncDisposable
     // _gate 保有前提。現バッファを切り離して send タスクに渡す。
     // send 自体は別 Task で背景進行し、await はせず即 return する (pipeline)。
     // in-flight 数が <see cref="MaxInFlight"/> に達していたら _sendSlots で待つ。
-    private async Task FlushLocked(CancellationToken ct)
+    private async ValueTask FlushLocked(CancellationToken ct)
     {
         if (_buf is null || _ranges.Count == 0)
         {
@@ -241,7 +246,7 @@ internal sealed class WriteCoalescer : IAsyncDisposable
     /// FinalizeUploadAsync を投げる前に、全 PATCH が確実に到達していることを
     /// 保証するために使う。
     /// </summary>
-    private async Task DrainPendingAsync()
+    private async ValueTask DrainPendingAsync()
     {
         Task[] snapshot;
         lock (_inFlightSendsGate)
