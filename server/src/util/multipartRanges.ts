@@ -38,6 +38,11 @@ export class MultipartRangesError extends Error {
   }
 }
 
+// TextDecoder は stateless 利用 (stream:false で 1 chunk 完結) なので per-call
+// alloc は無駄。1 part あたり readLine ~3 回 × 1 PATCH 数百〜数千 part になり得るので、
+// module-level の 1 個を全 parser インスタンス・全 PATCH で共有する。
+const _headerDecoder = new TextDecoder("utf-8", { fatal: false });
+
 export function extractBoundary(contentType: string): string | null {
   // boundary=value または boundary="value" を抽出。RFC 2046 では boundary に
   // 引用符付き形が許可されているので両対応。値は ASCII 印字可文字のみ想定。
@@ -71,7 +76,7 @@ class StreamReader {
       if (idx >= 0) {
         const line = this.buf.subarray(0, idx);
         this.buf = this.buf.subarray(idx + 2);
-        return new TextDecoder("utf-8", { fatal: false }).decode(line);
+        return _headerDecoder.decode(line);
       }
       const r = await this.reader.read();
       if (r.done) return null;
