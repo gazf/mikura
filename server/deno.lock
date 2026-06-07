@@ -3,6 +3,10 @@
   "specifiers": {
     "jsr:@hono/hono@4": "4.6.9",
     "jsr:@std/assert@1": "1.0.8",
+    "jsr:@std/crypto@*": "1.1.0",
+    "jsr:@std/crypto@1": "1.1.0",
+    "jsr:@std/encoding@*": "1.0.5",
+    "jsr:@std/encoding@1": "1.0.5",
     "jsr:@std/internal@^1.0.5": "1.0.5",
     "jsr:@std/path@1": "1.0.6"
   },
@@ -15,6 +19,12 @@
       "dependencies": [
         "jsr:@std/internal"
       ]
+    },
+    "@std/crypto@1.1.0": {
+      "integrity": "b8d6d0a6377a32b213af2661ed7bf1062d94feac0c57def5526a8e74a95c3ec8"
+    },
+    "@std/encoding@1.0.5": {
+      "integrity": "ecf363d4fc25bd85bd915ff6733a7e79b67e0e7806334af15f4645c569fefc04"
     },
     "@std/internal@1.0.5": {
       "integrity": "54a546004f769c1ac9e025abd15a76b6671ddc9687e2313b67376125650dc7ba"
@@ -108,6 +118,8 @@
     "dependencies": [
       "jsr:@hono/hono@4",
       "jsr:@std/assert@1",
+      "jsr:@std/crypto@1",
+      "jsr:@std/encoding@1",
       "jsr:@std/path@1"
     ]
   }

@@ -13,6 +13,8 @@ client/tests/*/bin/
 client/tests/*/obj/
 client/spike/*/bin/
 client/spike/*/obj/
+client/bench/*/bin/
+client/bench/*/obj/
 
 # IDE
 .vs/

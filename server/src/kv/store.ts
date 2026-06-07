@@ -18,7 +18,13 @@ let ephemeralKv: Deno.Kv | null = null;
 
 export async function getKv(): Promise<Deno.Kv> {
   if (!persistentKv) {
-    persistentKv = await Deno.openKv();
+    // 既定は Deno default (sqlite at well-known path)。bench harness 等で
+    // 一時 sqlite に隔離したい場合は MIKURA_KV_PATH で override する。
+    // 本番は env var 未設定で従来挙動を保持。
+    const overridePath = Deno.env.get("MIKURA_KV_PATH");
+    persistentKv = overridePath
+      ? await Deno.openKv(overridePath)
+      : await Deno.openKv();
   }
   return persistentKv;
 }
