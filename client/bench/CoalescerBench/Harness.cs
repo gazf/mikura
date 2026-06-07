@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using Mikura.Core.Abstractions;
+using Mikura.Core.Models;
 using Mikura.Core.Sync;
 
 namespace Mikura.Bench.Coalescer;
@@ -16,14 +17,24 @@ namespace Mikura.Bench.Coalescer;
 internal sealed class Harness
 {
     private readonly IServerApi _api;
+    private readonly bool _bypassBackend;
 
-    public Harness(IServerApi api)
+    public Harness(IServerApi api, bool bypassBackend = false)
     {
         _api = api;
+        _bypassBackend = bypassBackend;
     }
 
     public async Task<BenchResult> RunAsync(ScenarioPlan plan, CancellationToken ct = default)
     {
+        if (_bypassBackend)
+        {
+            // pure harness baseline: ServerBackend / WriteCoalescer を一切経由せず、
+            // worker の Task.Run + await loop だけ走らせる。bypass モード - bench モード
+            // の差分 = ServerBackend + Coalescer の per-IO alloc。
+            return await RunBypassAsync(plan, ct).ConfigureAwait(false);
+        }
+
         // 各 file ごとに backend を 1 つ用意。CDM の T=16 は実体としても 16 file 同時。
         var backend = new ServerBackend(_api);
         await backend.InitializeAsync(ct).ConfigureAwait(false);
@@ -73,6 +84,11 @@ internal sealed class Harness
         //   - http backend で計測区間を WriteAsync だけにすると「coalescer の入口
         //     buffer に積み終わるまで」しか測らず、桁違いに楽観的な MB/s が出る。
         //   - fake backend では Cleanup も即時 return なので余計な overhead は無い。
+        //
+        // breakdown 用に 3 区間に分けて GC.GetTotalAllocatedBytes を取る:
+        //   - workers fan-out → join: pure pipeline cost
+        //   - cleanup: finalize / lock release / coalescer dispose
+        //   - スケジューラ alloc (Task.Run × N) は workers 区間にカウントされる
         GC.Collect();
         GC.WaitForPendingFinalizers();
         GC.Collect();
@@ -108,6 +124,7 @@ internal sealed class Harness
             }
         }
         await Task.WhenAll(tasks).ConfigureAwait(false);
+        var allocAfterWorkers = GC.GetTotalAllocatedBytes(precise: true);
 
         // Cleanup: drain coalescer in-flight + finalize upload. ここまで終わって
         // 初めて全 byte が server に到達した = E2E throughput が確定する。
@@ -128,6 +145,9 @@ internal sealed class Harness
         var mbps = totalBytes / 1_000_000.0 / elapsed.TotalSeconds;
         var iops = plan.IoCount / elapsed.TotalSeconds;
 
+        var workerAlloc = allocAfterWorkers - allocStart;
+        var cleanupAlloc = allocEnd - allocAfterWorkers;
+
         return new BenchResult(
             ScenarioName: plan.Name,
             Elapsed: elapsed,
@@ -136,7 +156,65 @@ internal sealed class Harness
             MBps: mbps,
             Iops: iops,
             AllocatedBytes: allocEnd - allocStart,
-            BytesPerOp: (double)(allocEnd - allocStart) / plan.IoCount);
+            BytesPerOp: (double)(allocEnd - allocStart) / plan.IoCount,
+            WorkerBytesPerOp: (double)workerAlloc / plan.IoCount,
+            CleanupBytesTotal: cleanupAlloc);
+    }
+
+    /// <summary>
+    /// ServerBackend / WriteCoalescer を経由しない harness baseline。同じ
+    /// FileCount × QueueDepth で Task.Run + await Task.CompletedTask の loop だけ
+    /// 走らせて、harness 自体の Task.Run / await / Task.WhenAll が per-IO に
+    /// どれだけ alloc を持ち込むかを測る。
+    /// </summary>
+    private async Task<BenchResult> RunBypassAsync(ScenarioPlan plan, CancellationToken ct)
+    {
+        var ioPerFile = (int)(plan.FileSize / plan.IoSize);
+
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        var allocStart = GC.GetTotalAllocatedBytes(precise: true);
+        var sw = Stopwatch.StartNew();
+
+        var workerCount = plan.FileCount * plan.QueueDepth;
+        var tasks = new Task[workerCount];
+        for (int f = 0; f < plan.FileCount; f++)
+        {
+            for (int q = 0; q < plan.QueueDepth; q++)
+            {
+                var startIdx = q;
+                tasks[f * plan.QueueDepth + q] = Task.Run(async () =>
+                {
+                    for (int i = startIdx; i < ioPerFile; i += plan.QueueDepth)
+                    {
+                        await Task.CompletedTask.ConfigureAwait(false);
+                    }
+                }, ct);
+            }
+        }
+        await Task.WhenAll(tasks).ConfigureAwait(false);
+        var allocAfterWorkers = GC.GetTotalAllocatedBytes(precise: true);
+        sw.Stop();
+        var elapsed = sw.Elapsed;
+        var allocEnd = allocAfterWorkers;
+
+        var totalBytes = plan.TotalBytes;
+        var mbps = totalBytes / 1_000_000.0 / elapsed.TotalSeconds;
+        var iops = plan.IoCount / elapsed.TotalSeconds;
+        var workerAlloc = allocAfterWorkers - allocStart;
+
+        return new BenchResult(
+            ScenarioName: plan.Name + " [bypass]",
+            Elapsed: elapsed,
+            TotalBytes: totalBytes,
+            IoCount: plan.IoCount,
+            MBps: mbps,
+            Iops: iops,
+            AllocatedBytes: allocEnd - allocStart,
+            BytesPerOp: (double)(allocEnd - allocStart) / plan.IoCount,
+            WorkerBytesPerOp: (double)workerAlloc / plan.IoCount,
+            CleanupBytesTotal: 0);
     }
 }
 
@@ -148,4 +226,6 @@ internal sealed record BenchResult(
     double MBps,
     double Iops,
     long AllocatedBytes,
-    double BytesPerOp);
+    double BytesPerOp,
+    double WorkerBytesPerOp,
+    long CleanupBytesTotal);

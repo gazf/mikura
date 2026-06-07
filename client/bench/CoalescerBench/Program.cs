@@ -19,6 +19,10 @@ var backendKind = argv.Get("backend", "fake");
 var scenarioArg = argv.Get("scenario", "all");
 var warmup = int.Parse(argv.Get("warmup", "1"));
 var iters = int.Parse(argv.Get("iters", "3"));
+// --bypass-backend: ServerBackend / WriteCoalescer を経由しない harness baseline
+// 計測。各シナリオの "[bypass]" 行を追加で出力して per-IO alloc の harness 寄与を
+// 分離する。
+var bypassBackend = argv.Get("bypass-backend", "false") == "true";
 
 IServerApi BuildApi()
 {
@@ -66,17 +70,25 @@ var kinds = scenarioArg switch
     "seq128k" => new[] { ScenarioKind.Seq128K },
     "rnd4kdeep" => new[] { ScenarioKind.Rnd4KDeep },
     "rnd4kshallow" => new[] { ScenarioKind.Rnd4KShallow },
+    // alloc/op の (Q, T) 依存を直交分解する scaling sweep。
+    "rnd4k-scaling" => new[]
+    {
+        ScenarioKind.Rnd4KQ1T1, ScenarioKind.Rnd4KQ32T1,
+        ScenarioKind.Rnd4KQ1T16, ScenarioKind.Rnd4KQ32T16,
+    },
     _ => throw new ArgumentException($"unknown scenario: {scenarioArg}"),
 };
 
 Console.WriteLine($"# CoalescerBench backend={backendKind} warmup={warmup} iters={iters}");
 Console.WriteLine($"# {DateTime.UtcNow:o}  runtime={Environment.Version}  cores={Environment.ProcessorCount}");
 Console.WriteLine();
-Console.WriteLine("scenario             |   MB/s |   iops | elapsed |  alloc/op |    total alloc");
-Console.WriteLine("--------------------- -------- -------- --------- ----------- ----------------");
+Console.WriteLine("scenario             |   MB/s |   iops | elapsed | alloc/op (work+clean) | cleanup tot");
+Console.WriteLine("--------------------- -------- -------- --------- ---------------------- -------------");
 
 foreach (var kind in kinds)
 {
+    // SEQ 系は 64MB、RND 系 (Q/T scaling 含む) は 16MB をデフォルトとする
+    // (RND は IOPS 観点で 16MB あれば十分大量に IRP が走る)。
     var sizeMb = int.Parse(argv.Get("size-mb",
         kind is ScenarioKind.Seq1M or ScenarioKind.Seq128K ? "64" : "16"));
     var plan = ScenarioPlan.ForKind(kind, (long)sizeMb * 1024 * 1024);
@@ -84,7 +96,7 @@ foreach (var kind in kinds)
     for (int w = 0; w < warmup; w++)
     {
         var api = BuildApi();
-        try { await new Harness(api).RunAsync(plan); }
+        try { await new Harness(api, bypassBackend).RunAsync(plan); }
         finally { (api as IDisposable)?.Dispose(); }
     }
 
@@ -92,7 +104,7 @@ foreach (var kind in kinds)
     for (int i = 0; i < iters; i++)
     {
         var api = BuildApi();
-        try { samples.Add(await new Harness(api).RunAsync(plan)); }
+        try { samples.Add(await new Harness(api, bypassBackend).RunAsync(plan)); }
         finally { (api as IDisposable)?.Dispose(); }
     }
 
@@ -100,7 +112,7 @@ foreach (var kind in kinds)
     samples.Sort((a, b) => a.MBps.CompareTo(b.MBps));
     var med = samples[samples.Count / 2];
     Console.WriteLine(
-        $"{plan.Name,-20} | {med.MBps,6:F1} | {med.Iops,6:F0} | {med.Elapsed.TotalMilliseconds,6:F1}ms | {med.BytesPerOp,8:F0}B | {FormatBytes(med.AllocatedBytes),14}");
+        $"{plan.Name,-20} | {med.MBps,6:F1} | {med.Iops,6:F0} | {med.Elapsed.TotalMilliseconds,6:F1}ms | {med.BytesPerOp,5:F0}B ({med.WorkerBytesPerOp,5:F0}+{med.BytesPerOp - med.WorkerBytesPerOp,4:F0}) | {FormatBytes(med.CleanupBytesTotal),11}");
 }
 
 static string FormatBytes(long b)
