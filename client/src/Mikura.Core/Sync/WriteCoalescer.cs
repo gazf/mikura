@@ -38,16 +38,18 @@ internal sealed class WriteCoalescer : IAsyncDisposable
     // 超は出ないが、メモリ防衛で上限を切る。
     private const int MaxRanges = 4096;
 
-    // 旧実装は ArrayPool<byte>.Create(4MB, maxArraysPerBucket: 4) で「メモリ上限を
-    // 切るため」の意図で自前 pool を持っていたが、16 並行 session (CDM RND 4K T=16
-    // 等) が同時に 4MB buf を要求すると pool が 4 slot しか保持しないため、12
-    // session 分が毎 cycle 4MB を fresh alloc に落ちていた (bench:CoalescerBench で
-    // RND 4K Q=32 T=16 alloc/op 1251B のうち 700B 超がこれ起因と判明)。
-    //
-    // Shared pool は per-thread cache + CPU core 連動の bucket 数を持ち、16 並行
-    // でも fallback alloc しない。peak resident は使用量に比例 (1-16 file 想定で
-    // 数十 MB 程度) で許容範囲。
-    private static readonly ArrayPool<byte> _pool = ArrayPool<byte>.Shared;
+    // 進化経緯:
+    //   - 初代: ArrayPool<byte>.Create(4MB, maxArraysPerBucket: 4)
+    //     → 16 並行 session で 4 slot 不足 → 12 session ぶん fresh alloc に fallback
+    //   - 2 代: ArrayPool<byte>.Shared (d4b065d)
+    //     → fallback 解消したが TLSCachedArrayPool の per-thread slot が ThreadPool 拡張
+    //       のたびに増殖、CDM 反復で Working Set が monotonic に成長して頭打ちにならない
+    //       (ユーザ実測: 1 回 ~150 MB → 10 回 ~200 MB と増え続け)
+    //   - 現在: maxArraysPerBucket を 16 まで増やした bounded pool に回帰
+    //     → bucket 上限 16 × 4MB = 64 MB に hard cap、per-thread cache 無し
+    //     → 16 並行 session も fallback せず捌けて、反復回数に依存しない安定 retain
+    private static readonly ArrayPool<byte> _pool =
+        ArrayPool<byte>.Create(maxArrayLength: TargetBufferSize, maxArraysPerBucket: 16);
 
     private readonly IServerApi _server;
     private readonly string _uploadId;
