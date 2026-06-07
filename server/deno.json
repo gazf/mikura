@@ -5,7 +5,8 @@
     "seed": "deno run --allow-read --allow-write --allow-env --unstable-kv src/kv/seed.ts",
     "bench:micro": "deno bench --allow-env --unstable-kv bench/multipart-parse.bench.ts",
     "bench:loopback": "deno run --allow-net --allow-read --allow-write --allow-env --allow-run --allow-sys=statfs --unstable-kv bench/upload-loopback.ts",
-    "bench:start-server": "deno run --allow-all --unstable-kv bench/start-server.ts"
+    "bench:start-server": "deno run --allow-all --unstable-kv bench/start-server.ts",
+    "bench:diag-rtt": "deno run --allow-all --unstable-kv bench/diag-rtt.ts"
   },
   "imports": {
     "hono": "jsr:@hono/hono@^4",
