@@ -314,12 +314,15 @@ public sealed class ServerBackend : IFileSystemBackend
         if (!isLast) return null;
 
         // 実 finalize: coalescer を flush + dispose してから FinalizeUploadAsync。
+        // 注意: FlushAsync が throw した場合でも Coalescer (= Timer 経由で TimerQueue
+        // に grounded) の dispose を必ず走らせる必要がある。これを怠ると Coalescer
+        // インスタンス + 保有 buf + _inFlightSends Tasks が GC root から到達可能な
+        // まま session ごとに leak する。
         try
         {
             if (slot.Coalescer is not null)
             {
                 await slot.Coalescer.FlushAsync(ct).ConfigureAwait(false);
-                await slot.Coalescer.DisposeAsync().ConfigureAwait(false);
             }
             return await _server.FinalizeUploadAsync(slot.UploadId!, finalSize, ct).ConfigureAwait(false);
         }
@@ -332,6 +335,16 @@ public sealed class ServerBackend : IFileSystemBackend
                 catch (Exception inner) { Trace.WriteLine($"AbortUpload after finalize-fail: {path}: {inner.Message}"); }
             }
             throw;
+        }
+        finally
+        {
+            // 正常 / 例外いずれの経路でも Coalescer を必ず dispose する (Timer 解放 +
+            // 残 buf を pool 返却)。FlushAsync が throw した時の Coalescer leak 修正。
+            if (slot.Coalescer is not null)
+            {
+                try { await slot.Coalescer.DisposeAsync().ConfigureAwait(false); }
+                catch (Exception ex) { Trace.WriteLine($"FinalizeSession coalescer dispose: {path}: {ex.Message}"); }
+            }
         }
     }
 
