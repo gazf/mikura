@@ -1,3 +1,5 @@
+import { crypto as stdCrypto } from "@std/crypto";
+import { encodeHex } from "@std/encoding/hex";
 import { getKv } from "../kv/store.ts";
 import { Keys } from "../kv/keys.ts";
 import type {
@@ -9,24 +11,22 @@ import type {
 } from "../types.ts";
 
 // TextEncoder は stateless なので module-level で 1 個を共有 (validateToken は
-// 全 request の hot path で sha256 を経由する)。token cache hit でも hashToken
-// は呼ばれるので per-call alloc 削減の効果はほぼ全 request に乗る。
+// 全 request の hot path で sha256 を経由する)。
 const _tokenEncoder = new TextEncoder();
 
-// hex encoding 用の lookup。Array.from + map + padStart の 3 連 alloc を排除し、
-// 1 pass で 64-char string concat に落とす (intermediate Array / String も無し)。
-const HEX_CHARS = "0123456789abcdef";
-
-async function sha256(input: string): Promise<string> {
+// validateToken は全 request の hot path。token cache hit でも hashToken は
+// 必ず呼ばれる (cache key 側が hash) ので、ここの per-call cost が直接 RPS を縛る。
+//
+// 旧実装: crypto.subtle.digest (async WebCrypto) + 手書き hex loop。
+// 新実装: @std/crypto digestSync (Wasm backed, sync) + @std/encoding/hex。
+// bench/multipart-parse.bench.ts の (A)/(B) で per-call cost を 1 桁以上短縮
+// できることを確認している (async WebCrypto は Promise 越境のコストが支配的)。
+// node:crypto createHash は更に速いが、Deno の Node 互換層依存を持ち込む
+// よりも純 std で揃える方針を取った (macro level の throughput では微差)。
+function sha256(input: string): string {
   const data = _tokenEncoder.encode(input);
-  const hash = await crypto.subtle.digest("SHA-256", data);
-  const bytes = new Uint8Array(hash);
-  let out = "";
-  for (let i = 0; i < bytes.length; i++) {
-    const b = bytes[i];
-    out += HEX_CHARS[b >> 4] + HEX_CHARS[b & 0xF];
-  }
-  return out;
+  const hash = stdCrypto.subtle.digestSync("SHA-256", data);
+  return encodeHex(new Uint8Array(hash));
 }
 
 export function generateToken(): string {
