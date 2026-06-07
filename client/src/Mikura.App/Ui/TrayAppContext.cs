@@ -50,6 +50,23 @@ public sealed class TrayAppContext : ApplicationContext
         menu.Items.Add(_syncNowItem);
         menu.Items.Add(_settingsItem);
         menu.Items.Add(_resetItem);
+#if DEBUG
+        // ADR メモリ調査用 (LOH segment 占有確認): Force Gen2 GC + LOH compacting で
+        // free space を OS に返却。Task Manager / VMMap で Managed Heap が落ちれば
+        // ArrayPool 経由の LOH retain だけと判定できる (= 真 leak ではない)。
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(new ToolStripMenuItem("[Debug] Force Full GC", null, (_, _) =>
+        {
+            var beforeManaged = GC.GetTotalMemory(forceFullCollection: false) / 1024 / 1024;
+            GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+            GC.WaitForPendingFinalizers();
+            GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+            var afterManaged = GC.GetTotalMemory(forceFullCollection: false) / 1024 / 1024;
+            var msg = $"[gc] managed live: {beforeManaged}MB -> {afterManaged}MB " +
+                      $"(check Task Manager / VMMap for RSS / Managed Heap delta)";
+            Trace.WriteLine(msg);
+        }));
+#endif
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(new ToolStripMenuItem("Exit", null, OnExit));
 
