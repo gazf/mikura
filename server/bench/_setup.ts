@@ -84,7 +84,10 @@ async function seedAdminUser(
   }
 }
 
-async function waitForHealth(baseUrl: string, timeoutMs: number): Promise<void> {
+async function waitForHealth(
+  baseUrl: string,
+  timeoutMs: number,
+): Promise<void> {
   const start = performance.now();
   while (performance.now() - start < timeoutMs) {
     try {
@@ -102,7 +105,9 @@ async function waitForHealth(baseUrl: string, timeoutMs: number): Promise<void> 
   throw new Error(`server did not become healthy within ${timeoutMs}ms`);
 }
 
-export async function setupBenchEnv(opts: SetupOptions = {}): Promise<BenchEnv> {
+export async function setupBenchEnv(
+  opts: SetupOptions = {},
+): Promise<BenchEnv> {
   const tmpfs = opts.tmpfsRoot ?? "/dev/shm";
   const tag = `mikura-bench-${rand()}`;
   const dataRoot = `${tmpfs}/${tag}-data`;

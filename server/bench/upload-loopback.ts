@@ -86,7 +86,6 @@ const SCENARIOS: Record<string, ScenarioPlan> = {
 const BOUNDARY = "----mikuraLoopback";
 
 function buildMultipart(
-  baseOffset: number,
   count: number,
   ioSize: number,
   fillByte: number,
@@ -189,15 +188,13 @@ async function runScenario(
 
   // 4) 計測区間: PATCH を concurrency 本で fan-out。
   const t0 = performance.now();
-  let nextPatchIdx = 0;
   let patchesSent = 0;
   const lock = { idx: 0 };
 
   async function worker() {
     while (true) {
-      let myIdx: number;
       // モノトニックに patch 番号を assign。
-      myIdx = lock.idx++;
+      const myIdx = lock.idx++;
       if (myIdx >= patchesNeeded) return;
       const ioStart = myIdx * plan.rangesPerPatch;
       const ioEnd = Math.min(ioStart + plan.rangesPerPatch, totalIos);
@@ -223,7 +220,7 @@ async function runScenario(
         await r.body?.cancel();
       } else {
         // multipart/mixed PATCH
-        const body = buildMultipart(0, slice.length, plan.ioSize, 0x42, slice);
+        const body = buildMultipart(slice.length, plan.ioSize, 0x42, slice);
         const r = await fetch(`${env.baseUrl}/uploads/${uploadId}`, {
           method: "PATCH",
           headers: {
@@ -296,11 +293,19 @@ async function main() {
   }
 
   const env = await setupBenchEnv({});
-  console.log(`# upload-loopback baseUrl=${env.baseUrl} dataRoot=${env.dataRoot}`);
-  console.log(`# size-mb=${args.sizeMb} warmup=${args.warmup} iters=${args.iters}`);
+  console.log(
+    `# upload-loopback baseUrl=${env.baseUrl} dataRoot=${env.dataRoot}`,
+  );
+  console.log(
+    `# size-mb=${args.sizeMb} warmup=${args.warmup} iters=${args.iters}`,
+  );
   console.log();
-  console.log("scenario                    |   MB/s |   IOPS | PATCHes | elapsed");
-  console.log("---------------------------- -------- -------- --------- ---------");
+  console.log(
+    "scenario                    |   MB/s |   IOPS | PATCHes | elapsed",
+  );
+  console.log(
+    "---------------------------- -------- -------- --------- ---------",
+  );
 
   try {
     for (const k of scenarioKeys) {

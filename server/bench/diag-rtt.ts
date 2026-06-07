@@ -47,16 +47,20 @@ function buildMultipart(count: number, ioSize: number): Uint8Array {
   return out;
 }
 
-async function timeN(label: string, n: number, fn: (i: number) => Promise<void>): Promise<void> {
+async function timeN(
+  label: string,
+  n: number,
+  fn: (i: number) => Promise<void>,
+): Promise<void> {
   // warmup
   await fn(0);
   const t = performance.now();
   for (let i = 0; i < n; i++) await fn(i);
   const elapsed = performance.now() - t;
   console.log(
-    `${label.padEnd(50)} | ${(elapsed / n * 1000).toFixed(1).padStart(7)} µs/req | total ${
-      elapsed.toFixed(1)
-    } ms`,
+    `${label.padEnd(50)} | ${
+      (elapsed / n * 1000).toFixed(1).padStart(7)
+    } µs/req | total ${elapsed.toFixed(1)} ms`,
   );
 }
 
@@ -82,10 +86,17 @@ async function main() {
     });
 
     // (3) GET /locks/nonexistent — auth + service (no file ops)
-    await timeN("(3) GET /locks/diag-nonexistent (auth + KV get)", N, async () => {
-      const r = await fetch(`${env.baseUrl}/locks/diag-nonexistent-${performance.now() | 0}`, { headers });
-      await r.body?.cancel();
-    });
+    await timeN(
+      "(3) GET /locks/diag-nonexistent (auth + KV get)",
+      N,
+      async () => {
+        const r = await fetch(
+          `${env.baseUrl}/locks/diag-nonexistent-${performance.now() | 0}`,
+          { headers },
+        );
+        await r.body?.cancel();
+      },
+    );
 
     // (4) 1 session, N × single-range PATCH (4KB body, current per-PATCH code path)
     {
@@ -104,19 +115,32 @@ async function main() {
       const body4k = new Uint8Array(4096);
       body4k.fill(0x42);
 
-      await timeN("(4) PATCH /uploads/:id 4KB raw (open+seek+write+close)", N, async (i) => {
-        const off = i * 4096;
-        const rr = await fetch(`${env.baseUrl}/uploads/${uploadId}`, {
-          method: "PATCH",
-          headers: { ...headers, "Content-Range": `bytes ${off}-${off + 4095}/*` },
-          body: body4k,
-        });
-        await rr.body?.cancel();
-      });
+      await timeN(
+        "(4) PATCH /uploads/:id 4KB raw (open+seek+write+close)",
+        N,
+        async (i) => {
+          const off = i * 4096;
+          const rr = await fetch(`${env.baseUrl}/uploads/${uploadId}`, {
+            method: "PATCH",
+            headers: {
+              ...headers,
+              "Content-Range": `bytes ${off}-${off + 4095}/*`,
+            },
+            body: body4k,
+          });
+          await rr.body?.cancel();
+        },
+      );
 
       // cleanup
-      await fetch(`${env.baseUrl}/uploads/${uploadId}`, { method: "DELETE", headers });
-      await fetch(`${env.baseUrl}/locks${filePath}`, { method: "DELETE", headers });
+      await fetch(`${env.baseUrl}/uploads/${uploadId}`, {
+        method: "DELETE",
+        headers,
+      });
+      await fetch(`${env.baseUrl}/locks${filePath}`, {
+        method: "DELETE",
+        headers,
+      });
     }
 
     // (5) 1 session, N × multipart PATCH (32 range × 4KB) ― bench:loopback の RND 4K 相当
@@ -135,23 +159,40 @@ async function main() {
       const { uploadId } = await r.json() as { uploadId: string };
       const mpBody = buildMultipart(32, 4096);
 
-      await timeN("(5) PATCH multipart 32×4KB (open+32×seek+32×write+close)", N, async () => {
-        const rr = await fetch(`${env.baseUrl}/uploads/${uploadId}`, {
-          method: "PATCH",
-          headers: { ...headers, "Content-Type": `multipart/mixed; boundary=${BOUNDARY}` },
-          body: mpBody,
-        });
-        await rr.body?.cancel();
-      });
+      await timeN(
+        "(5) PATCH multipart 32×4KB (open+32×seek+32×write+close)",
+        N,
+        async () => {
+          const rr = await fetch(`${env.baseUrl}/uploads/${uploadId}`, {
+            method: "PATCH",
+            headers: {
+              ...headers,
+              "Content-Type": `multipart/mixed; boundary=${BOUNDARY}`,
+            },
+            body: mpBody,
+          });
+          await rr.body?.cancel();
+        },
+      );
 
-      await fetch(`${env.baseUrl}/uploads/${uploadId}`, { method: "DELETE", headers });
-      await fetch(`${env.baseUrl}/locks${filePath}`, { method: "DELETE", headers });
+      await fetch(`${env.baseUrl}/uploads/${uploadId}`, {
+        method: "DELETE",
+        headers,
+      });
+      await fetch(`${env.baseUrl}/locks${filePath}`, {
+        method: "DELETE",
+        headers,
+      });
     }
 
     console.log();
     console.log("# 解釈:");
-    console.log("#   (1) = pure HTTP route 最小 = TCP + hono dispatch + JSON response");
-    console.log("#   (2)-(1) = auth middleware (validateToken cache hit + upsertDevice cached)");
+    console.log(
+      "#   (1) = pure HTTP route 最小 = TCP + hono dispatch + JSON response",
+    );
+    console.log(
+      "#   (2)-(1) = auth middleware (validateToken cache hit + upsertDevice cached)",
+    );
     console.log("#   (3)-(2) = lock service (KV get path) - tree iter コスト");
     console.log("#   (4)-(3) = file ops (open + 1 seek + 1 write + close)");
     console.log("#   (5)-(4) = multipart parse + 31 extra seek+write");
