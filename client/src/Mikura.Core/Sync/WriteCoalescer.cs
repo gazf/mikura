@@ -38,8 +38,16 @@ internal sealed class WriteCoalescer : IAsyncDisposable
     // 超は出ないが、メモリ防衛で上限を切る。
     private const int MaxRanges = 4096;
 
-    private static readonly ArrayPool<byte> _pool =
-        ArrayPool<byte>.Create(maxArrayLength: TargetBufferSize, maxArraysPerBucket: 4);
+    // 旧実装は ArrayPool<byte>.Create(4MB, maxArraysPerBucket: 4) で「メモリ上限を
+    // 切るため」の意図で自前 pool を持っていたが、16 並行 session (CDM RND 4K T=16
+    // 等) が同時に 4MB buf を要求すると pool が 4 slot しか保持しないため、12
+    // session 分が毎 cycle 4MB を fresh alloc に落ちていた (bench:CoalescerBench で
+    // RND 4K Q=32 T=16 alloc/op 1251B のうち 700B 超がこれ起因と判明)。
+    //
+    // Shared pool は per-thread cache + CPU core 連動の bucket 数を持ち、16 並行
+    // でも fallback alloc しない。peak resident は使用量に比例 (1-16 file 想定で
+    // 数十 MB 程度) で許容範囲。
+    private static readonly ArrayPool<byte> _pool = ArrayPool<byte>.Shared;
 
     private readonly IServerApi _server;
     private readonly string _uploadId;
