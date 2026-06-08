@@ -66,6 +66,37 @@ public sealed class TrayAppContext : ApplicationContext
                       $"(check Task Manager / VMMap for RSS / Managed Heap delta)";
             Trace.WriteLine(msg);
         }));
+
+        // CPU 100% 切り分け用 stats snapshot。CDM 中に複数回 click すると delta が見えて
+        // 「GC が頻発してるか」「ThreadPool thread が増え続けてるか」「Pending Work が
+        // 詰まってるか」を判定できる。
+        menu.Items.Add(new ToolStripMenuItem("[Debug] Dump Stats", null, (_, _) =>
+        {
+            var proc = System.Diagnostics.Process.GetCurrentProcess();
+            var gen0 = GC.CollectionCount(0);
+            var gen1 = GC.CollectionCount(1);
+            var gen2 = GC.CollectionCount(2);
+            var managedMb = GC.GetTotalMemory(forceFullCollection: false) / 1024 / 1024;
+            var workingSetMb = proc.WorkingSet64 / 1024 / 1024;
+            var privateMb = proc.PrivateMemorySize64 / 1024 / 1024;
+            var cpuTime = proc.TotalProcessorTime;
+            var threadCount = proc.Threads.Count;
+
+            System.Threading.ThreadPool.GetAvailableThreads(out var availWorker, out var availIo);
+            System.Threading.ThreadPool.GetMaxThreads(out var maxWorker, out var maxIo);
+            System.Threading.ThreadPool.GetMinThreads(out var minWorker, out var minIo);
+            var pending = System.Threading.ThreadPool.PendingWorkItemCount;
+            var completed = System.Threading.ThreadPool.CompletedWorkItemCount;
+            var tpThreadCount = System.Threading.ThreadPool.ThreadCount;
+
+            var msg = $"[stats] proc: cpuTime={cpuTime.TotalSeconds:F1}s threads={threadCount} " +
+                      $"working={workingSetMb}MB private={privateMb}MB | " +
+                      $"gc: managed={managedMb}MB g0={gen0} g1={gen1} g2={gen2} | " +
+                      $"tp: threads={tpThreadCount} pending={pending} completed={completed} " +
+                      $"worker={maxWorker - availWorker}/{maxWorker}(min={minWorker}) " +
+                      $"io={maxIo - availIo}/{maxIo}(min={minIo})";
+            Trace.WriteLine(msg);
+        }));
 #endif
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(new ToolStripMenuItem("Exit", null, OnExit));
