@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using Mikura.Core.Abstractions;
@@ -460,6 +461,25 @@ public sealed class ServerBackend : IFileSystemBackend
         };
     }
 
+    /// <summary>
+    /// per-handle read-ahead cache の最大 prefetch byte 数 cap。要求 byte の 2x
+    /// を試みるが、IRP が大きいと (1MB IRP × 2 = 2MB) bandwidth waste が膨らむため
+    /// この cap で抑える。single-use cache の性質上、cap を IRP × 2 より大きくしても
+    /// 「次 IRP 1 つ分」しか hit しないので意味が薄い (実測: 256KB → 512KB で
+    /// SEQ 128K Q=32 は +2% のみ、noise band)。256KB で打ち止め。
+    /// </summary>
+    private const int MaxPrefetchSize = 256 * 1024;
+
+    /// <summary>
+    /// prefetch を armed にするのに必要な連続 sequential read 数。3 は
+    /// 「RND workload で偶然 streak が立つ確率を抑える」最小値。CDM RND Q=32
+    /// では offsets が完全ランダムなので 3 連続 sequential はまず起きない (実測:
+    /// RND phase 中 armed=0%)。一方 CDM SEQ や application の sequential read には
+    /// 警戒なしで armed まで 3 IRP の warm-up を払うだけで済む (= 連続 read の頭
+    /// 3 IRP は plain fetch、4 番目以降が prefetch 経路)。
+    /// </summary>
+    private const int SeqStreakThreshold = 3;
+
     public async Task<int> ReadAsync(IFileHandle handle, long offset, Memory<byte> buffer, CancellationToken ct = default)
     {
         // ADR-025 改訂: 旧設計は最初の Read で whole-file hydrate (handle 単位の
@@ -468,6 +488,10 @@ public sealed class ServerBackend : IFileSystemBackend
         // 乗せていた。右クリックのたびに 100MB が LOH に積み増されてプロセス
         // メモリが膨らむ実機回帰の主因。本実装は range-based fetch に切替え、
         // kernel が要求した範囲ぶんだけ HTTP Range で取得する。
+        //
+        // read-ahead cache: 1 IRP につき 2x prefetch して残りを per-handle cache
+        // に置く (Samba 流 next-sequential)。次 IRP が cache 先頭から始まれば
+        // HTTP RTT 0。詳細は ServerHandle.TryConsumePrefetch / StorePrefetch。
         var h = (ServerHandle)handle;
         if (h.IsDirectory) return 0;
 
@@ -484,6 +508,25 @@ public sealed class ServerBackend : IFileSystemBackend
             return requested;
         }
 
+        // sequential pattern tracking: cache hit / miss いずれの経路でも
+        // 1 IRP につき 1 回 update する。armed = SeqStreakThreshold 連続で
+        // sequential continue を観測 = prefetch 価値あり と判定。
+        var armed = h.NoteReadAndCheckArmed(offset, requested);
+
+        // prefetch cache hit: zero round-trip。partial hit (cache が requested 未満)
+        // でも single-use semantics で remainder は捨てる (user 仕様)。caller
+        // (kernel) は不足分を次 IRP で要求してくるので integrity は崩れない。
+        if (h.TryConsumePrefetch(offset, buffer.Span.Slice(0, requested), out var cachedBytes))
+        {
+            if (cachedBytes < requested)
+            {
+                // EOF を跨いだ partial hit。残りは zero-fill (logicalEnd 以下なので
+                // 通常ここには来ないが safety net)。
+                buffer.Span.Slice(cachedBytes, requested - cachedBytes).Clear();
+            }
+            return requested;
+        }
+
         // server 側に実体がある範囲は range fetch、その先は SetSize-extend
         // 由来のゼロ領域として local で zero-fill する。
         var fetchableEnd = Math.Min(offset + requested, h.OriginalServerSize);
@@ -491,10 +534,53 @@ public sealed class ServerBackend : IFileSystemBackend
         var fetched = 0;
         if (fetchLen > 0)
         {
-            await using var stream = await _server.DownloadFileAsync(h.Path, offset, fetchLen, ct)
-                .ConfigureAwait(false);
-            await stream.ReadExactlyAsync(buffer.Slice(0, fetchLen), ct).ConfigureAwait(false);
-            fetched = fetchLen;
+            // prefetch size 計算: armed の場合のみ 2x、それ以外は plain (fetchLen のみ)。
+            // armed=false 経路は従来挙動と同等 = zero-copy direct fetch。
+            var prefetchableEnd = armed
+                ? Math.Min(
+                    offset + (long)Math.Min(requested * 2L, MaxPrefetchSize),
+                    h.OriginalServerSize)
+                : (long)offset + fetchLen;
+            var prefetchLen = (int)Math.Max(0, prefetchableEnd - offset);
+
+            if (prefetchLen <= fetchLen)
+            {
+                // 余剰なし (disarmed / EOF 直前 / 要求が既に MaxPrefetchSize に等しい)。
+                // 直接 buffer に読み込む zero-copy 経路。
+                await using var stream = await _server.DownloadFileAsync(h.Path, offset, fetchLen, ct)
+                    .ConfigureAwait(false);
+                await stream.ReadExactlyAsync(buffer.Slice(0, fetchLen), ct).ConfigureAwait(false);
+                fetched = fetchLen;
+            }
+            else
+            {
+                // prefetch: pooled buffer に prefetchLen byte 読んで、先頭 fetchLen を
+                // IRP buffer にコピー、残りを cache に格納 (所有権移譲)。
+                var pooled = ArrayPool<byte>.Shared.Rent(prefetchLen);
+                var transferred = false;
+                try
+                {
+                    await using var stream = await _server.DownloadFileAsync(h.Path, offset, prefetchLen, ct)
+                        .ConfigureAwait(false);
+                    await stream.ReadExactlyAsync(pooled.AsMemory(0, prefetchLen), ct)
+                        .ConfigureAwait(false);
+
+                    pooled.AsMemory(0, fetchLen).CopyTo(buffer);
+                    fetched = fetchLen;
+
+                    var extraStart = fetchLen;
+                    var extraLen = prefetchLen - fetchLen;
+                    h.StorePrefetch(pooled, extraStart, extraLen, offset + fetchLen);
+                    transferred = true;
+                }
+                finally
+                {
+                    if (!transferred)
+                    {
+                        ArrayPool<byte>.Shared.Return(pooled);
+                    }
+                }
+            }
         }
         if (fetched < requested)
         {
@@ -536,6 +622,11 @@ public sealed class ServerBackend : IFileSystemBackend
             .ConfigureAwait(false);
         await h.EnqueueChunkAsync(writeOffset, data.Slice(0, length), ct).ConfigureAwait(false);
         h.RecordWriteSize(length);
+
+        // read-ahead cache invalidate: 同 handle で Write した後の Read は
+        // 自身が書いた新 byte を見るべき。prefetch は server から取った Write 前
+        // の値なので必ず stale。
+        h.InvalidatePrefetch();
 
         var newLength = Math.Max(existingLen, writeOffset + length);
         h.SetLogicalLength(newLength);
@@ -919,6 +1010,132 @@ public sealed class ServerBackend : IFileSystemBackend
             // 何も持っていない。Cleanup 経路で必ず ReleaseSessionSlotFor*Async が
             // 呼ばれ refcount が減算される。漏れた場合 (例: WinFsp 経路の例外で
             // Cleanup post されず) は server 側 TTL に任せる。
+            InvalidatePrefetch();
+        }
+
+        // ─────────────────────────── read-ahead prefetch cache (per-handle) ────
+        // Samba 流の "next-sequential" speculative prefetch。1 IRP につき要求サイズの
+        // 2x (cap = MaxPrefetchSize) をサーバから取り、要求 byte を返した後の
+        // 余剰を 1 entry 分だけ保持する。次の IRP が prefetch 範囲の先頭から始まる
+        // (= sequential continue) なら HTTP RTT を省ける。
+        //
+        // 単一 entry / single-use semantics:
+        //   - hit したら即 ArrayPool.Return + null 化
+        //   - miss で新規格納するときも先に古い entry を Return
+        //   - Write / Dispose 時に InvalidatePrefetch
+        //
+        // Sequential detection (arm/disarm):
+        //   - 各 IRP で「前回 IRP の end == 今回 IRP の start」を判定
+        //   - SeqStreakThreshold 連続で armed = prefetch を発行
+        //   - break (random offset 着弾) で streak リセット → 次回からは plain fetch
+        //   これで CDM RND 4K 系の "always 2x bandwidth 消費" regression を回避。
+        private byte[]? _prefetchBuffer;
+        private int _prefetchStart;
+        private long _prefetchOffset;
+        private int _prefetchLength;
+        private readonly object _prefetchGate = new();
+
+        // sequential pattern tracking (gate と同じ lock 配下で保護)
+        private long _lastReadEnd = -1; // -1 = まだ Read 経験なし
+        private int _seqStreak;
+
+        /// <summary>
+        /// offset が prefetch の先頭と一致したら dest にコピーして cache を消費。
+        /// 一致しない (= sequential 切れ) なら cache 廃棄して false を返す。
+        /// </summary>
+        public bool TryConsumePrefetch(long offset, Span<byte> dest, out int copied)
+        {
+            lock (_prefetchGate)
+            {
+                if (_prefetchBuffer is null)
+                {
+                    copied = 0;
+                    return false;
+                }
+                if (offset != _prefetchOffset)
+                {
+                    // sequential 切れ = stale。次回 prefetch のために廃棄。
+                    ReturnPrefetchLocked();
+                    copied = 0;
+                    return false;
+                }
+                var n = Math.Min(dest.Length, _prefetchLength);
+                _prefetchBuffer.AsSpan(_prefetchStart, n).CopyTo(dest);
+                // single-use: 部分消費でも残りは捨てる (user 指定 spec)。
+                ReturnPrefetchLocked();
+                copied = n;
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// prefetch fetch 完了後に余剰 byte を格納。buffer の所有権は pool に
+        /// 戻されるまで cache 側が持つ (caller は以後触らない)。
+        /// </summary>
+        public void StorePrefetch(byte[] buffer, int start, int length, long offset)
+        {
+            lock (_prefetchGate)
+            {
+                ReturnPrefetchLocked();
+                _prefetchBuffer = buffer;
+                _prefetchStart = start;
+                _prefetchLength = length;
+                _prefetchOffset = offset;
+            }
+        }
+
+        public void InvalidatePrefetch()
+        {
+            lock (_prefetchGate)
+            {
+                ReturnPrefetchLocked();
+                // pattern tracking もリセット: Write 後 / Dispose 後の次の Read は
+                // 「streak ゼロから」始める。古い streak のまま prefetch を armed
+                // 続行すると、Write で内容が変わった直後に古い前提で 2x fetch する
+                // 無駄が出る (再 arm を待つほうが安全)。
+                _lastReadEnd = -1;
+                _seqStreak = 0;
+            }
+        }
+
+        /// <summary>
+        /// Read IRP の到着を記録し、prefetch を発行すべきか (armed) を返す。
+        /// 「前回 IRP の end == 今回 IRP の start」が <see cref="SeqStreakThreshold"/>
+        /// 連続で続いたら armed = true、それ以外 (= random offset 着弾) は streak を
+        /// リセットして armed = false。
+        /// </summary>
+        /// <remarks>
+        /// 呼び出しは ReadAsync の入口、TryConsumePrefetch / fetch 経路に関係なく
+        /// 1 IRP につき 1 回。cache hit も sequential continue としてカウントされる
+        /// (実体的に「次 byte を読み続けている」ため)。
+        /// </remarks>
+        public bool NoteReadAndCheckArmed(long offset, int length)
+        {
+            lock (_prefetchGate)
+            {
+                var sequential = _lastReadEnd >= 0 && _lastReadEnd == offset;
+                if (sequential)
+                {
+                    if (_seqStreak < int.MaxValue) _seqStreak++;
+                }
+                else
+                {
+                    _seqStreak = 1;
+                }
+                _lastReadEnd = offset + length;
+                return _seqStreak >= SeqStreakThreshold;
+            }
+        }
+
+        private void ReturnPrefetchLocked()
+        {
+            if (_prefetchBuffer is not null)
+            {
+                ArrayPool<byte>.Shared.Return(_prefetchBuffer);
+                _prefetchBuffer = null;
+                _prefetchStart = 0;
+                _prefetchLength = 0;
+            }
         }
 
         // ─────────────────────────────────── async I/O in-flight tracker ────
