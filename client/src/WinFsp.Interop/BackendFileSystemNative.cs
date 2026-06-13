@@ -46,6 +46,12 @@ public sealed class BackendFileSystemNative : IFileSystem, IAsyncFileIo
     private readonly DateTime _createdAt = DateTime.UtcNow;
     private FileSystemHost? _host;
 
+    // race 切り分け用の詳細ログ。env MIKURA_NATIVE_TRACE=1 で有効化。
+    // Open / Cleanup / Close の入口で thread + handle path + flags を打つ。
+    private static readonly bool _trace =
+        string.Equals(Environment.GetEnvironmentVariable("MIKURA_NATIVE_TRACE"), "1",
+            StringComparison.Ordinal);
+
     public BackendFileSystemNative(IFileSystemBackend backend, OnlineGate gate)
     {
         _backend = backend;
@@ -115,6 +121,8 @@ public sealed class BackendFileSystemNative : IFileSystem, IAsyncFileIo
 
         var path = ToBackendPath(fileName);
         var intent = HasWriteAccess(grantedAccess) ? FileAccessIntent.Write : FileAccessIntent.Read;
+        if (_trace)
+            Trace.WriteLine($"[trace] Open tid={Environment.CurrentManagedThreadId} path={path} access=0x{grantedAccess:X8} intent={intent}");
 
         try
         {
@@ -297,6 +305,8 @@ public sealed class BackendFileSystemNative : IFileSystem, IAsyncFileIo
         if ((flags & NativeCleanupFlags.SetAllocationSize) != 0) cf |= DomainCleanupFlags.Modified;
         if ((flags & NativeCleanupFlags.SetArchiveBit) != 0) cf |= DomainCleanupFlags.Modified;
         if ((flags & NativeCleanupFlags.Delete) != 0) cf |= DomainCleanupFlags.Delete;
+        if (_trace)
+            Trace.WriteLine($"[trace] Cleanup tid={Environment.CurrentManagedThreadId} path={handle.Path} winflags=0x{(uint)flags:X} cf={cf}");
         try
         {
             _backend.CleanupAsync(handle, cf).GetAwaiter().GetResult();
@@ -310,6 +320,8 @@ public sealed class BackendFileSystemNative : IFileSystem, IAsyncFileIo
     public void Close(object fileContext)
     {
         var handle = (IFileHandle)fileContext;
+        if (_trace)
+            Trace.WriteLine($"[trace] Close tid={Environment.CurrentManagedThreadId} path={handle.Path}");
         try
         {
             _backend.CloseAsync(handle).GetAwaiter().GetResult();

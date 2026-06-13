@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using WinFsp.Native.Native;
@@ -268,7 +269,7 @@ public sealed unsafe class FileSystemHost : IDisposable
             }
             return status;
         }
-        catch { return NtStatus.Unsuccessful; }
+        catch (Exception ex) { Trace.WriteLine($"[ERROR] WinFsp callback threw: {ex.GetType().Name}: {ex.Message}"); return NtStatus.Unsuccessful; }
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -299,7 +300,7 @@ public sealed unsafe class FileSystemHost : IDisposable
             }
             return status;
         }
-        catch { return NtStatus.Unsuccessful; }
+        catch (Exception ex) { Trace.WriteLine($"[ERROR] WinFsp callback threw: {ex.GetType().Name}: {ex.Message}"); return NtStatus.Unsuccessful; }
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -319,7 +320,7 @@ public sealed unsafe class FileSystemHost : IDisposable
             }
             return status;
         }
-        catch { return NtStatus.Unsuccessful; }
+        catch (Exception ex) { Trace.WriteLine($"[ERROR] WinFsp callback threw: {ex.GetType().Name}: {ex.Message}"); return NtStatus.Unsuccessful; }
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -339,7 +340,7 @@ public sealed unsafe class FileSystemHost : IDisposable
             }
             return status;
         }
-        catch { return NtStatus.Unsuccessful; }
+        catch (Exception ex) { Trace.WriteLine($"[ERROR] WinFsp callback threw: {ex.GetType().Name}: {ex.Message}"); return NtStatus.Unsuccessful; }
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -356,7 +357,7 @@ public sealed unsafe class FileSystemHost : IDisposable
             if (status >= 0) *pInfo = info;
             return status;
         }
-        catch { return NtStatus.Unsuccessful; }
+        catch (Exception ex) { Trace.WriteLine($"[ERROR] WinFsp callback threw: {ex.GetType().Name}: {ex.Message}"); return NtStatus.Unsuccessful; }
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -370,7 +371,11 @@ public sealed unsafe class FileSystemHost : IDisposable
                 fileName == 0 ? null : MarshalString(fileName),
                 (CleanupFlags)flags);
         }
-        catch { /* native 側に例外を流さない */ }
+        catch (Exception ex)
+        {
+            // native 側に例外を流すと dispatcher が死ぬ。ここで捕まえて log だけ残す。
+            Trace.WriteLine($"[ERROR] WinFsp OnCleanup threw: {ex.GetType().Name}: {ex.Message}");
+        }
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -382,10 +387,18 @@ public sealed unsafe class FileSystemHost : IDisposable
             var ctx = GetContext(fileContext);
             if (host is not null && ctx is not null) host._fs.Close(ctx);
         }
-        catch { /* swallow */ }
+        catch (Exception ex)
+        {
+            Trace.WriteLine($"[ERROR] WinFsp OnClose threw: {ex.GetType().Name}: {ex.Message}");
+        }
         finally
         {
-            FreeContext(fileContext);
+            // FreeContext 自体は GCHandle 操作なので throw しない想定だが、念のため。
+            try { FreeContext(fileContext); }
+            catch (Exception ex)
+            {
+                Trace.WriteLine($"[ERROR] WinFsp OnClose FreeContext threw: {ex.GetType().Name}: {ex.Message}");
+            }
         }
     }
 
@@ -425,7 +438,7 @@ public sealed unsafe class FileSystemHost : IDisposable
             *pBytesTransferred = transferred;
             return status;
         }
-        catch { return NtStatus.Unsuccessful; }
+        catch (Exception ex) { Trace.WriteLine($"[ERROR] WinFsp callback threw: {ex.GetType().Name}: {ex.Message}"); return NtStatus.Unsuccessful; }
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -464,7 +477,7 @@ public sealed unsafe class FileSystemHost : IDisposable
             if (status >= 0) *pInfo = info;
             return status;
         }
-        catch { return NtStatus.Unsuccessful; }
+        catch (Exception ex) { Trace.WriteLine($"[ERROR] WinFsp callback threw: {ex.GetType().Name}: {ex.Message}"); return NtStatus.Unsuccessful; }
     }
 
 
@@ -479,7 +492,7 @@ public sealed unsafe class FileSystemHost : IDisposable
             if (status >= 0) *pInfo = info;
             return status;
         }
-        catch { return NtStatus.Unsuccessful; }
+        catch (Exception ex) { Trace.WriteLine($"[ERROR] WinFsp callback threw: {ex.GetType().Name}: {ex.Message}"); return NtStatus.Unsuccessful; }
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -494,7 +507,7 @@ public sealed unsafe class FileSystemHost : IDisposable
             if (status >= 0) *pInfo = info;
             return status;
         }
-        catch { return NtStatus.Unsuccessful; }
+        catch (Exception ex) { Trace.WriteLine($"[ERROR] WinFsp callback threw: {ex.GetType().Name}: {ex.Message}"); return NtStatus.Unsuccessful; }
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -512,7 +525,7 @@ public sealed unsafe class FileSystemHost : IDisposable
             if (status >= 0) *pInfo = info;
             return status;
         }
-        catch { return NtStatus.Unsuccessful; }
+        catch (Exception ex) { Trace.WriteLine($"[ERROR] WinFsp callback threw: {ex.GetType().Name}: {ex.Message}"); return NtStatus.Unsuccessful; }
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -527,7 +540,7 @@ public sealed unsafe class FileSystemHost : IDisposable
             if (status >= 0) *pInfo = info;
             return status;
         }
-        catch { return NtStatus.Unsuccessful; }
+        catch (Exception ex) { Trace.WriteLine($"[ERROR] WinFsp callback threw: {ex.GetType().Name}: {ex.Message}"); return NtStatus.Unsuccessful; }
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -540,7 +553,7 @@ public sealed unsafe class FileSystemHost : IDisposable
             if (host is null || ctx is null) return NtStatus.Unsuccessful;
             return host._fs.CanDelete(ctx, MarshalString(fileName));
         }
-        catch { return NtStatus.Unsuccessful; }
+        catch (Exception ex) { Trace.WriteLine($"[ERROR] WinFsp callback threw: {ex.GetType().Name}: {ex.Message}"); return NtStatus.Unsuccessful; }
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -553,7 +566,7 @@ public sealed unsafe class FileSystemHost : IDisposable
             if (host is null || ctx is null) return NtStatus.Unsuccessful;
             return host._fs.Rename(ctx, MarshalString(fileName), MarshalString(newFileName), replaceIfExists != 0);
         }
-        catch { return NtStatus.Unsuccessful; }
+        catch (Exception ex) { Trace.WriteLine($"[ERROR] WinFsp callback threw: {ex.GetType().Name}: {ex.Message}"); return NtStatus.Unsuccessful; }
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -581,7 +594,7 @@ public sealed unsafe class FileSystemHost : IDisposable
             }
             return status;
         }
-        catch { return NtStatus.Unsuccessful; }
+        catch (Exception ex) { Trace.WriteLine($"[ERROR] WinFsp callback threw: {ex.GetType().Name}: {ex.Message}"); return NtStatus.Unsuccessful; }
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -597,7 +610,7 @@ public sealed unsafe class FileSystemHost : IDisposable
             // managed byte[] にコピーしてから dispatch する。
             return host._fs.SetSecurity(ctx, securityInformation, Array.Empty<byte>());
         }
-        catch { return NtStatus.Unsuccessful; }
+        catch (Exception ex) { Trace.WriteLine($"[ERROR] WinFsp callback threw: {ex.GetType().Name}: {ex.Message}"); return NtStatus.Unsuccessful; }
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -616,7 +629,7 @@ public sealed unsafe class FileSystemHost : IDisposable
             *pBytesTransferred = transferred;
             return status;
         }
-        catch { return NtStatus.Unsuccessful; }
+        catch (Exception ex) { Trace.WriteLine($"[ERROR] WinFsp callback threw: {ex.GetType().Name}: {ex.Message}"); return NtStatus.Unsuccessful; }
     }
 
     // ─────────────────────────────────────────── FileContext lifecycle ────

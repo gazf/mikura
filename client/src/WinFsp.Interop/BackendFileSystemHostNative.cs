@@ -25,6 +25,12 @@ public sealed class BackendFileSystemHostNative : IBackendHost, IDisposable
     /// <summary>
     /// 指定 mount point に WinFsp drive を bind。drive letter ("Z:") か
     /// 空ディレクトリ path を渡す。失敗時は例外を投げる。
+    /// <para>
+    /// 環境変数 <c>MIKURA_NATIVE_THREADCOUNT</c> で WinFsp dispatcher の thread 数を
+    /// 制御できる。0 (既定) は WinFsp default (typically 2*CPU)。1 を指定すると
+    /// 旧 <c>Fsp.FileSystemHost</c> の <c>Synchronized=true</c> 相当 = serialized callback
+    /// になる (race 切り分け用)。
+    /// </para>
     /// </summary>
     public string Mount(string mountPoint)
     {
@@ -34,10 +40,23 @@ public sealed class BackendFileSystemHostNative : IBackendHost, IDisposable
             Directory.CreateDirectory(mountPoint);
         }
 
-        _host.Mount(mountPoint);
+        var threadCount = ParseThreadCountEnv();
+        if (threadCount > 0)
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"[INFO] WinFsp.Native dispatcher threadCount={threadCount} (MIKURA_NATIVE_THREADCOUNT)");
+        }
+        _host.Mount(mountPoint, threadCount);
         _mounted = true;
         _mountPoint = mountPoint;
         return mountPoint;
+    }
+
+    private static uint ParseThreadCountEnv()
+    {
+        var raw = Environment.GetEnvironmentVariable("MIKURA_NATIVE_THREADCOUNT");
+        if (string.IsNullOrEmpty(raw)) return 0;
+        return uint.TryParse(raw, out var v) ? v : 0;
     }
 
     private static bool LooksLikeDirectoryPath(string mountPoint)

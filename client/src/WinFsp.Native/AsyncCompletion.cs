@@ -22,15 +22,30 @@ internal static class AsyncCompletion
         }
         catch (Exception ex)
         {
-            Trace.WriteLine($"[WinFsp.Native] Read async failed: {ex.GetType().Name}: {ex.Message}");
+            Trace.WriteLine($"[ERROR] WinFsp.Native Read async backend threw: {ex.GetType().Name}: {ex.Message}");
             result = new ReadResult(NtStatus.Unsuccessful, 0);
         }
         finally
         {
-            ((IDisposable)mm).Dispose();
+            try { ((IDisposable)mm).Dispose(); }
+            catch (Exception ex)
+            {
+                Trace.WriteLine($"[ERROR] WinFsp.Native Read mm dispose threw: {ex.GetType().Name}: {ex.Message}");
+            }
         }
 
-        SendResponseRead(fs, hint, result);
+        try
+        {
+            SendResponseRead(fs, hint, result);
+        }
+        catch (Exception ex)
+        {
+            // SendResponse failure (e.g., host disposed concurrently). 起こすと
+            // UnobservedTaskException 経由でログだけ残ってプロセスは生き残る
+            // — kernel 側は STATUS_PENDING のまま戻ってこないので caller の IRP
+            // は無応答になるが、unmount 時しか起きないはず。
+            Trace.WriteLine($"[ERROR] WinFsp.Native Read SendResponse threw (hint=0x{hint:X}): {ex.GetType().Name}: {ex.Message}");
+        }
     }
 
     public static async Task WriteAsync(nint fs, ulong hint,
@@ -43,15 +58,26 @@ internal static class AsyncCompletion
         }
         catch (Exception ex)
         {
-            Trace.WriteLine($"[WinFsp.Native] Write async failed: {ex.GetType().Name}: {ex.Message}");
+            Trace.WriteLine($"[ERROR] WinFsp.Native Write async backend threw: {ex.GetType().Name}: {ex.Message}");
             result = new WriteResult(NtStatus.Unsuccessful, 0, default);
         }
         finally
         {
-            ((IDisposable)mm).Dispose();
+            try { ((IDisposable)mm).Dispose(); }
+            catch (Exception ex)
+            {
+                Trace.WriteLine($"[ERROR] WinFsp.Native Write mm dispose threw: {ex.GetType().Name}: {ex.Message}");
+            }
         }
 
-        SendResponseWrite(fs, hint, result);
+        try
+        {
+            SendResponseWrite(fs, hint, result);
+        }
+        catch (Exception ex)
+        {
+            Trace.WriteLine($"[ERROR] WinFsp.Native Write SendResponse threw (hint=0x{hint:X}): {ex.GetType().Name}: {ex.Message}");
+        }
     }
 
     // ───────────────────────────────────────── SendResponse builders ────
