@@ -1,6 +1,6 @@
 using System.Buffers;
 
-namespace Mikura.Core.Sync;
+namespace Mikura.Core.FileSystem;
 
 /// <summary>
 /// Per-handle read-ahead prefetch cache (Samba 流 next-sequential, ADR-031)。

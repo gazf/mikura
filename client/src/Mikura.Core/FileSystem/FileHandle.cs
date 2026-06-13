@@ -2,7 +2,7 @@ using System.Diagnostics;
 using Mikura.Core.Abstractions;
 using Mikura.Core.Models;
 
-namespace Mikura.Core.Sync;
+namespace Mikura.Core.FileSystem;
 
 public sealed partial class FileSystemBackend
 {

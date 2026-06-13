@@ -3,7 +3,7 @@ using System.Diagnostics;
 using Mikura.Core.Abstractions;
 using Mikura.Core.Models;
 
-namespace Mikura.Core.Sync;
+namespace Mikura.Core.FileSystem;
 
 /// <summary>
 /// kernel Write IRP を後段の HTTP PATCH に流す前段の write cache。

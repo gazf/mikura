@@ -7,7 +7,7 @@ using System.Threading.Tasks;
 using Mikura.Core.Abstractions;
 using Mikura.Core.Models;
 
-namespace Mikura.Core.Tests.Sync;
+namespace Mikura.Core.Tests.FileSystem;
 
 /// <summary>
 /// FileSystemBackend テスト用の手書き fake。Moq だと

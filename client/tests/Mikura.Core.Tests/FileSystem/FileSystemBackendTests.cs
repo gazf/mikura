@@ -2,11 +2,11 @@ using System;
 using System.IO;
 using System.Threading.Tasks;
 using Mikura.Core.Abstractions;
+using Mikura.Core.FileSystem;
 using Mikura.Core.Models;
-using Mikura.Core.Sync;
 using Xunit;
 
-namespace Mikura.Core.Tests.Sync;
+namespace Mikura.Core.Tests.FileSystem;
 
 /// <summary>
 /// FileSystemBackend の責務 (ADR-021/022/023):

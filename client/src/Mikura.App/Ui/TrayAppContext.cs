@@ -3,6 +3,7 @@ using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Windows.Forms;
 using Mikura.App.Config;
+using Mikura.Core.FileSystem;
 using Mikura.Core.Identity;
 using Mikura.Core.Sync;
 using Mikura.Transport;

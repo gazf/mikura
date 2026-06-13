@@ -4,7 +4,7 @@ using System.Diagnostics;
 using Mikura.Core.Abstractions;
 using Mikura.Core.Models;
 
-namespace Mikura.Core.Sync;
+namespace Mikura.Core.FileSystem;
 
 /// <summary>
 /// Production <see cref="IFileSystemBackend"/> wired to <see cref="IServerApi"/>.

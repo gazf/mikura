@@ -4,9 +4,9 @@ using Mikura.Core.Models;
 namespace WinFsp.Interop.Backends;
 
 /// <summary>
-/// In-memory <see cref="IFileSystemBackend"/> for development, demos, and the
-/// pre-server-integration phase. Holds a flat namespace under "/" with two
-/// seeded files. Phase B.2's <c>FileSystemBackend</c> replaces this for production.
+/// In-memory <see cref="IFileSystemBackend"/> for development and demos.
+/// Holds a flat namespace under "/" with two seeded files.
+/// Production uses <c>Mikura.Core.FileSystem.FileSystemBackend</c>.
 /// </summary>
 public sealed class InMemoryFileSystemBackend : IFileSystemBackend
 {
