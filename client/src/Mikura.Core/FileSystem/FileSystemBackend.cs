@@ -286,6 +286,12 @@ public sealed partial class FileSystemBackend : IFileSystemBackend
                 if (--slot.Refcount <= 0) _activeSessions.Remove(path);
             }
             slot.StartResult.TrySetException(ex);
+            // ↑ second caller がいないと slot.StartResult.Task の例外は誰にも観測されず
+            // GC 時に TaskScheduler.UnobservedTaskException として発火する。
+            // Task.Exception を一度読むだけで「observed」扱いになるので、ここで明示する。
+            // 後で second caller が await して再 throw する分には同じ AggregateException
+            // を読み出すだけなので副作用なし。
+            _ = slot.StartResult.Task.Exception;
             Trace.WriteLine($"StartUpload failed: {path}: {ex.Message}");
             throw;
         }
@@ -740,7 +746,15 @@ public sealed partial class FileSystemBackend : IFileSystemBackend
                 return;
             }
 
-            var shouldUpload = (flags & CleanupFlags.Modified) != 0 || h.FreshlyCreated;
+            // 防衛: read-intent open (HasLock=false) で kernel が SetLastWriteTime /
+            // SetArchiveBit を立てた Cleanup を post してくる事がある (実機 echo > Z:\foo
+            // の post-close hook で Defender / Indexer が読み戻すケース等)。lock を持って
+            // いない handle で StartUpload を叩くと server で必ず 403 holder mismatch、
+            // かつ並走中の write handle の lock が release 直後だと「直前まで動いていた
+            // upload が、追従して走った別 handle の cleanup で 403」という症状になる。
+            // HasLock=false の handle は upload しても通る筋がないので skip。
+            var shouldUpload = (h.HasLock || h.FreshlyCreated)
+                && ((flags & CleanupFlags.Modified) != 0 || h.FreshlyCreated);
             if (shouldUpload && !h.IsDirectory)
             {
                 try
