@@ -130,23 +130,25 @@ public sealed unsafe class FileSystemHost : IDisposable
     private VolumeParams BuildVolumeParams()
     {
         var vp = default(VolumeParams);
-        vp.Version = (ushort)Marshal.SizeOf<VolumeParams>(); // V0 + V1 = 504
+        // Version: 0 か sizeof(FSP_FSCTL_VOLUME_PARAMS) のいずれか。
+        // V1 fields を使うので 504 を指定。fsctl.h の static assert と一致。
+        vp.Version = 504;
         vp.SectorSize = SectorSize;
         vp.SectorsPerAllocationUnit = SectorsPerAllocationUnit;
         vp.MaxComponentLength = MaxComponentLength;
         vp.VolumeCreationTime = VolumeCreationTime;
         vp.VolumeSerialNumber = VolumeSerialNumber;
         vp.FileInfoTimeout = FileInfoTimeout;
-        vp.Prefix = "";
-        vp.FileSystemName = FileSystemName;
+        vp.SetPrefix(""); // UNC prefix なし
+        vp.SetFileSystemName(FileSystemName);
 
-        VolumeParamsFlags.Set(ref vp.Flags1, VolumeParamsFlags.CaseSensitiveSearch, CaseSensitiveSearch);
-        VolumeParamsFlags.Set(ref vp.Flags1, VolumeParamsFlags.CasePreservedNames, CasePreservedNames);
-        VolumeParamsFlags.Set(ref vp.Flags1, VolumeParamsFlags.UnicodeOnDisk, UnicodeOnDisk);
-        VolumeParamsFlags.Set(ref vp.Flags1, VolumeParamsFlags.PersistentAcls, PersistentAcls);
-        VolumeParamsFlags.Set(ref vp.Flags1, VolumeParamsFlags.PostCleanupWhenModifiedOnly, PostCleanupWhenModifiedOnly);
-        VolumeParamsFlags.Set(ref vp.Flags1, VolumeParamsFlags.PassQueryDirectoryPattern, PassQueryDirectoryPattern);
-        VolumeParamsFlags.Set(ref vp.Flags1, VolumeParamsFlags.FlushAndPurgeOnCleanup, FlushAndPurgeOnCleanup);
+        VolumeParamsFlags.Set(ref vp.Flags, VolumeParamsFlags.CaseSensitiveSearch, CaseSensitiveSearch);
+        VolumeParamsFlags.Set(ref vp.Flags, VolumeParamsFlags.CasePreservedNames, CasePreservedNames);
+        VolumeParamsFlags.Set(ref vp.Flags, VolumeParamsFlags.UnicodeOnDisk, UnicodeOnDisk);
+        VolumeParamsFlags.Set(ref vp.Flags, VolumeParamsFlags.PersistentAcls, PersistentAcls);
+        VolumeParamsFlags.Set(ref vp.Flags, VolumeParamsFlags.PostCleanupWhenModifiedOnly, PostCleanupWhenModifiedOnly);
+        VolumeParamsFlags.Set(ref vp.Flags, VolumeParamsFlags.PassQueryDirectoryPattern, PassQueryDirectoryPattern);
+        VolumeParamsFlags.Set(ref vp.Flags, VolumeParamsFlags.FlushAndPurgeOnCleanup, FlushAndPurgeOnCleanup);
 
         return vp;
     }

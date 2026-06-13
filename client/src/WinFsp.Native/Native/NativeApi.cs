@@ -1,4 +1,6 @@
+using System.Reflection;
 using System.Runtime.InteropServices;
+using Microsoft.Win32;
 
 namespace WinFsp.Native.Native;
 
@@ -11,10 +13,58 @@ namespace WinFsp.Native.Native;
 /// user-mode stub を直接叩く。signature は winfsp/winfsp.h の <c>FSP_API</c>
 /// 関数群 (FspFileSystemCreate / Delete / SetMountPoint / RemoveMountPoint /
 /// StartDispatcher / StopDispatcher / SendResponse / GetOperationContext) と一致。
+///
+/// <para>DLL 解決: WinFsp は <c>%ProgramFiles(x86)%\WinFsp\bin\winfsp-x64.dll</c>
+/// に install される。default PATH には含まれないので、process 起動時に明示的に
+/// resolver を仕込んで、Registry (HKLM\SOFTWARE\WOW6432Node\WinFsp\InstallDir) か
+/// 既定パスから探す。</para>
 /// </remarks>
 internal static partial class NativeApi
 {
     private const string DllName = "winfsp-x64.dll";
+
+    static NativeApi()
+    {
+        NativeLibrary.SetDllImportResolver(typeof(NativeApi).Assembly, Resolve);
+    }
+
+    private static nint Resolve(string libraryName, Assembly assembly, DllImportSearchPath? searchPath)
+    {
+        if (!string.Equals(libraryName, DllName, StringComparison.OrdinalIgnoreCase))
+            return 0;
+
+        foreach (var path in CandidatePaths())
+        {
+            if (File.Exists(path) && NativeLibrary.TryLoad(path, out var handle))
+                return handle;
+        }
+        // 最終手段: default search path に任せる (PATH 等が通っていれば拾える)
+        return NativeLibrary.TryLoad(libraryName, out var fallback) ? fallback : 0;
+    }
+
+    private static IEnumerable<string> CandidatePaths()
+    {
+        // 1) Registry: HKLM\SOFTWARE\WOW6432Node\WinFsp\InstallDir (x64 host, 32-bit MSI)
+        string? installDir = null;
+        try
+        {
+            using var key = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry32)
+                .OpenSubKey(@"SOFTWARE\WinFsp");
+            installDir = key?.GetValue("InstallDir") as string;
+        }
+        catch { /* registry permission 等は無視 */ }
+        if (!string.IsNullOrEmpty(installDir))
+            yield return Path.Combine(installDir, "bin", DllName);
+
+        // 2) 既定 install パス
+        var pf86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+        if (!string.IsNullOrEmpty(pf86))
+            yield return Path.Combine(pf86, "WinFsp", "bin", DllName);
+
+        var pf = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+        if (!string.IsNullOrEmpty(pf))
+            yield return Path.Combine(pf, "WinFsp", "bin", DllName);
+    }
 
     /// <summary>
     /// winfsp.h の <c>FSP_FSCTL_DISK_DEVICE_NAME</c> 相当。FspFileSystemCreate に
