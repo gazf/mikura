@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows10.0.17763.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>WinFsp.Native</RootNamespace>
+    <AssemblyName>WinFsp.Native</AssemblyName>
+    <!--
+      参考: hooyao/winfsp-native (https://github.com/hooyao/winfsp-native, MIT) の
+      API design を参照しつつ、外部依存を作らない方針で自前実装。LibraryImport +
+      function pointer + UnmanagedCallersOnly の組み合わせで native dispatcher と
+      callback table を直接やり取りする。AOT 対応視野、winfsp-msil (= 旧 .NET binding)
+      の delegate marshaling overhead を回避するのが目的 (ADR-021 + CPU 100% 調査の
+      後継、PoC 段階で「自前 P/Invoke が winfsp-x64.dll と整合する」ことの実証から)。
+    -->
+  </PropertyGroup>
+
+</Project>
