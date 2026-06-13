@@ -136,4 +136,33 @@ internal static partial class NativeApi
     /// </summary>
     [LibraryImport(DllName, EntryPoint = "FspFileSystemGetOperationContext")]
     public static unsafe partial OperationContext* FspFileSystemGetOperationContext();
+
+    /// <summary>
+    /// <c>FspFileSystemAddDirInfo</c>: directory entry を ReadDirectory の出力 buffer
+    /// に追加。<paramref name="dirInfo"/> = null で EOF marker。<paramref name="dirInfo"/>
+    /// の <see cref="DirInfo.Size"/> は header(104) + name_bytes を含む total size。
+    /// </summary>
+    /// <returns>buffer に書けたら true。容量不足 (= caller は ReadDirectory を成功 status
+    /// で抜けて、次回 marker 経由で続きを返す) なら false。</returns>
+    [LibraryImport(DllName, EntryPoint = "FspFileSystemAddDirInfo")]
+    [return: MarshalAs(UnmanagedType.U1)]
+    public static unsafe partial bool FspFileSystemAddDirInfo(
+        void* dirInfo, void* buffer, uint length, uint* pBytesTransferred);
+
+    /// <summary>
+    /// <c>FspFileSystemNotifyBegin</c>: kernel 側 cache invalidation の通知 transaction
+    /// 開始。rename 競合があると待たされる、<paramref name="timeoutMs"/> で打切り。
+    /// </summary>
+    [LibraryImport(DllName, EntryPoint = "FspFileSystemNotifyBegin")]
+    public static partial int FspFileSystemNotifyBegin(nint fileSystem, uint timeoutMs);
+
+    [LibraryImport(DllName, EntryPoint = "FspFileSystemNotifyEnd")]
+    public static partial int FspFileSystemNotifyEnd(nint fileSystem);
+
+    /// <summary>
+    /// <c>FspFileSystemNotify</c>: 1 個以上の <see cref="NotifyInfo"/> を flat な byte
+    /// stream として渡す。各 entry の Size 自身に header(12) + name_bytes、続けて配置。
+    /// </summary>
+    [LibraryImport(DllName, EntryPoint = "FspFileSystemNotify")]
+    public static unsafe partial int FspFileSystemNotify(nint fileSystem, void* notifyInfo, nuint size);
 }

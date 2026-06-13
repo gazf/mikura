@@ -126,6 +126,54 @@ public sealed unsafe class FileSystemHost : IDisposable
 
     public void Dispose() => Unmount();
 
+    /// <summary>
+    /// kernel cache invalidation を 1 件発火。<paramref name="serverPath"/> は server
+    /// canonical な絶対 path (先頭スラッシュ付き)。mount 前 / unmount 後は no-op。
+    /// </summary>
+    /// <param name="serverPath">対象 file の正規 path。</param>
+    /// <param name="filter">変更種別 (filename / attribute / size 等)。</param>
+    /// <param name="action">操作種別 (added / removed / modified)。</param>
+    /// <param name="timeoutMs">NotifyBegin の wait 上限。rename 競合があるとここで待つ。</param>
+    public void Notify(string serverPath, NotifyFilter filter, NotifyAction action, uint timeoutMs = 1000)
+    {
+        if (!_started || _fileSystem == 0 || string.IsNullOrEmpty(serverPath)) return;
+
+        var status = NativeApi.FspFileSystemNotifyBegin(_fileSystem, timeoutMs);
+        if (status < 0) return; // タイムアウト等、no-op で握りつぶす
+
+        try
+        {
+            // NotifyInfo (12 byte) + WCHAR FileNameBuf (no null terminator) を組み立てる
+            var nameBytes = serverPath.Length * 2;
+            var totalSize = 12 + nameBytes;
+            // 4-byte 倍数に padding (winfsp 内部 alignment 要請、SIZE_T size と整合)
+            var aligned = (totalSize + 3) & ~3;
+
+            Span<byte> entry = stackalloc byte[aligned];
+            entry.Clear();
+
+            var infoPtr = (NotifyInfo*)Unsafe.AsPointer(ref MemoryMarshal.GetReference(entry));
+            infoPtr->Size = (ushort)totalSize;
+            infoPtr->Filter = (uint)filter;
+            infoPtr->Action = (uint)action;
+
+            if (nameBytes > 0)
+            {
+                var nameSpan = MemoryMarshal.Cast<byte, char>(entry.Slice(12, nameBytes));
+                serverPath.AsSpan().CopyTo(nameSpan);
+            }
+
+            fixed (byte* entryFixed = entry)
+            {
+                NativeApi.FspFileSystemNotify(_fileSystem, entryFixed, (nuint)totalSize);
+            }
+        }
+        finally
+        {
+            NativeApi.FspFileSystemNotifyEnd(_fileSystem);
+        }
+    }
+
     // ─────────────────────────────────────────── VolumeParams build ────
     private VolumeParams BuildVolumeParams()
     {
