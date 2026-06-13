@@ -6,7 +6,7 @@ namespace WinFsp.Interop.Backends;
 /// <summary>
 /// In-memory <see cref="IFileSystemBackend"/> for development, demos, and the
 /// pre-server-integration phase. Holds a flat namespace under "/" with two
-/// seeded files. Phase B.2's <c>ServerBackend</c> replaces this for production.
+/// seeded files. Phase B.2's <c>FileSystemBackend</c> replaces this for production.
 /// </summary>
 public sealed class InMemoryFileSystemBackend : IFileSystemBackend
 {

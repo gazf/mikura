@@ -4,7 +4,7 @@ using Mikura.Core.Models;
 
 namespace Mikura.Core.Sync;
 
-public sealed partial class ServerBackend
+public sealed partial class FileSystemBackend
 {
     /// <summary>
     /// Per-handle backend state (ADR-025 改訂後):
@@ -18,7 +18,7 @@ public sealed partial class ServerBackend
     /// </summary>
     private sealed class FileHandle : IFileHandle
     {
-        private readonly ServerBackend _backend;
+        private readonly FileSystemBackend _backend;
         private FileEntry _entry;
         private long _length;
         private readonly long _originalServerSize;
@@ -36,7 +36,7 @@ public sealed partial class ServerBackend
         /// </summary>
         public PrefetchCache Prefetch { get; } = new();
 
-        public FileHandle(ServerBackend backend, string path, FileEntry entry, bool hasLock)
+        public FileHandle(FileSystemBackend backend, string path, FileEntry entry, bool hasLock)
         {
             _backend = backend;
             Path = path;

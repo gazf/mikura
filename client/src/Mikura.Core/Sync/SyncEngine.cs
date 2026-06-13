@@ -9,18 +9,18 @@ namespace Mikura.Core.Sync;
 ///
 /// <para>Replaces the CfApi-driven flow: no more <c>SyncProvider</c>/
 /// <c>SyncRootRegistrar</c>/local placeholder files. The "filesystem state"
-/// is the in-memory tree owned by <see cref="ServerBackend"/>; this class
+/// is the in-memory tree owned by <see cref="FileSystemBackend"/>; this class
 /// just keeps it in sync with the server.</para>
 /// </summary>
 public sealed class SyncEngine
 {
-    private readonly ServerBackend _backend;
+    private readonly FileSystemBackend _backend;
     private readonly string _mountPoint;
     private readonly string _deviceId;
     private readonly Action<string, ExternalChangeKind>? _notifyKernelCache;
 
     public SyncEngine(
-        ServerBackend backend,
+        FileSystemBackend backend,
         string mountPoint,
         string deviceId,
         Action<string, ExternalChangeKind>? notifyKernelCache = null)

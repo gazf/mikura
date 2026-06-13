@@ -10,14 +10,14 @@ using Mikura.Core.Models;
 namespace Mikura.Core.Tests.Sync;
 
 /// <summary>
-/// ServerBackend テスト用の手書き fake。Moq だと
+/// FileSystemBackend テスト用の手書き fake。Moq だと
 /// stateful なロック / ストレージのモデル化が読みづらくなるので、
 /// 状態と呼び出し回数を素直に持つ実体クラスにする。
 /// </summary>
 internal sealed class FakeServerApi : IServerApi
 {
     // 実 server (POSIX) は case-sensitive なので Ordinal にする。OrdinalIgnoreCase
-    // にすると、ServerBackend が user-provided path をそのまま server に
+    // にすると、FileSystemBackend が user-provided path をそのまま server に
     // 投げる回帰 (= /Foo.mp4 を /FOO.MP4 で開いた直後の Read 404) を捕まえられない。
     public Dictionary<string, byte[]> Files { get; } = new(StringComparer.Ordinal);
     public List<TreeNode> InitialTree { get; } = new();
@@ -281,7 +281,7 @@ internal sealed class FakeServerApi : IServerApi
         return Task.CompletedTask;
     }
 
-    // 以下は ServerBackend からは呼ばれないので未実装で十分。
+    // 以下は FileSystemBackend からは呼ばれないので未実装で十分。
     public Task<IReadOnlyList<FileNode>> ListDirectoryAsync(string path, CancellationToken ct = default) =>
         throw new NotImplementedException();
 

@@ -9,7 +9,7 @@ using Xunit;
 namespace Mikura.Core.Tests.Sync;
 
 /// <summary>
-/// ServerBackend の責務 (ADR-021/022/023):
+/// FileSystemBackend の責務 (ADR-021/022/023):
 ///   - WinFsp のメタデータ問合せに対し、起動時に取得した /tree のキャッシュで応答する。
 ///   - ADR-016/022: write-intent open でだけサーバロックを取得し、read open は素通し。
 ///     プロセス内の同一パスへの複数 open は LockSlot で refcount し、POST/DELETE は
@@ -24,11 +24,11 @@ namespace Mikura.Core.Tests.Sync;
 ///   - Cleanup(Modified) または FreshlyCreated でアップロード、tree 更新、ロック解放、
 ///     buffer drop を行う (ADR-020)。
 /// </summary>
-public class ServerBackendTests
+public class FileSystemBackendTests
 {
-    private static async Task<ServerBackend> NewInitializedBackendAsync(FakeServerApi server)
+    private static async Task<FileSystemBackend> NewInitializedBackendAsync(FakeServerApi server)
     {
-        var backend = new ServerBackend(server);
+        var backend = new FileSystemBackend(server);
         await backend.InitializeAsync();
         return backend;
     }

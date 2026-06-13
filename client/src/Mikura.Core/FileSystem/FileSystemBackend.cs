@@ -21,7 +21,7 @@ namespace Mikura.Core.Sync;
 /// という挙動になる。Samba 代替の主要ワークフロー (file copy / save / rename)
 /// では問題にならない。</para>
 /// </summary>
-public sealed partial class ServerBackend : IFileSystemBackend
+public sealed partial class FileSystemBackend : IFileSystemBackend
 {
     private readonly IServerApi _server;
     private readonly ConcurrentDictionary<string, FileEntry> _tree =
@@ -38,7 +38,7 @@ public sealed partial class ServerBackend : IFileSystemBackend
         new(StringComparer.OrdinalIgnoreCase);
     private readonly object _activeSessionsGate = new();
 
-    public ServerBackend(IServerApi server)
+    public FileSystemBackend(IServerApi server)
     {
         _server = server;
     }

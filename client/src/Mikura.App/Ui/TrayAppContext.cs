@@ -18,7 +18,7 @@ public sealed class TrayAppContext : ApplicationContext
     private static readonly TimeSpan WssHeartbeatInterval = TimeSpan.FromSeconds(10);
 
     private HttpServerApi? _server;
-    private ServerBackend? _backend;
+    private FileSystemBackend? _backend;
     private BackendFileSystemHost? _fsHost;
     private SyncEngine? _syncEngine;
     private HttpEventStream? _eventStream;
@@ -149,7 +149,7 @@ public sealed class TrayAppContext : ApplicationContext
             http.DefaultRequestHeaders.Add("X-Device-Id", _deviceId);
             _server = new HttpServerApi(http, _settings.ServerUrl);
 
-            _backend = new ServerBackend(_server);
+            _backend = new FileSystemBackend(_server);
             Trace.WriteLine($"Initializing backend (server={_settings.ServerUrl})");
             await _backend.InitializeAsync().ConfigureAwait(true);
             Trace.WriteLine($"Backend initialized: {_backend.TreeSnapshot.Count} entries cached");

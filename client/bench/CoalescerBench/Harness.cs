@@ -29,14 +29,14 @@ internal sealed class Harness
     {
         if (_bypassBackend)
         {
-            // pure harness baseline: ServerBackend / WriteCoalescer を一切経由せず、
+            // pure harness baseline: FileSystemBackend / WriteCoalescer を一切経由せず、
             // worker の Task.Run + await loop だけ走らせる。bypass モード - bench モード
-            // の差分 = ServerBackend + Coalescer の per-IO alloc。
+            // の差分 = FileSystemBackend + Coalescer の per-IO alloc。
             return await RunBypassAsync(plan, ct).ConfigureAwait(false);
         }
 
         // 各 file ごとに backend を 1 つ用意。CDM の T=16 は実体としても 16 file 同時。
-        var backend = new ServerBackend(_api);
+        var backend = new FileSystemBackend(_api);
         await backend.InitializeAsync(ct).ConfigureAwait(false);
 
         // Note: data buffer は 1 つを使い回す (pure path 計測なので payload の内容は
@@ -162,7 +162,7 @@ internal sealed class Harness
     }
 
     /// <summary>
-    /// ServerBackend / WriteCoalescer を経由しない harness baseline。同じ
+    /// FileSystemBackend / WriteCoalescer を経由しない harness baseline。同じ
     /// FileCount × QueueDepth で Task.Run + await Task.CompletedTask の loop だけ
     /// 走らせて、harness 自体の Task.Run / await / Task.WhenAll が per-IO に
     /// どれだけ alloc を持ち込むかを測る。

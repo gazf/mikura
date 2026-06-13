@@ -19,7 +19,7 @@ var backendKind = argv.Get("backend", "fake");
 var scenarioArg = argv.Get("scenario", "all");
 var warmup = int.Parse(argv.Get("warmup", "1"));
 var iters = int.Parse(argv.Get("iters", "3"));
-// --bypass-backend: ServerBackend / WriteCoalescer を経由しない harness baseline
+// --bypass-backend: FileSystemBackend / WriteCoalescer を経由しない harness baseline
 // 計測。各シナリオの "[bypass]" 行を追加で出力して per-IO alloc の harness 寄与を
 // 分離する。
 var bypassBackend = argv.Get("bypass-backend", "false") == "true";

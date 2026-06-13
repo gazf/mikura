@@ -6,7 +6,7 @@ namespace Mikura.Bench.Coalescer;
 /// <summary>
 /// 純 C# 経路のコストだけを測るための IServerApi。すべて即時 return、
 /// ストレージは持たない。FakeServerApi が test 用に持っている lock + buffer
-/// copy 等の overhead を除いて、ServerBackend / WriteCoalescer / multipart 直前
+/// copy 等の overhead を除いて、FileSystemBackend / WriteCoalescer / multipart 直前
 /// までのコストを取り出す。
 /// </summary>
 internal sealed class NoOpServerApi : IServerApi

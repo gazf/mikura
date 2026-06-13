@@ -271,7 +271,7 @@ public sealed class BackendFileSystem : FileSystemBase
 
     /// <summary>
     /// IRP buffer (unmanaged IntPtr) を UnmanagedMemoryManager で Memory&lt;byte&gt; に
-    /// wrap して ServerBackend.ReadAsync が直接書き込む(中間 byte[] と Marshal.Copy
+    /// wrap して FileSystemBackend.ReadAsync が直接書き込む(中間 byte[] と Marshal.Copy
     /// 廃止)。寿命: SendReadResponse 呼び出しまでに mgr を Dispose する順序を厳守。
     /// ioToken は SendResponse 直後 finally で Dispose して in-flight counter を戻す。
     /// </summary>
@@ -344,7 +344,7 @@ public sealed class BackendFileSystem : FileSystemBase
     }
 
     /// <summary>
-    /// IRP buffer を ReadOnlyMemory&lt;byte&gt; として wrap して ServerBackend.WriteAsync に
+    /// IRP buffer を ReadOnlyMemory&lt;byte&gt; として wrap して FileSystemBackend.WriteAsync に
     /// 直接読ませる。完了経路で SendWriteResponse(成功時は新 FileInfo を ref で返す)
     /// → ioToken Dispose の順で WinFsp 応答と in-flight 解放を行う。
     /// </summary>
