@@ -349,6 +349,29 @@ public sealed unsafe class FileSystemHost : IDisposable
             var host = GetHost(fs);
             var ctx = GetContext(fileContext);
             if (host is null || ctx is null) return NtStatus.Unsuccessful;
+
+            // async path: IFileSystem が IAsyncFileIo を実装していれば、ValueTask 経路。
+            // 同期完了なら fast path で即 return、pending なら STATUS_PENDING + 後で
+            // SendResponse。
+            if (host._fs is IAsyncFileIo asyncFs)
+            {
+                var mm = new UnmanagedMemoryManager((void*)buffer, checked((int)length));
+                var task = asyncFs.ReadAsync(ctx, mm.Memory, offset, CancellationToken.None);
+                if (task.IsCompletedSuccessfully)
+                {
+                    var r = task.Result;
+                    ((IDisposable)mm).Dispose();
+                    *pBytesTransferred = r.BytesTransferred;
+                    return r.Status;
+                }
+                // pending: 完了時に SendResponse する fire-and-forget task。callback は
+                // STATUS_PENDING で即 return、dispatcher thread を解放する。
+                var hint = NativeApi.FspFileSystemGetOperationContext()->Request->Hint;
+                _ = AsyncCompletion.ReadAsync(host._fileSystem, hint, task, mm);
+                return NtStatus.Pending;
+            }
+
+            // sync path (既存)
             var span = new Span<byte>((void*)buffer, checked((int)length));
             var status = host._fs.Read(ctx, span, offset, out var transferred);
             *pBytesTransferred = transferred;
@@ -366,6 +389,25 @@ public sealed unsafe class FileSystemHost : IDisposable
             var host = GetHost(fs);
             var ctx = GetContext(fileContext);
             if (host is null || ctx is null) return NtStatus.Unsuccessful;
+
+            if (host._fs is IAsyncFileIo asyncFs)
+            {
+                var mm = new UnmanagedMemoryManager((void*)buffer, checked((int)length));
+                var task = asyncFs.WriteAsync(ctx, mm.Memory, offset,
+                    writeToEndOfFile != 0, constrainedIo != 0, CancellationToken.None);
+                if (task.IsCompletedSuccessfully)
+                {
+                    var r = task.Result;
+                    ((IDisposable)mm).Dispose();
+                    *pBytesTransferred = r.BytesTransferred;
+                    if (r.Status >= 0) *pInfo = r.FileInfo;
+                    return r.Status;
+                }
+                var hint = NativeApi.FspFileSystemGetOperationContext()->Request->Hint;
+                _ = AsyncCompletion.WriteAsync(host._fileSystem, hint, task, mm);
+                return NtStatus.Pending;
+            }
+
             var span = new ReadOnlySpan<byte>((void*)buffer, checked((int)length));
             var status = host._fs.Write(ctx, span, offset,
                 writeToEndOfFile != 0, constrainedIo != 0,
@@ -376,6 +418,7 @@ public sealed unsafe class FileSystemHost : IDisposable
         }
         catch { return NtStatus.Unsuccessful; }
     }
+
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int OnFlush(nint fs, nint fileContext, NativeFileInfo* pInfo)

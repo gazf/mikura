@@ -127,4 +127,13 @@ internal static partial class NativeApi
     /// </summary>
     [LibraryImport(DllName, EntryPoint = "FspFileSystemPreflight", StringMarshalling = StringMarshalling.Utf16)]
     public static partial int FspFileSystemPreflight(string devicePath, string? mountPoint);
+
+    /// <summary>
+    /// <c>FspFileSystemGetOperationContext</c>: 現在 dispatcher thread で処理中の
+    /// IRP の <see cref="OperationContext"/> ポインタを返す。Hint と Kind を取り出して
+    /// 非同期 response (STATUS_PENDING) 経路の準備に使う。
+    /// 戻り値の Request / Response 寿命は callback return まで。
+    /// </summary>
+    [LibraryImport(DllName, EntryPoint = "FspFileSystemGetOperationContext")]
+    public static unsafe partial OperationContext* FspFileSystemGetOperationContext();
 }

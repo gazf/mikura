@@ -56,8 +56,32 @@ return 0;
 
 // ─────────────────────────────────────────────────── HelloFs implementation ────
 
-internal sealed class HelloFs : IFileSystem
+internal sealed class HelloFs : IFileSystem, IAsyncFileIo
 {
+    // ─────────────────────────────────────── async Read path 実証 ────
+    // sync 経路 (IFileSystem.Read) は残しつつ、IAsyncFileIo.ReadAsync で
+    // Task.Delay を 1ms 挟んで STATUS_PENDING + SendResponse 経路を強制踏む。
+    // 実機 `type Z:\hello.txt` で「async path が機能してる」ことを確認する。
+
+    public async ValueTask<ReadResult> ReadAsync(object fileContext, Memory<byte> buffer, ulong offset,
+        CancellationToken ct)
+    {
+        await Task.Delay(1, ct).ConfigureAwait(false); // 必ず STATUS_PENDING 経由
+        if (fileContext is not Node node || node.IsDir)
+            return new ReadResult(NtStatus.InvalidDeviceRequest, 0);
+        if (offset >= (ulong)HelloBytes.Length)
+            return new ReadResult(NtStatus.EndOfFile, 0);
+        var toCopy = Math.Min(buffer.Length, HelloBytes.Length - (int)offset);
+        HelloBytes.AsSpan((int)offset, toCopy).CopyTo(buffer.Span);
+        return new ReadResult(NtStatus.Success, (uint)toCopy);
+    }
+
+    // Write は read-only FS なので即同期 return (= ValueTask.FromResult、fast path 経路)。
+    // CompletedSuccessfully で IsCompletedSuccessfully = true、SendResponse は使われない。
+    public ValueTask<WriteResult> WriteAsync(object fileContext, ReadOnlyMemory<byte> buffer, ulong offset,
+        bool writeToEndOfFile, bool constrainedIo, CancellationToken ct) =>
+        ValueTask.FromResult(new WriteResult(NtStatus.MediaWriteProtected, 0, default));
+
     // 静的内容。Read-only なので mutation 無し。
     private static readonly byte[] HelloBytes = Encoding.UTF8.GetBytes("hello from custom WinFsp binding\r\n");
     private const string HelloName = "\\hello.txt";
