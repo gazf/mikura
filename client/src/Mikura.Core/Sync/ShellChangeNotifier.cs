@@ -8,7 +8,7 @@ namespace Mikura.Core.Sync;
 /// CfCreatePlaceholders / File.Delete だけでは Explorer のビューが自動更新されない (F5 が必要) ため、
 /// プレースホルダー作成・削除・更新後にこの通知を発火して Explorer に再描画させる。
 /// </summary>
-internal static partial class Shell
+internal static partial class ShellChangeNotifier
 {
     // SHChangeNotify event IDs
     private const int SHCNE_CREATE = 0x00000002;
@@ -27,19 +27,19 @@ internal static partial class Shell
     public static void NotifyCreate(string localPath, bool isDirectory)
     {
         SHChangeNotify(isDirectory ? SHCNE_MKDIR : SHCNE_CREATE, SHCNF_PATHW, localPath, IntPtr.Zero);
-        Trace.WriteLine($"Shell.NotifyCreate ({(isDirectory ? "MKDIR" : "CREATE")}): {localPath}");
+        Trace.WriteLine($"ShellChangeNotifier.NotifyCreate ({(isDirectory ? "MKDIR" : "CREATE")}): {localPath}");
     }
 
     public static void NotifyDelete(string localPath, bool isDirectory)
     {
         SHChangeNotify(isDirectory ? SHCNE_RMDIR : SHCNE_DELETE, SHCNF_PATHW, localPath, IntPtr.Zero);
-        Trace.WriteLine($"Shell.NotifyDelete ({(isDirectory ? "RMDIR" : "DELETE")}): {localPath}");
+        Trace.WriteLine($"ShellChangeNotifier.NotifyDelete ({(isDirectory ? "RMDIR" : "DELETE")}): {localPath}");
     }
 
     public static void NotifyUpdate(string localPath)
     {
         SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, localPath, IntPtr.Zero);
-        Trace.WriteLine($"Shell.NotifyUpdate: {localPath}");
+        Trace.WriteLine($"ShellChangeNotifier.NotifyUpdate: {localPath}");
     }
 
     /// <summary>
@@ -49,6 +49,6 @@ internal static partial class Shell
     public static void NotifyUpdateDir(string localDirectoryPath)
     {
         SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW, localDirectoryPath, IntPtr.Zero);
-        Trace.WriteLine($"Shell.NotifyUpdateDir: {localDirectoryPath}");
+        Trace.WriteLine($"ShellChangeNotifier.NotifyUpdateDir: {localDirectoryPath}");
     }
 }

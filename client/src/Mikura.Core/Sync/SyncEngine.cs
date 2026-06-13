@@ -83,8 +83,8 @@ public sealed class SyncEngine
                 // change appears without F5. WinFsp itself flushes its file info
                 // cache (FileInfoTimeout=0), but the Shell view is independent.
                 var localPath = ToLocalPath(evt.Path);
-                if (evt.Event == "created") Shell.NotifyCreate(localPath, isDirectory);
-                else Shell.NotifyUpdate(localPath);
+                if (evt.Event == "created") ShellChangeNotifier.NotifyCreate(localPath, isDirectory);
+                else ShellChangeNotifier.NotifyUpdate(localPath);
                 break;
             }
 
@@ -94,7 +94,7 @@ public sealed class SyncEngine
                     "deleted", evt.Path, size: 0, DateTime.UtcNow, isDirectory: false);
                 if (!existed) break;
                 _notifyKernelCache?.Invoke(evt.Path, ExternalChangeKind.Deleted);
-                Shell.NotifyDelete(ToLocalPath(evt.Path), isDirectory: false);
+                ShellChangeNotifier.NotifyDelete(ToLocalPath(evt.Path), isDirectory: false);
                 break;
             }
 
@@ -105,7 +105,7 @@ public sealed class SyncEngine
                 if (evt.Holder is null) break;
                 if (IsSelfDevice(evt.Holder.DeviceId)) break;
                 _backend.ApplyLockEvent(evt.Path, locked: evt.Event == "lock_acquired");
-                Shell.NotifyUpdate(ToLocalPath(evt.Path));
+                ShellChangeNotifier.NotifyUpdate(ToLocalPath(evt.Path));
                 break;
             }
         }
