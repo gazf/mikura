@@ -26,6 +26,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Mikura.Core\Mikura.Core.csproj" />
+    <ProjectReference Include="..\WinFsp.Native\WinFsp.Native.csproj" />
   </ItemGroup>
 
 </Project>

@@ -9,7 +9,7 @@ namespace WinFsp.Interop;
 /// the WinFsp counterpart to <c>SyncProvider</c>/<c>SyncRootRegistrar</c> in
 /// the legacy CfApi stack (ADR-021).
 /// </summary>
-public sealed class BackendFileSystemHost : IDisposable
+public sealed class BackendFileSystemHost : IBackendHost, IDisposable
 {
     private readonly FileSystemHost _host;
     private readonly BackendFileSystem _fileSystem;
@@ -30,7 +30,11 @@ public sealed class BackendFileSystemHost : IDisposable
     /// </list>
     /// Throws if mount fails.
     /// </summary>
-    public string Mount(string mountPoint, uint debugFlags = 0)
+    /// <summary><see cref="IBackendHost.Mount"/> 実装。既存呼出元との互換用に
+    /// debugFlags 付き overload を別途残す。</summary>
+    public string Mount(string mountPoint) => Mount(mountPoint, 0u);
+
+    public string Mount(string mountPoint, uint debugFlags)
     {
         // If the mount point looks like a directory path, make sure it exists
         // before handing it to WinFsp — the driver requires an empty existing
