@@ -338,6 +338,32 @@ public class FileSystemBackendTests
     }
 
     [Fact]
+    public async Task Cleanup_AfterLockAlreadyReleased_DoesNotReAttemptUpload()
+    {
+        // 回帰 (新 WinFsp.Native binding 実機 #3a): kernel が同一 Create handle に
+        // Cleanup を 2 回発火するケース (WinFsp 既定の per-FileNode FileContext +
+        // delayed Close 経路で観測) があり、2 回目は 1 回目の MarkLockReleased で
+        // HasLock=false になっているのに FreshlyCreated は init-only で true のまま。
+        // 旧条件 `(HasLock || FreshlyCreated) && (Modified || FreshlyCreated)` だと
+        // 2 回目も shouldUpload=true になり StartUpload を再発火 → server で
+        // "Lock holder mismatch" 403 を喰らっていた。HasLock を必要条件にして 2 回目
+        // 以降は静かに skip することが責務。
+        var server = new FakeServerApi();
+        var backend = await NewInitializedBackendAsync(server);
+
+        using var handle = await backend.CreateAsync("/touched.bin", isDirectory: false);
+        await backend.CleanupAsync(handle!, CleanupFlags.Modified);
+        var startUploadCallsAfter1st = server.StartUploadCalls;
+
+        // 2 回目 Cleanup: 1 回目で lock release 済み (HasLock=false)、FreshlyCreated は
+        // 依然 true、Modified flag も付いた異常パターン。例外を投げず、StartUpload を
+        // 追加発行しないことが期待値。
+        await backend.CleanupAsync(handle!, CleanupFlags.Modified);
+
+        Assert.Equal(startUploadCallsAfter1st, server.StartUploadCalls);
+    }
+
+    [Fact]
     public async Task Cleanup_Delete_RemovesFromServerAndTree()
     {
         var server = new FakeServerApi();

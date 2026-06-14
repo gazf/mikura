@@ -43,6 +43,7 @@ internal sealed class FakeServerApi : IServerApi
     public int AcquireLockCalls { get; private set; }
     public int ReleaseLockCalls { get; private set; }
     public int DownloadCalls { get; private set; }
+    public int StartUploadCalls { get; private set; }
 
     /// <summary>テスト用の seed ヘルパ: ファイルとツリー両方に登録する。</summary>
     public void SeedFile(string path, byte[] content)
@@ -172,6 +173,7 @@ internal sealed class FakeServerApi : IServerApi
 
     public Task<string> StartUploadAsync(string path, bool baseFromExisting, CancellationToken ct = default)
     {
+        StartUploadCalls++;
         var uploadId = Guid.NewGuid().ToString();
         var session = new FakeUploadSession
         {
