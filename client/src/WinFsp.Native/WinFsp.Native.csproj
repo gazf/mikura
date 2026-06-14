@@ -10,6 +10,11 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RootNamespace>WinFsp.Native</RootNamespace>
     <AssemblyName>WinFsp.Native</AssemblyName>
+    <!-- AOT-ready: LibraryImport (source-gen P/Invoke) + UnmanagedCallersOnly + function pointers
+         で構成、reflection 不使用、Marshal 経由は AOT-safe な変種 (AllocHGlobal / PtrToStringUni
+         / Copy(byte[])) のみ。`<IsAotCompatible>true</IsAotCompatible>` を立てると analyzer
+         warnings 0 件で通る (検証済み)。 -->
+    <IsAotCompatible>true</IsAotCompatible>
     <!--
       参考: hooyao/winfsp-native (https://github.com/hooyao/winfsp-native, MIT) の
       API design を参照しつつ、外部依存を作らない方針で自前実装。LibraryImport +

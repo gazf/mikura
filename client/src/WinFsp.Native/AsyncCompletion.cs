@@ -81,26 +81,21 @@ internal static class AsyncCompletion
     }
 
     // ───────────────────────────────────────── SendResponse builders ────
-    // FSP_FSCTL_TRANSACT_RSP を NativeMemory.AllocZeroed で組み、SendResponse 後に Free。
-    // PoC は per-IRP alloc、本格化時に pool 化検討。
+    // FSP_FSCTL_TRANSACT_RSP は 128B 固定、SendResponse 呼び出しが同期完了する
+    // (kernel 側に値をコピーしてから return する) ので、stack 上の struct を `&` で
+    // 直接渡せば heap alloc 不要。default(TransactRsp) で全 byte ゼロ初期化される
+    // (Size=128 の SequentialLayout、managed reference なし)。
 
     private static unsafe void SendResponseRead(nint fs, ulong hint, ReadResult result)
     {
-        var rsp = (TransactRsp*)NativeMemory.AllocZeroed((nuint)sizeof(TransactRsp));
-        try
-        {
-            rsp->Version = (ushort)sizeof(TransactRsp);
-            rsp->Size = (ushort)sizeof(TransactRsp);
-            rsp->Kind = (uint)FspFsctlTransactKind.Read;
-            rsp->Hint = hint;
-            rsp->IoStatusInformation = result.BytesTransferred;
-            rsp->IoStatusStatus = (uint)result.Status;
-            NativeApi.FspFileSystemSendResponse(fs, (nint)rsp);
-        }
-        finally
-        {
-            NativeMemory.Free(rsp);
-        }
+        TransactRsp rsp = default;
+        rsp.Version = (ushort)sizeof(TransactRsp);
+        rsp.Size = (ushort)sizeof(TransactRsp);
+        rsp.Kind = (uint)FspFsctlTransactKind.Read;
+        rsp.Hint = hint;
+        rsp.IoStatusInformation = result.BytesTransferred;
+        rsp.IoStatusStatus = (uint)result.Status;
+        NativeApi.FspFileSystemSendResponse(fs, (nint)(&rsp));
     }
 
     private static unsafe void SendResponseWrite(nint fs, ulong hint, WriteResult result)
@@ -108,25 +103,18 @@ internal static class AsyncCompletion
         // Rsp.Write.FileInfo は struct offset 24 (Rsp union 開始位置、Write variant は
         // FSP_FSCTL_FILE_INFO FileInfo 単独配置)。
         const int RspUnionStart = 24;
-        var rsp = (TransactRsp*)NativeMemory.AllocZeroed((nuint)sizeof(TransactRsp));
-        try
+        TransactRsp rsp = default;
+        rsp.Version = (ushort)sizeof(TransactRsp);
+        rsp.Size = (ushort)sizeof(TransactRsp);
+        rsp.Kind = (uint)FspFsctlTransactKind.Write;
+        rsp.Hint = hint;
+        rsp.IoStatusInformation = result.BytesTransferred;
+        rsp.IoStatusStatus = (uint)result.Status;
+        if (result.Status >= 0)
         {
-            rsp->Version = (ushort)sizeof(TransactRsp);
-            rsp->Size = (ushort)sizeof(TransactRsp);
-            rsp->Kind = (uint)FspFsctlTransactKind.Write;
-            rsp->Hint = hint;
-            rsp->IoStatusInformation = result.BytesTransferred;
-            rsp->IoStatusStatus = (uint)result.Status;
-            if (result.Status >= 0)
-            {
-                var fileInfoPtr = (NativeFileInfo*)((byte*)rsp + RspUnionStart);
-                *fileInfoPtr = result.FileInfo;
-            }
-            NativeApi.FspFileSystemSendResponse(fs, (nint)rsp);
+            var fileInfoPtr = (NativeFileInfo*)((byte*)(&rsp) + RspUnionStart);
+            *fileInfoPtr = result.FileInfo;
         }
-        finally
-        {
-            NativeMemory.Free(rsp);
-        }
+        NativeApi.FspFileSystemSendResponse(fs, (nint)(&rsp));
     }
 }
