@@ -286,6 +286,12 @@ public sealed partial class FileSystemBackend : IFileSystemBackend
                 if (--slot.Refcount <= 0) _activeSessions.Remove(path);
             }
             slot.StartResult.TrySetException(ex);
+            // ↑ second caller がいないと slot.StartResult.Task の例外は誰にも観測されず
+            // GC 時に TaskScheduler.UnobservedTaskException として発火する。
+            // Task.Exception を一度読むだけで「observed」扱いになるので、ここで明示する。
+            // 後で second caller が await して再 throw する分には同じ AggregateException
+            // を読み出すだけなので副作用なし。
+            _ = slot.StartResult.Task.Exception;
             Trace.WriteLine($"StartUpload failed: {path}: {ex.Message}");
             throw;
         }
@@ -494,18 +500,24 @@ public sealed partial class FileSystemBackend : IFileSystemBackend
         // sequential continue を観測 = prefetch 価値あり と判定。
         var armed = h.Prefetch.NoteReadAndCheckArmed(offset, requested);
 
-        // prefetch cache hit: zero round-trip。partial hit (cache が requested 未満)
-        // でも single-use semantics で remainder は捨てる (user 仕様)。caller
-        // (kernel) は不足分を次 IRP で要求してくるので integrity は崩れない。
+        // prefetch cache hit: zero round-trip。
+        // full hit (cachedBytes >= requested) なら即 return。
+        // partial hit (cachedBytes < requested) は cache 側の余剰が要求より小さいケース
+        // (= 例えば 64KB prefetch 後の cache に対して 1MB IRP が来た等、mixed IRP size
+        // のワークロード)。旧版は残りを zero-fill していたが、Excel/Word 等の zip 形式
+        // file で開封時 "ファイルレベルの検証と修復" が走る regression を踏むので、
+        // 偏った byte 列を返さず、cache 分は keep + 残りを server から続きを fetch する
+        // ように切替え。
+        var partialFromCache = 0;
         if (h.Prefetch.TryConsume(offset, buffer.Span.Slice(0, requested), out var cachedBytes))
         {
-            if (cachedBytes < requested)
-            {
-                // EOF を跨いだ partial hit。残りは zero-fill (logicalEnd 以下なので
-                // 通常ここには来ないが safety net)。
-                buffer.Span.Slice(cachedBytes, requested - cachedBytes).Clear();
-            }
-            return requested;
+            if (cachedBytes >= requested) return requested;
+            // partial: 先頭 cachedBytes は cache 内容で埋まっている。offset / buffer /
+            // requested を残り分にスライドして以降の server fetch path に合流。
+            partialFromCache = cachedBytes;
+            offset += cachedBytes;
+            buffer = buffer.Slice(cachedBytes);
+            requested -= cachedBytes;
         }
 
         // server 側に実体がある範囲は range fetch、その先は SetSize-extend
@@ -567,7 +579,7 @@ public sealed partial class FileSystemBackend : IFileSystemBackend
         {
             buffer.Span.Slice(fetched, requested - fetched).Clear();
         }
-        return requested;
+        return partialFromCache + requested;
     }
 
     public async Task<long> WriteAsync(
@@ -740,7 +752,24 @@ public sealed partial class FileSystemBackend : IFileSystemBackend
                 return;
             }
 
-            var shouldUpload = (flags & CleanupFlags.Modified) != 0 || h.FreshlyCreated;
+            // 防衛: read-intent open (HasLock=false) で kernel が SetLastWriteTime /
+            // SetArchiveBit を立てた Cleanup を post してくる事がある (実機 echo > Z:\foo
+            // の post-close hook で Defender / Indexer が読み戻すケース等)。lock を持って
+            // いない handle で StartUpload を叩くと server で必ず 403 holder mismatch、
+            // かつ並走中の write handle の lock が release 直後だと「直前まで動いていた
+            // upload が、追従して走った別 handle の cleanup で 403」という症状になる。
+            // HasLock=false の handle は upload しても通る筋がないので skip。
+            // HasLock を必須にする (FreshlyCreated はもう "lock を持つ十分条件" にしない):
+            //   1 回目 Cleanup で MarkLockReleased が走ると HasLock=false になるが、
+            //   FreshlyCreated は init-only で true のまま。WinFsp が同じ Create handle に
+            //   2 回目 Cleanup を発行する場合 (実機 CDM で 5 秒間隔の 2 度 Cleanup を確認)、
+            //   旧条件 `(HasLock || FreshlyCreated)` だと shouldUpload が true のまま素通り
+            //   して StartUpload を叩き、server で 403 holder mismatch を喰らう。
+            //   HasLock のみを必要条件にすれば、lock release 後の 2 回目以降は skip。
+            //   FreshlyCreated の役割は (1) baseFromExisting=false の選択、(2) Modified flag
+            //   が立っていない時でも upload を起こす、の 2 つに限定する。
+            var shouldUpload = h.HasLock
+                && ((flags & CleanupFlags.Modified) != 0 || h.FreshlyCreated);
             if (shouldUpload && !h.IsDirectory)
             {
                 try

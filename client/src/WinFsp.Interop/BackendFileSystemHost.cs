@@ -1,19 +1,20 @@
 using Mikura.Core.Abstractions;
-using Fsp;
-using Fsp.Interop;
+using WinFsp.Native;
+using WinFsp.Native.Native;
 
 namespace WinFsp.Interop;
 
 /// <summary>
-/// Owns a <see cref="FileSystemHost"/> and a <see cref="BackendFileSystem"/>;
-/// the WinFsp counterpart to <c>SyncProvider</c>/<c>SyncRootRegistrar</c> in
-/// the legacy CfApi stack (ADR-021).
+/// <see cref="BackendFileSystem"/> を抱えて <see cref="FileSystemHost"/> のライフサイクル
+/// (Mount / Notify / Unmount) を駆動する WinFsp adapter。WinFsp 上で動く mikura の
+/// 「volume host」。
 /// </summary>
 public sealed class BackendFileSystemHost : IDisposable
 {
-    private readonly FileSystemHost _host;
     private readonly BackendFileSystem _fileSystem;
+    private readonly FileSystemHost _host;
     private bool _mounted;
+    private string? _mountPoint;
 
     public BackendFileSystemHost(IFileSystemBackend backend, OnlineGate gate)
     {
@@ -22,30 +23,39 @@ public sealed class BackendFileSystemHost : IDisposable
     }
 
     /// <summary>
-    /// Mounts the WinFsp drive at <paramref name="mountPoint"/>. Accepts:
-    /// <list type="bullet">
-    ///   <item>A drive letter like <c>"Z:"</c></item>
-    ///   <item>A full path to an empty directory like <c>"C:\\mikura"</c> (created if missing)</item>
-    ///   <item><c>"*"</c> for the next available drive letter</item>
-    /// </list>
-    /// Throws if mount fails.
+    /// 指定 mount point に WinFsp drive を bind。drive letter ("Z:") か空ディレクトリ
+    /// path を渡す。失敗時は例外を投げる。
+    /// <para>
+    /// 環境変数 <c>MIKURA_NATIVE_THREADCOUNT</c> で WinFsp dispatcher の thread 数を
+    /// 制御できる。0 (既定) = WinFsp 既定 (typically 2*CPU)、1 = serialized callback
+    /// (race / 並行性の切り分け用の escape hatch、通常は 0 で十分)。
+    /// </para>
     /// </summary>
-    public string Mount(string mountPoint, uint debugFlags = 0)
+    public string Mount(string mountPoint)
     {
-        // If the mount point looks like a directory path, make sure it exists
-        // before handing it to WinFsp — the driver requires an empty existing
-        // directory for path-style mounts. (Previous CfApi-era runs may have
-        // deleted this directory on shutdown, see ADR-021 transition notes.)
+        // path 形式 (例: C:\mikura) の場合は dir が無いと WinFsp が失敗するので先に作る。
         if (LooksLikeDirectoryPath(mountPoint) && !Directory.Exists(mountPoint))
         {
             Directory.CreateDirectory(mountPoint);
         }
 
-        var status = _host.Mount(mountPoint, null, true, debugFlags);
-        if (status < 0)
-            throw new IOException($"WinFsp mount failed at {mountPoint}: 0x{status:X8}");
+        var threadCount = ParseThreadCountEnv();
+        if (threadCount > 0)
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"[INFO] WinFsp dispatcher threadCount={threadCount} (MIKURA_NATIVE_THREADCOUNT)");
+        }
+        _host.Mount(mountPoint, threadCount);
         _mounted = true;
-        return _host.MountPoint();
+        _mountPoint = mountPoint;
+        return mountPoint;
+    }
+
+    private static uint ParseThreadCountEnv()
+    {
+        var raw = Environment.GetEnvironmentVariable("MIKURA_NATIVE_THREADCOUNT");
+        if (string.IsNullOrEmpty(raw)) return 0;
+        return uint.TryParse(raw, out var v) ? v : 0;
     }
 
     private static bool LooksLikeDirectoryPath(string mountPoint)
@@ -53,50 +63,31 @@ public sealed class BackendFileSystemHost : IDisposable
         if (string.IsNullOrEmpty(mountPoint)) return false;
         if (mountPoint == "*") return false;
         // Drive letter forms: "Z:", "Z:\"
-        if (mountPoint.Length <= 3 && mountPoint.Length >= 2
+        if (mountPoint.Length is >= 2 and <= 3
             && char.IsLetter(mountPoint[0]) && mountPoint[1] == ':')
             return false;
         return true;
     }
 
     /// <summary>
-    /// kernel cache invalidation を WinFsp 経由で kernel に伝える。WSS broadcast で
-    /// 他端末由来の created / modified / deleted を受け取った時に呼ぶことで、
-    /// FlushAndPurgeOnCleanup=false で温存している data cache を明示的に捨てて
-    /// stale read を防ぐ。
-    ///
-    /// <para>WinFsp 仕様: NotifyBegin → 0..N Notify(...) → NotifyEnd の 3 段。
-    /// FileName は server canonical な絶対 path (先頭スラッシュ付き) を渡す。
-    /// mount 前 / unmount 後に呼ばれてしまっても安全に no-op で抜ける。</para>
+    /// kernel cache invalidation を発火。WSS broadcast (created / modified / deleted)
+    /// を受信した時に呼ぶ。mount 前 / unmount 後は no-op。
     /// </summary>
-    public void NotifyExternalChange(string serverPath, Mikura.Core.Abstractions.ExternalChangeKind kind)
+    public void NotifyExternalChange(string serverPath, ExternalChangeKind kind)
     {
         if (!_mounted || string.IsNullOrEmpty(serverPath)) return;
 
         var (action, filter) = kind switch
         {
-            Mikura.Core.Abstractions.ExternalChangeKind.Created => (NotifyAction.Added, NotifyFilter.ChangeFileName),
-            Mikura.Core.Abstractions.ExternalChangeKind.Deleted => (NotifyAction.Removed, NotifyFilter.ChangeFileName),
-            Mikura.Core.Abstractions.ExternalChangeKind.Modified => (NotifyAction.Modified, NotifyFilter.ChangeLastWrite | NotifyFilter.ChangeSize),
-            _ => (NotifyAction.Modified, NotifyFilter.ChangeLastWrite),
-        };
-
-        var info = new NotifyInfo
-        {
-            FileName = serverPath,
-            Action = action,
-            Filter = filter,
+            ExternalChangeKind.Created => (NotifyAction.Added, NotifyFilter.FileName),
+            ExternalChangeKind.Deleted => (NotifyAction.Removed, NotifyFilter.FileName),
+            ExternalChangeKind.Modified => (NotifyAction.Modified, NotifyFilter.LastWrite | NotifyFilter.Size),
+            _ => (NotifyAction.Modified, NotifyFilter.LastWrite),
         };
 
         try
         {
-            // タイムアウトは 1 秒に設定。NotifyBegin は rename 競合があると待たされる
-            // が、broadcast の流量で長時間 block されては困るので短めに切る。
-            // 失敗しても一貫性が「キャッシュ寿命だけ stale」レベルに退化するだけで
-            // クラッシュにはならないので、catch して握りつぶす。
-            if (_host.NotifyBegin(1000) < 0) return;
-            try { _host.Notify(new[] { info }); }
-            finally { _host.NotifyEnd(); }
+            _host.Notify(serverPath, filter, action, timeoutMs: 1000);
         }
         catch (Exception ex)
         {

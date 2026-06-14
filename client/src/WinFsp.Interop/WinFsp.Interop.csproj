@@ -7,25 +7,17 @@
     <LangVersion>latest</LangVersion>
     <Platforms>x64</Platforms>
     <PlatformTarget>x64</PlatformTarget>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RootNamespace>WinFsp.Interop</RootNamespace>
     <AssemblyName>WinFsp.Interop</AssemblyName>
+    <!-- AOT-ready: analyzer warnings 0 件で通る (検証済み)。実 AOT publish は WinForms 側
+         (Mikura.App) が引っ張る制約で全体としては未対応、binding 単独では AOT 化可能。 -->
+    <IsAotCompatible>true</IsAotCompatible>
   </PropertyGroup>
-
-  <PropertyGroup>
-    <WinFspBin Condition="'$(WinFspBin)' == '' AND '$(OS)' == 'Windows_NT'">$(MSBuildProgramFiles32)\WinFsp\bin\</WinFspBin>
-    <WinFspBin Condition="'$(WinFspBin)' == '' AND '$(OS)' != 'Windows_NT'">/mnt/c/Program Files (x86)/WinFsp/bin/</WinFspBin>
-    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-  </PropertyGroup>
-
-  <ItemGroup>
-    <Reference Include="winfsp-msil">
-      <HintPath>$(WinFspBin)winfsp-msil.dll</HintPath>
-      <Private>true</Private>
-    </Reference>
-  </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\Mikura.Core\Mikura.Core.csproj" />
+    <ProjectReference Include="..\WinFsp.Native\WinFsp.Native.csproj" />
   </ItemGroup>
 
 </Project>
