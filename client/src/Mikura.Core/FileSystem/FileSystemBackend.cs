@@ -753,7 +753,16 @@ public sealed partial class FileSystemBackend : IFileSystemBackend
             // かつ並走中の write handle の lock が release 直後だと「直前まで動いていた
             // upload が、追従して走った別 handle の cleanup で 403」という症状になる。
             // HasLock=false の handle は upload しても通る筋がないので skip。
-            var shouldUpload = (h.HasLock || h.FreshlyCreated)
+            // HasLock を必須にする (FreshlyCreated はもう "lock を持つ十分条件" にしない):
+            //   1 回目 Cleanup で MarkLockReleased が走ると HasLock=false になるが、
+            //   FreshlyCreated は init-only で true のまま。WinFsp が同じ Create handle に
+            //   2 回目 Cleanup を発行する場合 (実機 CDM で 5 秒間隔の 2 度 Cleanup を確認)、
+            //   旧条件 `(HasLock || FreshlyCreated)` だと shouldUpload が true のまま素通り
+            //   して StartUpload を叩き、server で 403 holder mismatch を喰らう。
+            //   HasLock のみを必要条件にすれば、lock release 後の 2 回目以降は skip。
+            //   FreshlyCreated の役割は (1) baseFromExisting=false の選択、(2) Modified flag
+            //   が立っていない時でも upload を起こす、の 2 つに限定する。
+            var shouldUpload = h.HasLock
                 && ((flags & CleanupFlags.Modified) != 0 || h.FreshlyCreated);
             if (shouldUpload && !h.IsDirectory)
             {

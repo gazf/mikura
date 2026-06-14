@@ -20,8 +20,8 @@ namespace WinFsp.Native;
 /// <para><b>FileSystem ポインタ → host instance の関連付け</b>: native callback は
 /// <c>nint fileSystem</c> しか持たないので、static <see cref="ConcurrentDictionary{TKey,TValue}"/>
 /// に lookup する。FSP_FILE_SYSTEM の <c>UserContext</c> field を使う方法もあるが、
-/// 構造体内部 layout への依存が WinFsp upstream の変更で壊れうるため、PoC は
-/// dictionary 戦略を採用。lookup cost は per-IRP ~30ns で無視可能。</para>
+/// 構造体内部 layout への依存が WinFsp upstream の変更で壊れうるため、dictionary
+/// 戦略を採用。lookup cost は per-IRP ~30ns で無視可能。</para>
 /// <para><b>FileContext lifetime</b>: Create/Open で IFileSystem が返した
 /// <c>object?</c> を <see cref="GCHandle"/> 化して native に渡す。Close で必ず Free。
 /// strong reference を握る形なので、IFileSystem 側から触らずにいれば leak しない。</para>
@@ -198,6 +198,14 @@ public sealed unsafe class FileSystemHost : IDisposable
         VolumeParamsFlags.Set(ref vp.Flags, VolumeParamsFlags.PostCleanupWhenModifiedOnly, PostCleanupWhenModifiedOnly);
         VolumeParamsFlags.Set(ref vp.Flags, VolumeParamsFlags.PassQueryDirectoryPattern, PassQueryDirectoryPattern);
         VolumeParamsFlags.Set(ref vp.Flags, VolumeParamsFlags.FlushAndPurgeOnCleanup, FlushAndPurgeOnCleanup);
+        // UmFileContextIsUserContext2: FileContext を per-Open ID (UserContext2 slot) として
+        // 扱わせる。これを set しないと既定では FileNode の UserContext (per-FileName 単位、
+        // 同一 path への全 Open で共有) として扱われ、Create で作った Create handle の
+        // FileContext が後続の Open(Read) IRP にもそのまま渡されてしまう (実機: PowerShell
+        // ReadAllBytes が h.FreshlyCreated=true ハンドル経由で zero-fill 経路を踏み、書いた
+        // バイトと一致しない 64MB のゼロを読み出す現象を確認)。1 に立てて各 Open ごとに
+        // 独立した FileContext を維持する。
+        VolumeParamsFlags.Set(ref vp.Flags, VolumeParamsFlags.UmFileContextIsUserContext2, true);
 
         return vp;
     }
@@ -230,12 +238,7 @@ public sealed unsafe class FileSystemHost : IDisposable
         _hostsByFs.TryGetValue(fileSystem, out var host) ? host : null;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static object? GetContext(nint fileContext)
-    {
-        if (fileContext == 0) return null;
-        var handle = GCHandle.FromIntPtr(fileContext);
-        return handle.IsAllocated ? handle.Target : null;
-    }
+    private static object? GetContext(nint fileContext) => LookupContext(fileContext);
 
     /// <summary>callback 内で生 PWSTR を C# string に。null-terminated UTF-16。</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -605,7 +608,9 @@ public sealed unsafe class FileSystemHost : IDisposable
             var host = GetHost(fs);
             var ctx = GetContext(fileContext);
             if (host is null || ctx is null) return NtStatus.Unsuccessful;
-            // PoC: modificationDescriptor の long を取れないので、SDDL 等は未対応。
+            // mikura では security descriptor を書き込まないので no-op。SDDL を扱う
+            // 必要が出たら kernel32!GetSecurityDescriptorLength で長さ取得 + managed
+            // byte[] にコピーして dispatch する形に拡張する。
             // 本格対応時は kernel32!GetSecurityDescriptorLength 経由で長さを取り、
             // managed byte[] にコピーしてから dispatch する。
             return host._fs.SetSecurity(ctx, securityInformation, Array.Empty<byte>());
@@ -633,17 +638,40 @@ public sealed unsafe class FileSystemHost : IDisposable
     }
 
     // ─────────────────────────────────────────── FileContext lifecycle ────
+    // 旧実装は GCHandle.ToIntPtr を fileContext として WinFsp に渡していたが、
+    // Free 後に slot 再利用 → 別 managed object (実機: System.Threading.Thread が
+    // 同 slot に着地) を unrelated callback で参照する race を観測した
+    // (`InvalidCastException: Thread → IFileHandle`)。これは典型的な
+    // use-after-free。
+    //
+    // 対策: 自前の monotonic ID + ConcurrentDictionary に切替え。
+    //   - Alloc は ID を increment して dict に object を入れ、ID を nint で返す
+    //   - Get は dict 検索、無ければ null (= stale fileContext を安全に弾く)
+    //   - Free は dict から remove するだけ — 同じ ID が再発行される事はない
+    // GCHandle と違って GC root にはならないが、IFileHandle の生存は
+    // backend 側 (FileSystemBackend) が _activeLocks/_activeSessions で管理して
+    // いるので問題ない。
+    private static long _nextContextId;
+    private static readonly ConcurrentDictionary<long, object> _contextMap = new();
+
     private static nint AllocContext(object? ctx)
     {
         if (ctx is null) return 0;
-        var handle = GCHandle.Alloc(ctx, GCHandleType.Normal);
-        return GCHandle.ToIntPtr(handle);
+        var id = Interlocked.Increment(ref _nextContextId);
+        _contextMap[id] = ctx;
+        return (nint)id;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static object? LookupContext(nint fileContext)
+    {
+        if (fileContext == 0) return null;
+        return _contextMap.TryGetValue((long)fileContext, out var ctx) ? ctx : null;
     }
 
     private static void FreeContext(nint fileContext)
     {
         if (fileContext == 0) return;
-        var handle = GCHandle.FromIntPtr(fileContext);
-        if (handle.IsAllocated) handle.Free();
+        _contextMap.TryRemove((long)fileContext, out _);
     }
 }
