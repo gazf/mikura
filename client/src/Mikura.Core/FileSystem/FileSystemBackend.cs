@@ -500,18 +500,24 @@ public sealed partial class FileSystemBackend : IFileSystemBackend
         // sequential continue を観測 = prefetch 価値あり と判定。
         var armed = h.Prefetch.NoteReadAndCheckArmed(offset, requested);
 
-        // prefetch cache hit: zero round-trip。partial hit (cache が requested 未満)
-        // でも single-use semantics で remainder は捨てる (user 仕様)。caller
-        // (kernel) は不足分を次 IRP で要求してくるので integrity は崩れない。
+        // prefetch cache hit: zero round-trip。
+        // full hit (cachedBytes >= requested) なら即 return。
+        // partial hit (cachedBytes < requested) は cache 側の余剰が要求より小さいケース
+        // (= 例えば 64KB prefetch 後の cache に対して 1MB IRP が来た等、mixed IRP size
+        // のワークロード)。旧版は残りを zero-fill していたが、Excel/Word 等の zip 形式
+        // file で開封時 "ファイルレベルの検証と修復" が走る regression を踏むので、
+        // 偏った byte 列を返さず、cache 分は keep + 残りを server から続きを fetch する
+        // ように切替え。
+        var partialFromCache = 0;
         if (h.Prefetch.TryConsume(offset, buffer.Span.Slice(0, requested), out var cachedBytes))
         {
-            if (cachedBytes < requested)
-            {
-                // EOF を跨いだ partial hit。残りは zero-fill (logicalEnd 以下なので
-                // 通常ここには来ないが safety net)。
-                buffer.Span.Slice(cachedBytes, requested - cachedBytes).Clear();
-            }
-            return requested;
+            if (cachedBytes >= requested) return requested;
+            // partial: 先頭 cachedBytes は cache 内容で埋まっている。offset / buffer /
+            // requested を残り分にスライドして以降の server fetch path に合流。
+            partialFromCache = cachedBytes;
+            offset += cachedBytes;
+            buffer = buffer.Slice(cachedBytes);
+            requested -= cachedBytes;
         }
 
         // server 側に実体がある範囲は range fetch、その先は SetSize-extend
@@ -573,7 +579,7 @@ public sealed partial class FileSystemBackend : IFileSystemBackend
         {
             buffer.Span.Slice(fetched, requested - fetched).Clear();
         }
-        return requested;
+        return partialFromCache + requested;
     }
 
     public async Task<long> WriteAsync(

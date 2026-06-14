@@ -338,6 +338,46 @@ public class FileSystemBackendTests
     }
 
     [Fact]
+    public async Task Read_PartialPrefetchHit_FallsThroughToServerInsteadOfZeroFill()
+    {
+        // 回帰 (Excel/ZIP 形式 file の "ファイルレベルの検証と修復" 症状): prefetch cache が
+        // 「64KB を offset X に保持」している時に「1MB を offset X に要求」されるような
+        // mixed IRP size のケース。旧版は cache 分 (64KB) を返したあと残り (= 1MB - 64KB)
+        // を zero-fill しており、Excel/Word 等の zip ファイルで CRC エラー → repair mode に
+        // 落ちる corruption を発生させた。修正後は cache 分は keep + 残りを server から
+        // 続きを fetch する。本 test は: armed まで sequential read を回す → cache に
+        // 余剰を持たせる → 直後に cache 容量を超える IRP を投げる → 全 byte が server
+        // 内容と一致することを確認。
+        const int blockSize = 64 * 1024;
+        var content = new byte[320 * 1024];
+        for (var i = 0; i < content.Length; i++) content[i] = (byte)(i & 0xFF);
+
+        var server = new FakeServerApi();
+        server.SeedFile("/blob.bin", content);
+        var backend = await NewInitializedBackendAsync(server);
+        using var handle = await backend.OpenAsync("/blob.bin", FileAccessIntent.Read);
+
+        // 3 連続の sequential read で prefetch を armed にする (SeqStreakThreshold=3)。
+        // 3 番目で実際に prefetch が走り、IRP 分 (64KB) を超えた余剰を cache に格納する。
+        var buf64 = new byte[blockSize];
+        await backend.ReadAsync(handle!, 0 * blockSize, buf64);
+        await backend.ReadAsync(handle!, 1 * blockSize, buf64);
+        await backend.ReadAsync(handle!, 2 * blockSize, buf64);
+        // この時点で cache は offset = 3 * 64KB = 192KB に 64KB ぶんを保持している想定
+        // (MaxPrefetchSize=256KB なので prefetchLen=min(64*2, 256)=128KB、64KB return + 64KB cache)。
+
+        // 4 番目の read を「cache offset に一致 + 容量超え (2 倍)」で投げる → 旧版なら
+        // 先頭 64KB だけ cache 内容で、後半 64KB が zero-fill される partial-hit 経路。
+        var buf128 = new byte[2 * blockSize];
+        var read = await backend.ReadAsync(handle!, 3 * blockSize, buf128);
+
+        Assert.Equal(buf128.Length, read);
+        // 期待値: file 全体は (byte)(i & 0xFF) でシードされているので、対応する byte 列と一致。
+        var expected = content.AsSpan(3 * blockSize, 2 * blockSize).ToArray();
+        Assert.Equal(expected, buf128);
+    }
+
+    [Fact]
     public async Task Cleanup_AfterLockAlreadyReleased_DoesNotReAttemptUpload()
     {
         // 回帰 (新 WinFsp.Native binding 実機 #3a): kernel が同一 Create handle に
