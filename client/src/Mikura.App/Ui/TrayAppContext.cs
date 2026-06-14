@@ -20,7 +20,7 @@ public sealed class TrayAppContext : ApplicationContext
 
     private HttpServerApi? _server;
     private FileSystemBackend? _backend;
-    private IBackendHost? _fsHost;
+    private BackendFileSystemHost? _fsHost;
     private SyncEngine? _syncEngine;
     private HttpEventStream? _eventStream;
     private CancellationTokenSource? _eventLoopCts;
@@ -155,16 +155,7 @@ public sealed class TrayAppContext : ApplicationContext
             await _backend.InitializeAsync().ConfigureAwait(true);
             Trace.WriteLine($"Backend initialized: {_backend.TreeSnapshot.Count} entries cached");
 
-            // env var で binding 切替え。MIKURA_USE_NATIVE_BINDING=1 で自前 modern
-            // P/Invoke (WinFsp.Native) 経由、それ以外は legacy winfsp-msil。
-            // PoC 期間中の機能比較 / 性能比較に使う。
-            var useNativeBinding = string.Equals(
-                Environment.GetEnvironmentVariable("MIKURA_USE_NATIVE_BINDING"),
-                "1", StringComparison.Ordinal);
-            _fsHost = useNativeBinding
-                ? new BackendFileSystemHostNative(_backend, _onlineGate)
-                : new BackendFileSystemHost(_backend, _onlineGate);
-            Trace.WriteLine($"Using {(useNativeBinding ? "WinFsp.Native (modern)" : "winfsp-msil (legacy)")} binding");
+            _fsHost = new BackendFileSystemHost(_backend, _onlineGate);
             Trace.WriteLine($"Mounting at '{_settings.SyncRootPath}'");
             _mountPoint = _fsHost.Mount(_settings.SyncRootPath);
             Trace.WriteLine($"Mounted at {_mountPoint}");
@@ -338,13 +329,7 @@ public sealed class TrayAppContext : ApplicationContext
             _fsHost = null;
 
             await _backend!.InitializeAsync();
-            // Remount 経路でも同じ env var で binding を選ぶ。
-            var useNativeBinding = string.Equals(
-                Environment.GetEnvironmentVariable("MIKURA_USE_NATIVE_BINDING"),
-                "1", StringComparison.Ordinal);
-            _fsHost = useNativeBinding
-                ? new BackendFileSystemHostNative(_backend, _onlineGate)
-                : new BackendFileSystemHost(_backend, _onlineGate);
+            _fsHost = new BackendFileSystemHost(_backend, _onlineGate);
             _mountPoint = _fsHost.Mount(_settings.SyncRootPath);
 
             _syncEngine = new SyncEngine(_backend, _mountPoint, _deviceId!,

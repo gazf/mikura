@@ -7,10 +7,11 @@ namespace WinFsp.Native;
 /// が WinFsp dispatcher からの IRP を marshaling して各 method に分配する。
 /// </summary>
 /// <remarks>
-/// <para>本 PoC では同期 method のみ提供 (return NTSTATUS、out 経由で結果)。
-/// 非同期 (STATUS_PENDING + SendResponse) は次段階で <c>ValueTask</c> 版を別 interface
-/// として追加する想定。mikura の現状 ReadAsync / WriteAsync は async 必須なので、
-/// 切替時に async overload を用意してから差し替える。</para>
+/// <para>本 interface は同期 (return NTSTATUS、out 経由で結果) を提供。非同期
+/// (STATUS_PENDING + <c>FspFileSystemSendResponse</c>) を使いたい backend は
+/// <see cref="IAsyncFileIo"/> を併せて実装すると、Read/Write が <see cref="ValueTask{TResult}"/>
+/// 経由で dispatch される。mikura の <c>BackendFileSystem</c> は HTTP backed なので
+/// async path を使用。</para>
 /// <para>FileContext は WinFsp side では <c>PVOID</c>、我々は <c>object?</c> として保持
 /// (実装が任意の per-handle state を返してよい)。<see cref="FileSystemHost"/> が
 /// GCHandle で IntPtr 化して native に渡し、Close で release する。</para>
@@ -33,7 +34,7 @@ public interface IFileSystem
     // ─────────────────────────────────────────────────── lookup ────
     /// <summary>
     /// path → attributes + security descriptor。Create/Open 前に kernel が呼ぶ。
-    /// SD は無くてもよい (PoC は null)、attribute は最低 FILE_ATTRIBUTE_DIRECTORY や
+    /// SD は無くてもよい (mikura は null を返す)、attribute は最低 FILE_ATTRIBUTE_DIRECTORY や
     /// NORMAL の判別が必要。
     /// </summary>
     int GetSecurityByName(string fileName, out uint fileAttributes, out byte[]? securityDescriptor);
@@ -82,7 +83,8 @@ public interface IFileSystem
     /// <summary>
     /// directory enumeration。pattern/marker は WinFsp が事前フィルタした結果。
     /// 各 entry は <see cref="WinFsp.Native.DirInfo"/> 形式で buffer に詰める
-    /// (PoC では呼ぶ側ヘルパ未提供、生 nint buffer を直接書く想定)。
+    /// 出力 buffer への積み込みは <see cref="DirectoryBuffer"/> ヘルパが
+    /// <c>FspFileSystemAddDirInfo</c> を介して行う。
     /// </summary>
     int ReadDirectory(object fileContext, string? pattern, string? marker,
         nint buffer, uint length, out uint bytesTransferred);

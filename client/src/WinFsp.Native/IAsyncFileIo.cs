@@ -21,7 +21,7 @@ public interface IAsyncFileIo
     /// <summary>
     /// <see cref="IFileSystem.Read"/> の非同期版。<paramref name="buffer"/> は kernel
     /// 提供領域への直接 <see cref="Memory{T}"/> wrap (zero-copy)。<paramref name="ct"/>
-    /// は callback path から cancel を伝播する余地として残す (本 PoC では未使用)。
+    /// は callback path から cancel を伝播する余地として残す (現在は未使用)。
     /// </summary>
     ValueTask<ReadResult> ReadAsync(object fileContext, Memory<byte> buffer, ulong offset,
         CancellationToken ct);

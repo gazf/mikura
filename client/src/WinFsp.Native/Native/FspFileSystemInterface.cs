@@ -52,7 +52,9 @@ public unsafe struct FspFileSystemInterface
 
     public delegate* unmanaged[Cdecl]<nint, nint, nint, nint, nint, uint, uint*, int> ReadDirectory;
 
-    // 以下は本 PoC では未対応。signature だけ定義して null で置く。
+    // 以下 callback slot は mikura の利用範囲では呼ばれないので null のまま (kernel が
+    // 該当 IRP を出してきても WinFsp 側で適切に変換される)。必要が出たら function pointer
+    // 同パターンで <see cref="FileSystemHost.PopulateInterface"/> に追加する。
     public delegate* unmanaged[Cdecl]<nint, nint, uint, byte, nint, nuint*, int> ResolveReparsePoints;
     public delegate* unmanaged[Cdecl]<nint, nint, nint, nint, nuint*, int> GetReparsePoint;
     public delegate* unmanaged[Cdecl]<nint, nint, nint, nint, nuint, int> SetReparsePoint;

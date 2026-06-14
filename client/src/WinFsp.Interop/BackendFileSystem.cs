@@ -1,59 +1,56 @@
-using System.Buffers;
-using System.Collections;
+using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Mikura.Core.Abstractions;
 using Mikura.Core.Models;
-using Fsp;
-using FileInfo = Fsp.Interop.FileInfo;
-using VolumeInfo = Fsp.Interop.VolumeInfo;
+using WinFsp.Native;
+using WinFsp.Native.Native;
 using DomainFileEntry = Mikura.Core.Models.FileEntry;
+// CleanupFlags は WinFsp.Native (kernel flags) と Mikura.Core.Abstractions (domain) で
+// 同名なので、Cleanup callback の引数型は明示的に WinFsp.Native 側を指定する。
+using NativeCleanupFlags = WinFsp.Native.CleanupFlags;
+using DomainCleanupFlags = Mikura.Core.Abstractions.CleanupFlags;
 
 namespace WinFsp.Interop;
 
 /// <summary>
-/// WinFsp <see cref="FileSystemBase"/> adapter that translates kernel callbacks
-/// into <see cref="IFileSystemBackend"/> calls. The body of every callback is
-/// (1) check the <see cref="OnlineGate"/>, (2) delegate to the backend,
-/// (3) translate the result into NTSTATUS / FileInfo (ADR-021).
-///
-/// <para>The backend is async; we block here because WinFsp's contract is
-/// synchronous. The blocking happens on WinFsp worker threads dedicated to IRP
-/// dispatch, so it does not stall any application thread.</para>
+/// mikura の <see cref="IFileSystemBackend"/> を WinFsp の <see cref="IFileSystem"/> +
+/// <see cref="IAsyncFileIo"/> 表現に変換する adapter。<see cref="FileSystemHost"/>
+/// が WinFsp dispatcher から受けた IRP callback をここに dispatch し、domain async API
+/// (Mikura.Core) に橋渡しする。
 /// </summary>
-public sealed class BackendFileSystem : FileSystemBase
+/// <remarks>
+/// <para>設計:
+///   - <see cref="IAsyncFileIo"/> 経由で Read / Write は <see cref="ValueTask{TResult}"/>
+///     を返す。<see cref="FileSystemHost"/> 側で即完了なら sync 経路、非同期 (HTTP I/O 等)
+///     なら <c>STATUS_PENDING</c> + <c>FspFileSystemSendResponse</c> で完了通知。
+///   - <see cref="ReadDirectory"/> は 1 callback 内で <see cref="DirectoryBuffer"/> に全
+///     entry を積む。buffer 不足は marker で続きを kernel が要求してくる。
+///   - <see cref="OnlineGate"/> off の間は全 callback が <see cref="NtStatus.NetworkUnreachable"/>
+///     を返し、SMB 相当の "session lost" semantics を実現 (ADR-021)。
+///   - Cleanup フラグ → domain <c>CleanupFlags</c> の mapping、HasWriteAccess の
+///     intent 分類等の責務は <c>WinFsp.Interop.Tests.BackendFileSystemTests</c> で固定。
+/// </para>
+/// </remarks>
+public sealed class BackendFileSystem : IFileSystem, IAsyncFileIo
 {
     private const int AllocationUnit = 4096;
 
-    /// <summary>STATUS_NETWORK_UNREACHABLE — analog to SMB session loss.</summary>
-    private const int StatusNetworkUnreachable = unchecked((int)0xC000023C);
-
-    /// <summary>STATUS_UNEXPECTED_IO_ERROR — backend exception の汎用フォールバック。</summary>
-    private const int StatusUnexpectedIoError = unchecked((int)0xC00000E9);
-
-    /// <summary>STATUS_OBJECT_NAME_NOT_FOUND の数値定数。Open での 404 マッピング用。</summary>
-    private const int StatusObjectNotFound = unchecked((int)0xC0000034);
-
-    /// <summary>
-    /// STATUS_FILE_DELETED — handle に紐づくファイルが I/O 中に削除された。
-    /// Read 中に path が消えた場合(例: Excel save dance の temp rename)に返す。
-    /// kernel は handle を invalidate して retry をやめる。
-    /// </summary>
-    private const int StatusFileDeleted = unchecked((int)0xC0000123);
-
-    /// <summary>STATUS_PENDING — async response パターンで callback を保留する。</summary>
-    private const int StatusPending = 0x00000103;
+    // FILE_DIRECTORY_FILE: kernel/CreateOptions の bit。createOptions に立っていれば
+    // ディレクトリ作成と判定 (Windows DDK 定義値)。
+    private const uint FileDirectoryFile = 0x00000001;
 
     private readonly IFileSystemBackend _backend;
     private readonly OnlineGate _gate;
     private readonly DateTime _createdAt = DateTime.UtcNow;
-
-    /// <summary>
-    /// SendReadResponse / SendWriteResponse / Notify を呼ぶための host 参照。
-    /// Mount 完了後でないと kernel 側 API は使えないので Mounted callback で取得。
-    /// </summary>
     private FileSystemHost? _host;
+
+    // race 切り分け用の詳細ログ。env MIKURA_NATIVE_TRACE=1 で有効化。
+    // Open / Cleanup / Close の入口で thread + handle path + flags を打つ。
+    private static readonly bool _trace =
+        string.Equals(Environment.GetEnvironmentVariable("MIKURA_NATIVE_TRACE"), "1",
+            StringComparison.Ordinal);
 
     public BackendFileSystem(IFileSystemBackend backend, OnlineGate gate)
     {
@@ -61,9 +58,12 @@ public sealed class BackendFileSystem : FileSystemBase
         _gate = gate;
     }
 
-    public override int Init(object host0)
+    /// <summary>Mount 後に <see cref="FileSystemHost.Notify"/> 等の kernel-side API を使うために露出。</summary>
+    public FileSystemHost? Host => _host;
+
+    // ─────────────────────────────────────── lifecycle ────
+    public void Init(FileSystemHost host)
     {
-        var host = (FileSystemHost)host0;
         host.SectorSize = AllocationUnit;
         host.SectorsPerAllocationUnit = 1;
         host.MaxComponentLength = 255;
@@ -73,419 +73,271 @@ public sealed class BackendFileSystem : FileSystemBase
         host.UnicodeOnDisk = true;
         host.PersistentAcls = false;
         // false で固定: Cleanup callback で lock release を行うので、modify
-        // 無し handle のときも必ず Cleanup を post してもらう必要がある。
-        // true (= modify あり時だけ Cleanup) だと、Excel が rename 後に
-        // Book1.xlsx を write open + 何も書かず close するパターンで lock が
-        // Cleanup を経由せず孤児化する (実機: 1 個残る現象)。
+        // 無し handle のときも必ず Cleanup を post してもらう必要がある (旧版コメント踏襲)。
         host.PostCleanupWhenModifiedOnly = false;
         host.PassQueryDirectoryPattern = true;
-        // false にすると最後の handle が閉じても kernel cache を保持 → shell の
-        // "右クリックの度に icon/version handler が file を open しなおす" 系の
-        // 反復アクセスが cache hit で消える。trade-off: 他端末での mutation を
-        // broadcast で知った直後でも、こちら側 kernel cache に古い byte が
-        // 残り得る (FileInfoTimeout=1000 の memo data lag と同じオーダー)。
+        // false で kernel cache を保持。shell の反復アクセスが cache hit で消える
+        // (旧版コメント踏襲)。
         host.FlushAndPurgeOnCleanup = false;
         host.VolumeCreationTime = (ulong)_createdAt.ToFileTimeUtc();
         host.VolumeSerialNumber = 0xCAF5;
         host.FileSystemName = "NTFS";
-
-        // NOTE: do NOT call _backend.InitializeAsync().GetResult() here — Init
-        // runs on the thread that invoked Mount (typically the UI thread). Any
-        // captured SynchronizationContext inside the backend's async chain would
-        // deadlock against the GetResult on that same thread. The host
-        // (TrayAppContext.StartAsync) is responsible for awaiting initialization
-        // before calling Mount.
-        return STATUS_SUCCESS;
     }
 
-    /// <summary>
-    /// Mount 成功後 = kernel 側 API (NotifyBegin 等) を呼べる状態。Init は VolumeParams
-    /// 設定専用で kernel 側 API は未稼働なので、host 参照はここで取る。
-    /// </summary>
-    public override int Mounted(object host0)
-    {
-        _host = (FileSystemHost)host0;
-        return STATUS_SUCCESS;
-    }
+    public void Mounted(FileSystemHost host) => _host = host;
+    public void Unmounted(FileSystemHost host) => _host = null;
 
-    public override void Unmounted(object host0)
+    // ─────────────────────────────────────── volume ────
+    public int GetVolumeInfo(out ulong totalSize, out ulong freeSize, out string label)
     {
-        _host = null;
-    }
-
-    public override int GetVolumeInfo(out VolumeInfo info)
-    {
-        info = default;
-        // backend が cache + 背景 refresh で server statfs を反映している。
-        // 高頻度呼出 (explorer の status bar 更新等) でもブロックしない。
         var stats = _backend.VolumeStats;
-        info.TotalSize = (ulong)Math.Max(0, stats.TotalSize);
-        info.FreeSize = (ulong)Math.Max(0, stats.FreeSize);
-        return STATUS_SUCCESS;
+        totalSize = (ulong)Math.Max(0, stats.TotalSize);
+        freeSize = (ulong)Math.Max(0, stats.FreeSize);
+        label = "";
+        return NtStatus.Success;
     }
 
-    public override int GetSecurityByName(string fileName, out uint fileAttributes, ref byte[] securityDescriptor)
+    // ─────────────────────────────────────── lookup ────
+    public int GetSecurityByName(string fileName, out uint fileAttributes, out byte[]? securityDescriptor)
     {
         fileAttributes = 0;
-        if (!_gate.IsOnline) return StatusNetworkUnreachable;
+        securityDescriptor = null;
+        if (!_gate.IsOnline) return NtStatus.NetworkUnreachable;
 
         var entry = AwaitOrNull(_backend.GetEntryAsync(ToBackendPath(fileName)));
-        if (entry is null) return STATUS_OBJECT_NAME_NOT_FOUND;
+        if (entry is null) return NtStatus.ObjectNameNotFound;
 
         fileAttributes = ToWindowsAttributes(entry);
-        return STATUS_SUCCESS;
+        return NtStatus.Success;
     }
 
-    public override int Open(
-        string fileName,
-        uint createOptions,
-        uint grantedAccess,
-        out object? fileNode,
-        out object? fileDesc0,
-        out FileInfo fileInfo,
-        out string? normalizedName)
+    // ─────────────────────────────────────── create / open ────
+    public int Open(string fileName, uint createOptions, uint grantedAccess,
+        out object? fileContext, out NativeFileInfo fileInfo)
     {
-        fileNode = null;
-        fileDesc0 = null;
-        normalizedName = null;
+        fileContext = null;
         fileInfo = default;
-
-        if (!_gate.IsOnline) return StatusNetworkUnreachable;
+        if (!_gate.IsOnline) return NtStatus.NetworkUnreachable;
 
         var path = ToBackendPath(fileName);
         var intent = HasWriteAccess(grantedAccess) ? FileAccessIntent.Write : FileAccessIntent.Read;
+        if (_trace)
+            Trace.WriteLine($"[trace] Open tid={Environment.CurrentManagedThreadId} path={path} access=0x{grantedAccess:X8} intent={intent}");
 
         try
         {
             var handle = _backend.OpenAsync(path, intent).GetAwaiter().GetResult();
-            if (handle is null) return STATUS_OBJECT_NAME_NOT_FOUND;
-            fileDesc0 = handle;
+            if (handle is null) return NtStatus.ObjectNameNotFound;
+            fileContext = handle;
             FillFileInfo(handle.Entry, out fileInfo);
-            return STATUS_SUCCESS;
+            return NtStatus.Success;
         }
         catch (UnauthorizedAccessException ex)
         {
-            // ADR-016: lock held by another holder — surface as ACCESS_DENIED so
-            // the caller's app sees "another user is editing" instead of
-            // "file not found".
-            System.Diagnostics.Trace.WriteLine($"[INFO] Open denied (lock conflict): {fileName}: {ex.Message}");
-            return STATUS_ACCESS_DENIED;
+            Trace.WriteLine($"[INFO] Open denied (lock conflict): {fileName}: {ex.Message}");
+            return NtStatus.AccessDenied;
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Trace.WriteLine($"[WARN] Open failed: {fileName}: {ex.Message}");
-            return STATUS_OBJECT_NAME_NOT_FOUND;
+            Trace.WriteLine($"[WARN] Open failed: {fileName}: {ex.Message}");
+            return NtStatus.ObjectNameNotFound;
         }
     }
 
-    public override int Create(
-        string fileName,
-        uint createOptions,
-        uint grantedAccess,
-        uint fileAttributes,
-        byte[] securityDescriptor,
-        ulong allocationSize,
-        out object? fileNode,
-        out object? fileDesc0,
-        out FileInfo fileInfo,
-        out string? normalizedName)
+    public int Create(string fileName, uint createOptions, uint grantedAccess,
+        uint fileAttributes, byte[]? securityDescriptor, ulong allocationSize,
+        out object? fileContext, out NativeFileInfo fileInfo)
     {
-        fileNode = null;
-        fileDesc0 = null;
-        normalizedName = null;
+        fileContext = null;
         fileInfo = default;
-
-        if (!_gate.IsOnline) return StatusNetworkUnreachable;
+        if (!_gate.IsOnline) return NtStatus.NetworkUnreachable;
 
         var path = ToBackendPath(fileName);
-        var isDir = (createOptions & FILE_DIRECTORY_FILE) != 0;
+        var isDir = (createOptions & FileDirectoryFile) != 0;
 
         var handle = AwaitOrNull(_backend.CreateAsync(path, isDir));
-        if (handle is null) return STATUS_ACCESS_DENIED;
-
-        fileDesc0 = handle;
+        if (handle is null) return NtStatus.AccessDenied;
+        fileContext = handle;
         FillFileInfo(handle.Entry, out fileInfo);
-        return STATUS_SUCCESS;
+        return NtStatus.Success;
     }
 
-    public override int Overwrite(
-        object fileNode,
-        object fileDesc0,
-        uint fileAttributes,
-        bool replaceFileAttributes,
-        ulong allocationSize,
-        out FileInfo fileInfo)
+    public int Overwrite(object fileContext, uint fileAttributes, bool replaceFileAttributes,
+        ulong allocationSize, out NativeFileInfo fileInfo)
     {
         fileInfo = default;
-        if (!_gate.IsOnline) return StatusNetworkUnreachable;
+        if (!_gate.IsOnline) return NtStatus.NetworkUnreachable;
 
-        var handle = (IFileHandle)fileDesc0;
-        if (handle.IsDirectory) return STATUS_INVALID_DEVICE_REQUEST;
+        var handle = (IFileHandle)fileContext;
+        if (handle.IsDirectory) return NtStatus.InvalidDeviceRequest;
 
         _backend.SetSizeAsync(handle, 0, false).GetAwaiter().GetResult();
         FillFileInfo(handle.Entry, out fileInfo);
-        return STATUS_SUCCESS;
+        return NtStatus.Success;
     }
 
-    public override int SetFileSize(
-        object fileNode,
-        object fileDesc0,
-        ulong newSize,
-        bool setAllocationSize,
-        out FileInfo fileInfo)
+    // ─────────────────────────────────────── I/O (async) ────
+    /// <summary>sync Read は IAsyncFileIo 経路に dispatch されるはずなので呼ばれない。</summary>
+    public int Read(object fileContext, Span<byte> buffer, ulong offset, out uint bytesTransferred)
     {
+        bytesTransferred = 0;
+        return NtStatus.NotImplemented;
+    }
+
+    /// <summary>sync Write も同上、async path を使う。</summary>
+    public int Write(object fileContext, ReadOnlySpan<byte> buffer, ulong offset,
+        bool writeToEndOfFile, bool constrainedIo,
+        out uint bytesTransferred, out NativeFileInfo fileInfo)
+    {
+        bytesTransferred = 0;
         fileInfo = default;
-        if (!_gate.IsOnline) return StatusNetworkUnreachable;
-
-        var handle = (IFileHandle)fileDesc0;
-        if (handle.IsDirectory) return STATUS_INVALID_DEVICE_REQUEST;
-
-        _backend.SetSizeAsync(handle, (long)newSize, setAllocationSize).GetAwaiter().GetResult();
-        FillFileInfo(handle.Entry, out fileInfo);
-        return STATUS_SUCCESS;
+        return NtStatus.NotImplemented;
     }
 
-    public override int Read(
-        object fileNode,
-        object fileDesc0,
-        IntPtr buffer,
-        ulong offset,
-        uint length,
-        out uint pBytesTransferred)
+    public async ValueTask<ReadResult> ReadAsync(object fileContext, Memory<byte> buffer, ulong offset, CancellationToken ct)
     {
-        pBytesTransferred = 0;
-        if (!_gate.IsOnline) return StatusNetworkUnreachable;
+        if (!_gate.IsOnline) return new ReadResult(NtStatus.NetworkUnreachable, 0);
 
-        var handle = (IFileHandle)fileDesc0;
-        if (handle.IsDirectory) return STATUS_INVALID_DEVICE_REQUEST;
+        var handle = (IFileHandle)fileContext;
+        if (handle.IsDirectory) return new ReadResult(NtStatus.InvalidDeviceRequest, 0);
 
-        // async response: callback は hint を取って即 StatusPending を返す。実 I/O は
-        // ProcessReadAsync で進行、完了時に SendReadResponse で kernel に通知。
-        // race fix: handle.EnterIo() で in-flight counter を上げ、Cleanup は
-        // DrainInFlightAsync で counter ゼロまで待ち合わせる。
-        var hint = _host!.GetOperationRequestHint();
-        var ioToken = handle.EnterIo();
-        _ = ProcessReadAsync(hint, buffer, (int)length, (long)offset, handle, ioToken);
-        return StatusPending;
-    }
-
-    /// <summary>
-    /// IRP buffer (unmanaged IntPtr) を UnmanagedMemoryManager で Memory&lt;byte&gt; に
-    /// wrap して FileSystemBackend.ReadAsync が直接書き込む(中間 byte[] と Marshal.Copy
-    /// 廃止)。寿命: SendReadResponse 呼び出しまでに mgr を Dispose する順序を厳守。
-    /// ioToken は SendResponse 直後 finally で Dispose して in-flight counter を戻す。
-    /// </summary>
-    private async Task ProcessReadAsync(
-        ulong hint, IntPtr buffer, int length, long offset,
-        IFileHandle handle, IDisposable ioToken)
-    {
-        int status = STATUS_SUCCESS;
-        int bytesRead = 0;
+        using var ioToken = handle.EnterIo();
         try
         {
-            using var mgr = new UnmanagedMemoryManager(buffer, length);
-            try
-            {
-                bytesRead = await _backend.ReadAsync(handle, offset, mgr.Memory)
-                    .ConfigureAwait(false);
-            }
-            catch (FileNotFoundException ex)
-            {
-                System.Diagnostics.Trace.WriteLine($"[INFO] Read on deleted path: {handle.Path}: {ex.Message}");
-                status = StatusFileDeleted;
-                bytesRead = 0;
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Trace.WriteLine(
-                    $"[ERROR] Read failed: {handle.Path} @{offset}+{length}: {ex.GetType().Name}: {ex.Message}");
-                status = StatusUnexpectedIoError;
-            }
-
-            if (status == STATUS_SUCCESS && bytesRead <= 0)
-            {
-                status = STATUS_END_OF_FILE;
-                bytesRead = 0;
-            }
+            var bytesRead = await _backend.ReadAsync(handle, (long)offset, buffer, ct).ConfigureAwait(false);
+            if (bytesRead <= 0) return new ReadResult(NtStatus.EndOfFile, 0);
+            return new ReadResult(NtStatus.Success, (uint)bytesRead);
         }
-        finally
+        catch (FileNotFoundException ex)
         {
-            // mgr の Dispose は using により completed。SendReadResponse → ioToken Dispose
-            // の順で「kernel に応答 → Cleanup に handle 解放」を表現する。
-            _host!.SendReadResponse(hint, status, status == STATUS_SUCCESS ? (uint)bytesRead : 0);
-            ioToken.Dispose();
+            Trace.WriteLine($"[INFO] Read on deleted path: {handle.Path}: {ex.Message}");
+            return new ReadResult(NtStatus.FileDeleted, 0);
+        }
+        catch (Exception ex)
+        {
+            Trace.WriteLine($"[ERROR] Read failed: {handle.Path} @{offset}+{buffer.Length}: {ex.GetType().Name}: {ex.Message}");
+            return new ReadResult(NtStatus.Unsuccessful, 0);
         }
     }
 
-    public override int Write(
-        object fileNode,
-        object fileDesc0,
-        IntPtr buffer,
-        ulong offset,
-        uint length,
-        bool writeToEndOfFile,
-        bool constrainedIo,
-        out uint pBytesTransferred,
-        out FileInfo fileInfo)
+    public async ValueTask<WriteResult> WriteAsync(object fileContext, ReadOnlyMemory<byte> buffer, ulong offset,
+        bool writeToEndOfFile, bool constrainedIo, CancellationToken ct)
     {
-        pBytesTransferred = 0;
-        fileInfo = default;
-        if (!_gate.IsOnline) return StatusNetworkUnreachable;
+        if (!_gate.IsOnline) return new WriteResult(NtStatus.NetworkUnreachable, 0, default);
 
-        var handle = (IFileHandle)fileDesc0;
-        if (handle.IsDirectory) return STATUS_INVALID_DEVICE_REQUEST;
+        var handle = (IFileHandle)fileContext;
+        if (handle.IsDirectory) return new WriteResult(NtStatus.InvalidDeviceRequest, 0, default);
 
-        // Read と同じ async response パターン。EnterIo で in-flight tracker に登録。
-        var hint = _host!.GetOperationRequestHint();
-        var ioToken = handle.EnterIo();
-        _ = ProcessWriteAsync(hint, buffer, (int)length, (long)offset,
-            writeToEndOfFile, constrainedIo, handle, ioToken);
-        return StatusPending;
-    }
-
-    /// <summary>
-    /// IRP buffer を ReadOnlyMemory&lt;byte&gt; として wrap して FileSystemBackend.WriteAsync に
-    /// 直接読ませる。完了経路で SendWriteResponse(成功時は新 FileInfo を ref で返す)
-    /// → ioToken Dispose の順で WinFsp 応答と in-flight 解放を行う。
-    /// </summary>
-    private async Task ProcessWriteAsync(
-        ulong hint, IntPtr buffer, int length, long offset,
-        bool writeToEnd, bool constrainedIo, IFileHandle handle, IDisposable ioToken)
-    {
-        int status = STATUS_SUCCESS;
-        FileInfo infoOut = default;
+        using var ioToken = handle.EnterIo();
         try
         {
-            using var mgr = new UnmanagedMemoryManager(buffer, length);
-            try
-            {
-                await _backend.WriteAsync(
-                    handle, offset, mgr.Memory, writeToEnd, constrainedIo)
-                    .ConfigureAwait(false);
-                FillFileInfo(handle.Entry, out infoOut);
-            }
-            catch (UnauthorizedAccessException ex)
-            {
-                System.Diagnostics.Trace.WriteLine($"[ERROR] Write denied: {handle.Path}: {ex.Message}");
-                status = STATUS_ACCESS_DENIED;
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Trace.WriteLine(
-                    $"[ERROR] Write failed: {handle.Path} @{offset}+{length}: {ex.GetType().Name}: {ex.Message}");
-                status = StatusUnexpectedIoError;
-            }
+            await _backend.WriteAsync(handle, (long)offset, buffer, writeToEndOfFile, constrainedIo, ct)
+                .ConfigureAwait(false);
+            FillFileInfo(handle.Entry, out var info);
+            return new WriteResult(NtStatus.Success, (uint)buffer.Length, info);
         }
-        finally
+        catch (UnauthorizedAccessException ex)
         {
-            _host!.SendWriteResponse(hint, status,
-                status == STATUS_SUCCESS ? (uint)length : 0, ref infoOut);
-            ioToken.Dispose();
+            Trace.WriteLine($"[ERROR] Write denied: {handle.Path}: {ex.Message}");
+            return new WriteResult(NtStatus.AccessDenied, 0, default);
+        }
+        catch (Exception ex)
+        {
+            Trace.WriteLine($"[ERROR] Write failed: {handle.Path} @{offset}+{buffer.Length}: {ex.GetType().Name}: {ex.Message}");
+            return new WriteResult(NtStatus.Unsuccessful, 0, default);
         }
     }
 
-    public override int GetFileInfo(object fileNode, object fileDesc0, out FileInfo fileInfo)
+    public int Flush(object? fileContext, out NativeFileInfo fileInfo)
+    {
+        if (!_gate.IsOnline) { fileInfo = default; return NtStatus.NetworkUnreachable; }
+        if (fileContext is null) { fileInfo = default; return NtStatus.Success; }
+        FillFileInfo(((IFileHandle)fileContext).Entry, out fileInfo);
+        return NtStatus.Success;
+    }
+
+    // ─────────────────────────────────────── metadata ────
+    public int GetFileInfo(object fileContext, out NativeFileInfo fileInfo)
+    {
+        if (!_gate.IsOnline) { fileInfo = default; return NtStatus.NetworkUnreachable; }
+        FillFileInfo(((IFileHandle)fileContext).Entry, out fileInfo);
+        return NtStatus.Success;
+    }
+
+    public int SetBasicInfo(object fileContext, uint fileAttributes,
+        ulong creationTime, ulong lastAccessTime, ulong lastWriteTime, ulong changeTime,
+        out NativeFileInfo fileInfo)
     {
         fileInfo = default;
-        if (!_gate.IsOnline) return StatusNetworkUnreachable;
-        FillFileInfo(((IFileHandle)fileDesc0).Entry, out fileInfo);
-        return STATUS_SUCCESS;
-    }
+        if (!_gate.IsOnline) return NtStatus.NetworkUnreachable;
 
-    public override int Flush(object fileNode, object fileDesc0, out FileInfo fileInfo)
-    {
-        if (!_gate.IsOnline)
-        {
-            fileInfo = default;
-            return StatusNetworkUnreachable;
-        }
-        if (fileDesc0 is null)
-        {
-            fileInfo = default;
-            return STATUS_SUCCESS;
-        }
-        FillFileInfo(((IFileHandle)fileDesc0).Entry, out fileInfo);
-        return STATUS_SUCCESS;
-    }
-
-    public override int CanDelete(object fileNode, object fileDesc0, string fileName)
-    {
-        if (!_gate.IsOnline) return StatusNetworkUnreachable;
-        var handle = (IFileHandle)fileDesc0;
-        var ok = _backend.CanDeleteAsync(handle).GetAwaiter().GetResult();
-        return ok ? STATUS_SUCCESS : STATUS_ACCESS_DENIED;
-    }
-
-    public override int Rename(
-        object fileNode,
-        object fileDesc0,
-        string fileName,
-        string newFileName,
-        bool replaceIfExists)
-    {
-        if (!_gate.IsOnline) return StatusNetworkUnreachable;
-        try
-        {
-            _backend.RenameAsync(ToBackendPath(fileName), ToBackendPath(newFileName), replaceIfExists)
-                .GetAwaiter().GetResult();
-            return STATUS_SUCCESS;
-        }
-        catch (FileNotFoundException) { return STATUS_OBJECT_NAME_NOT_FOUND; }
-        catch (IOException) { return STATUS_OBJECT_NAME_COLLISION; }
-    }
-
-    public override int SetBasicInfo(
-        object fileNode,
-        object fileDesc0,
-        uint fileAttributes,
-        ulong creationTime,
-        ulong lastAccessTime,
-        ulong lastWriteTime,
-        ulong changeTime,
-        out FileInfo fileInfo)
-    {
-        fileInfo = default;
-        if (!_gate.IsOnline) return StatusNetworkUnreachable;
-
-        var handle = (IFileHandle)fileDesc0;
+        var handle = (IFileHandle)fileContext;
         var info = new FileBasicInfo(
             CreationTimeUtc: creationTime != 0 ? DateTime.FromFileTimeUtc((long)creationTime) : null,
             LastAccessTimeUtc: lastAccessTime != 0 ? DateTime.FromFileTimeUtc((long)lastAccessTime) : null,
             LastWriteTimeUtc: lastWriteTime != 0 ? DateTime.FromFileTimeUtc((long)lastWriteTime) : null);
         _backend.SetBasicInfoAsync(handle, info).GetAwaiter().GetResult();
         FillFileInfo(handle.Entry, out fileInfo);
-        return STATUS_SUCCESS;
+        return NtStatus.Success;
     }
 
-    public override void Cleanup(object fileNode, object fileDesc0, string fileName, uint flags)
+    public int SetFileSize(object fileContext, ulong newSize, bool setAllocationSize,
+        out NativeFileInfo fileInfo)
     {
-        var handle = (IFileHandle)fileDesc0;
-        var cleanupFlags = CleanupFlags.None;
-        if ((flags & CleanupSetLastWriteTime) != 0) cleanupFlags |= CleanupFlags.Modified;
-        if ((flags & CleanupSetAllocationSize) != 0) cleanupFlags |= CleanupFlags.Modified;
-        if ((flags & CleanupSetArchiveBit) != 0) cleanupFlags |= CleanupFlags.Modified;
-        if ((flags & CleanupDelete) != 0) cleanupFlags |= CleanupFlags.Delete;
+        fileInfo = default;
+        if (!_gate.IsOnline) return NtStatus.NetworkUnreachable;
+
+        var handle = (IFileHandle)fileContext;
+        if (handle.IsDirectory) return NtStatus.InvalidDeviceRequest;
+
+        _backend.SetSizeAsync(handle, (long)newSize, setAllocationSize).GetAwaiter().GetResult();
+        FillFileInfo(handle.Entry, out fileInfo);
+        return NtStatus.Success;
+    }
+
+    // ─────────────────────────────────────── lifecycle (file) ────
+    public void Cleanup(object? fileContext, string? fileName, NativeCleanupFlags flags)
+    {
+        if (fileContext is not IFileHandle handle) return;
+
+        var cf = DomainCleanupFlags.None;
+        if ((flags & NativeCleanupFlags.SetLastWriteTime) != 0) cf |= DomainCleanupFlags.Modified;
+        if ((flags & NativeCleanupFlags.SetAllocationSize) != 0) cf |= DomainCleanupFlags.Modified;
+        if ((flags & NativeCleanupFlags.SetArchiveBit) != 0) cf |= DomainCleanupFlags.Modified;
+        if ((flags & NativeCleanupFlags.Delete) != 0) cf |= DomainCleanupFlags.Delete;
+        if (_trace)
+            Trace.WriteLine($"[trace] Cleanup tid={Environment.CurrentManagedThreadId} path={handle.Path} winflags=0x{(uint)flags:X} cf={cf}");
         try
         {
-            _backend.CleanupAsync(handle, cleanupFlags).GetAwaiter().GetResult();
+            _backend.CleanupAsync(handle, cf).GetAwaiter().GetResult();
         }
         catch (Exception ex)
         {
-            // WinFsp Cleanup has no return path; log and swallow.
-            System.Diagnostics.Trace.WriteLine($"[WARN] Cleanup failed: {handle.Path}: {ex.Message}");
+            Trace.WriteLine($"[WARN] Cleanup failed: {handle.Path}: {ex.Message}");
         }
     }
 
-    public override void Close(object fileNode, object fileDesc0)
+    public void Close(object fileContext)
     {
-        var handle = (IFileHandle)fileDesc0;
+        // GCHandle slot 再利用 defence: stale な fileContext で別 type が来たら静かに抜ける。
+        // WinFsp が Close 後の遅延 callback で同じ nint を再送した場合、GCHandle 経由で別の
+        // managed object (実機: System.Threading.Thread が観測された) が返ってくる事がある。
+        // 直接 cast すると InvalidCastException → UnmanagedCallersOnly callback で例外 →
+        // catch があっても native 側に伝播し最悪 process 終了。
+        if (fileContext is not IFileHandle handle)
+        {
+            Trace.WriteLine($"[ERROR] Close got non-IFileHandle ({fileContext?.GetType().Name ?? "null"}) — stale fileContext, ignoring");
+            return;
+        }
+        if (_trace)
+            Trace.WriteLine($"[trace] Close tid={Environment.CurrentManagedThreadId} path={handle.Path}");
         try
         {
             _backend.CloseAsync(handle).GetAwaiter().GetResult();
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Trace.WriteLine($"[WARN] Close failed: {handle.Path}: {ex.Message}");
+            Trace.WriteLine($"[WARN] Close failed: {handle.Path}: {ex.Message}");
         }
         finally
         {
@@ -493,46 +345,90 @@ public sealed class BackendFileSystem : FileSystemBase
         }
     }
 
-    public override bool ReadDirectoryEntry(
-        object fileNode,
-        object fileDesc0,
-        string pattern,
-        string marker,
-        ref object? context,
-        out string? fileName,
-        out FileInfo fileInfo)
+    // ─────────────────────────────────────── delete / rename ────
+    public int CanDelete(object fileContext, string fileName)
     {
-        fileName = null;
-        fileInfo = default;
-        if (!_gate.IsOnline) return false;
-
-        var handle = (IFileHandle)fileDesc0;
-        if (!handle.IsDirectory) return false;
-
-        // Cache the enumeration on the handle to give WinFsp stable continuation.
-        var bag = (DirectoryEnumeration?)context;
-        if (bag is null)
-        {
-            var children = _backend.EnumerateAsync(handle.Path).GetAwaiter().GetResult();
-            bag = new DirectoryEnumeration(children);
-            if (marker is not null) bag.SeekAfter(marker);
-            context = bag;
-        }
-
-        if (!bag.TryAdvance(out var entry)) return false;
-        fileName = entry.Name;
-        FillFileInfo(entry, out fileInfo);
-        return true;
+        if (!_gate.IsOnline) return NtStatus.NetworkUnreachable;
+        var handle = (IFileHandle)fileContext;
+        var ok = _backend.CanDeleteAsync(handle).GetAwaiter().GetResult();
+        return ok ? NtStatus.Success : NtStatus.AccessDenied;
     }
 
-    /// <summary>
-    /// Distinguishes write-intent opens from metadata-only / read-only opens.
-    /// Windows fires <c>CreateFile</c> many times per user-visible open
-    /// (shell preview, AV scan, indexer, icon overlays, properties dialog, ...);
-    /// without this filter we would call <c>AcquireLockAsync</c> on every one
-    /// of them. ADR-016 only requires locking against concurrent writes —
-    /// readers do not need a server-side lock.
-    /// </summary>
+    public int Rename(object fileContext, string fileName, string newFileName, bool replaceIfExists)
+    {
+        if (!_gate.IsOnline) return NtStatus.NetworkUnreachable;
+        try
+        {
+            _backend.RenameAsync(ToBackendPath(fileName), ToBackendPath(newFileName), replaceIfExists)
+                .GetAwaiter().GetResult();
+            return NtStatus.Success;
+        }
+        catch (FileNotFoundException) { return NtStatus.ObjectNameNotFound; }
+        catch (IOException) { return NtStatus.ObjectNameCollision; }
+    }
+
+    // ─────────────────────────────────────── security ────
+    public int GetSecurity(object fileContext, out byte[]? securityDescriptor)
+    {
+        // mikura は OS 標準の SD 管理を提供しない。empty で success。
+        securityDescriptor = null;
+        return NtStatus.Success;
+    }
+
+    public int SetSecurity(object fileContext, uint securityInformation, byte[] modificationDescriptor)
+    {
+        // 同上、no-op で success (kernel 側 cache 反映を妨げないため)。
+        return NtStatus.Success;
+    }
+
+    // ─────────────────────────────────────── directory enumeration ────
+    public int ReadDirectory(object fileContext, string? pattern, string? marker,
+        nint buffer, uint length, out uint bytesTransferred)
+    {
+        bytesTransferred = 0;
+        if (!_gate.IsOnline) return NtStatus.NetworkUnreachable;
+
+        var handle = (IFileHandle)fileContext;
+        if (!handle.IsDirectory) return NtStatus.InvalidDeviceRequest;
+
+        // 旧版は ReadDirectoryEntry の per-entry override で、call 間の context を
+        // ref object? に貯める形だったが、新版は 1 call で全 entry を積むので
+        // enumeration を都度 backend から取り直す (1 directory open あたり数回程度)。
+        IReadOnlyList<DomainFileEntry> children;
+        try
+        {
+            children = _backend.EnumerateAsync(handle.Path).GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            Trace.WriteLine($"[WARN] Enumerate failed: {handle.Path}: {ex.Message}");
+            return NtStatus.Unsuccessful;
+        }
+
+        var db = new DirectoryBuffer(buffer, length);
+        var skipUntilMarker = !string.IsNullOrEmpty(marker);
+        foreach (var entry in children)
+        {
+            if (skipUntilMarker)
+            {
+                if (string.Equals(entry.Name, marker, StringComparison.OrdinalIgnoreCase))
+                    skipUntilMarker = false;
+                continue;
+            }
+            FillFileInfo(entry, out var info);
+            if (!db.TryAdd(entry.Name, in info))
+            {
+                // buffer 容量切れ。caller (kernel) は次回 marker 付きで続きを取りに来る。
+                bytesTransferred = db.BytesTransferred;
+                return NtStatus.Success;
+            }
+        }
+        db.MarkEnd();
+        bytesTransferred = db.BytesTransferred;
+        return NtStatus.Success;
+    }
+
+    // ─────────────────────────────────────── helpers ────
     private static bool HasWriteAccess(uint grantedAccess)
     {
         const uint FILE_WRITE_DATA = 0x0002;
@@ -571,7 +467,7 @@ public sealed class BackendFileSystem : FileSystemBase
         return a;
     }
 
-    private static void FillFileInfo(DomainFileEntry entry, out FileInfo info)
+    private static void FillFileInfo(DomainFileEntry entry, out NativeFileInfo info)
     {
         info = default;
         info.FileAttributes = ToWindowsAttributes(entry);
@@ -587,11 +483,8 @@ public sealed class BackendFileSystem : FileSystemBase
     }
 
     /// <summary>
-    /// path と creation time を混ぜた 64-bit ID。content-based ではないが、
-    /// 「同名で削除→再作成」を NTFS の MFT エントリ再割当てと同じく別 ID として扱う
-    /// (creation time が変わるため)。mtime mix と違って通常の編集では ID が変わらない。
-    /// rename で path が変われば ID も変わる(NTFS の MFT 永続性とは別物)が、
-    /// 業務 app の path-based 操作には十分。
+    /// 旧 BackendFileSystem.ComputeIndexNumber と同じハッシュ式 (path + creation time)。
+    /// path 削除→再作成で異なる ID、通常編集では同 ID。
     /// </summary>
     private static ulong ComputeIndexNumber(ReadOnlySpan<char> path, ulong creationTime)
     {
@@ -602,11 +495,8 @@ public sealed class BackendFileSystem : FileSystemBase
         ref byte ptr = ref MemoryMarshal.GetReference(data);
         int len = data.Length;
 
-        // path のサイズと creation time を初期値に混ぜる。同 path で生成時刻が
-        // 違う(削除→再作成)場合に異なる hash 開始点になる。
         ulong hash = ((ulong)len * prime1) ^ (creationTime * prime2);
         int i = 0;
-
         while (i + 8 <= len)
         {
             ulong k = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref ptr, i));
@@ -614,14 +504,12 @@ public sealed class BackendFileSystem : FileSystemBase
             hash = BitOperations.RotateLeft(hash, 31) * prime1;
             i += 8;
         }
-
         while (i < len)
         {
             hash ^= (ulong)Unsafe.Add(ref ptr, i) * prime2;
             hash = BitOperations.RotateLeft(hash, 11) * prime1;
             i++;
         }
-
         hash ^= hash >> 33;
         hash *= prime2;
         hash ^= hash >> 29;
@@ -633,44 +521,8 @@ public sealed class BackendFileSystem : FileSystemBase
         try { return task.GetAwaiter().GetResult(); }
         catch (Exception ex)
         {
-            System.Diagnostics.Trace.WriteLine($"[WARN] backend call failed: {ex.Message}");
+            Trace.WriteLine($"[WARN] backend call failed: {ex.Message}");
             return null;
-        }
-    }
-
-    private sealed class DirectoryEnumeration
-    {
-        private readonly IReadOnlyList<DomainFileEntry> _entries;
-        private int _index;
-
-        public DirectoryEnumeration(IReadOnlyList<DomainFileEntry> entries)
-        {
-            _entries = entries;
-            _index = 0;
-        }
-
-        public void SeekAfter(string marker)
-        {
-            for (var i = 0; i < _entries.Count; i++)
-            {
-                if (string.Equals(_entries[i].Name, marker, StringComparison.OrdinalIgnoreCase))
-                {
-                    _index = i + 1;
-                    return;
-                }
-            }
-            _index = _entries.Count;
-        }
-
-        public bool TryAdvance(out DomainFileEntry entry)
-        {
-            if (_index >= _entries.Count)
-            {
-                entry = null!;
-                return false;
-            }
-            entry = _entries[_index++];
-            return true;
         }
     }
 }

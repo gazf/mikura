@@ -116,7 +116,7 @@ internal static partial class NativeApi
     /// <c>FspFileSystemSendResponse</c>: STATUS_PENDING で先に return した IRP を
     /// 後から完了通知するための async response API。Response struct は WinFsp 定義の
     /// FSP_FSCTL_TRANSACT_RSP (Hint + Kind + Status + per-operation 出力データ) を
-    /// 詰めて渡す。本 PoC では同期 callback のみで使わない。
+    /// 詰めて渡す。<see cref="WinFsp.Native.AsyncCompletion"/> から呼ばれる。
     /// </summary>
     [LibraryImport(DllName, EntryPoint = "FspFileSystemSendResponse")]
     public static partial void FspFileSystemSendResponse(nint fileSystem, nint pResponse);
