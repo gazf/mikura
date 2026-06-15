@@ -14,11 +14,15 @@ import {
 } from "../services/file.service.ts";
 import { checkPermission } from "../services/auth.service.ts";
 import { getAllLocks, isLockedByOther } from "../services/lock.service.ts";
-import type { AuthUser } from "../services/auth.service.ts";
+import type {
+  AuthUser,
+  PermissionContext,
+} from "../services/auth.service.ts";
 
 type Env = {
   Variables: {
     user: AuthUser;
+    permCtx: PermissionContext;
   };
 };
 
@@ -39,14 +43,21 @@ export function registerFileRoutes(app: Hono<Env>) {
   // GET /tree — recursive full tree listing (read 権限のあるノードのみ返す)
   app.get("/tree", async (c) => {
     const user = c.get("user");
+    const permCtx = c.get("permCtx");
     // const t0 = performance.now();
     try {
       const tree = await getTree();
       const locks = await getAllLocks();
       // 各ノードを read 権限でフィルタ + ADR-019 isReadOnly 合成 (他 device がロック中)。
+      // permCtx は request スコープの cache。entry 間で parent path の lookup
+      // が大量重複するため、これを共有すると /tree の KV op が劇的に減る。
       const checks = await Promise.all(
         tree.map(async (n) => {
-          if (!(await checkPermission(user.id, n.path, "read"))) return null;
+          if (
+            !(await checkPermission(user.id, n.path, "read", permCtx))
+          ) {
+            return null;
+          }
           const lock = locks.get(n.path);
           const isReadOnly = lock !== undefined &&
             lock.deviceId !== user.deviceId;
@@ -71,9 +82,10 @@ export function registerFileRoutes(app: Hono<Env>) {
     const wildcard = c.req.path.replace(/^\/files\/?/, "");
     const filePath = "/" + wildcard;
     const user = c.get("user");
+    const permCtx = c.get("permCtx");
     // const t0 = performance.now();
 
-    if (!(await checkPermission(user.id, filePath, "read"))) {
+    if (!(await checkPermission(user.id, filePath, "read", permCtx))) {
       return c.json({ message: "Forbidden" }, 403);
     }
 
@@ -104,7 +116,8 @@ export function registerFileRoutes(app: Hono<Env>) {
       return c.json({ message: "Refusing to delete storage root" }, 400);
     }
 
-    if (!(await checkPermission(user.id, filePath, "write"))) {
+    const permCtx = c.get("permCtx");
+    if (!(await checkPermission(user.id, filePath, "write", permCtx))) {
       return c.json({ message: "Forbidden" }, 403);
     }
 
@@ -129,7 +142,8 @@ export function registerFileRoutes(app: Hono<Env>) {
       return c.json({ message: "Refusing to create root" }, 400);
     }
 
-    if (!(await checkPermission(user.id, filePath, "write"))) {
+    const permCtx = c.get("permCtx");
+    if (!(await checkPermission(user.id, filePath, "write", permCtx))) {
       return c.json({ message: "Forbidden" }, 403);
     }
 
@@ -166,9 +180,10 @@ export function registerFileRoutes(app: Hono<Env>) {
     }
 
     // 移動元/移動先の両方に write 権限が必要
+    const permCtx = c.get("permCtx");
     if (
-      !(await checkPermission(user.id, oldPath, "write")) ||
-      !(await checkPermission(user.id, newPath, "write"))
+      !(await checkPermission(user.id, oldPath, "write", permCtx)) ||
+      !(await checkPermission(user.id, newPath, "write", permCtx))
     ) {
       return c.json({ message: "Forbidden" }, 403);
     }
@@ -189,9 +204,10 @@ export function registerFileRoutes(app: Hono<Env>) {
     const wildcard = c.req.path.replace(/^\/content\/?/, "");
     const filePath = "/" + wildcard;
     const user = c.get("user");
+    const permCtx = c.get("permCtx");
     // const t0 = performance.now();
 
-    if (!(await checkPermission(user.id, filePath, "read"))) {
+    if (!(await checkPermission(user.id, filePath, "read", permCtx))) {
       return c.json({ message: "Forbidden" }, 403);
     }
 
@@ -252,8 +268,9 @@ export function registerFileRoutes(app: Hono<Env>) {
     const wildcard = c.req.path.replace(/^\/content\/?/, "");
     const filePath = "/" + wildcard;
     const user = c.get("user");
+    const permCtx = c.get("permCtx");
 
-    if (!(await checkPermission(user.id, filePath, "write"))) {
+    if (!(await checkPermission(user.id, filePath, "write", permCtx))) {
       return c.json({ message: "Forbidden" }, 403);
     }
 

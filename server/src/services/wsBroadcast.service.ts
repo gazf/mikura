@@ -1,4 +1,4 @@
-import { checkPermission } from "./auth.service.ts";
+import { checkPermission, PermissionContext } from "./auth.service.ts";
 import { getKv } from "../kv/store.ts";
 import { Keys } from "../kv/keys.ts";
 import type { User } from "../types.ts";
@@ -76,12 +76,20 @@ export async function broadcastLockEvent(
   let sent = 0;
   // 認可チェックは並列に。失敗 (権限なし) は黙って配信スキップ。
   // 自端末向けの broadcast はそもそも自分が起こした事象なので除外。
+  // broadcast-scoped な PermissionContext を共有することで、同一 (userId, path)
+  // の重複 lookup を排除する (異なる peer が同じ user の別 device なら groupIds
+  // も再利用される、加えて path 階層の parent も walk 上で重複する)。
+  const permCtx = new PermissionContext();
   await Promise.all(
     [...peers].map(async (peer) => {
       if (peer.deviceId === holder.deviceId) return;
       if (peer.socket.readyState !== WebSocket.OPEN) return;
       try {
-        if (!(await checkPermission(peer.userId, filePath, "read"))) return;
+        if (
+          !(await checkPermission(peer.userId, filePath, "read", permCtx))
+        ) {
+          return;
+        }
         peer.socket.send(payload);
         sent++;
       } catch (err) {
@@ -123,12 +131,18 @@ export async function broadcastFileEvent(
     originatorDeviceId ? { ...base, originatorDeviceId } : base,
   );
 
+  // broadcast-scoped permission cache (lock event 側と同じ意図)。
+  const permCtx = new PermissionContext();
   await Promise.all(
     [...peers].map(async (peer) => {
       if (originatorDeviceId && peer.deviceId === originatorDeviceId) return;
       if (peer.socket.readyState !== WebSocket.OPEN) return;
       try {
-        if (!(await checkPermission(peer.userId, filePath, "read"))) return;
+        if (
+          !(await checkPermission(peer.userId, filePath, "read", permCtx))
+        ) {
+          return;
+        }
         peer.socket.send(payload);
       } catch (err) {
         console.error("broadcastFileEvent send failed:", err);
