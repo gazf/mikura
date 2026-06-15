@@ -62,8 +62,9 @@ dotnet run --project src/Mikura.App  # Windows only
 - REST API paths: forward slashes, relative to data root
 - Path validation required: reject `..` and null bytes
 - Use Deno KV atomic ops to prevent races
-- C#: `unsafe` is no longer required at any layer; WinFsp's .NET binding (`Fsp.FileSystemBase`) is fully managed
+- C#: `unsafe` は `WinFsp.Native` 層 (関数ポインタ + 生 native memory) と一部 IRP buffer 受け渡しに限定で使用可、それ以外は要らない。`Mikura.Core` / `Mikura.Transport` / `Mikura.App` は managed only
 - C#: prefer zero-alloc (DTOs as `readonly struct`, `ArrayPool`, `stackalloc` with `ArrayPool` fallback)
+- C#: WinFsp 層は AOT-ready (`<IsAotCompatible>true</IsAotCompatible>` 永続化済み) なので、reflection / `JsonSerializer.Deserialize<T>` / `Activator.CreateInstance` 等の reflection API は `WinFsp.Native` / `WinFsp.Interop` には入れない (analyzer が warning として弾く)
 
 ## Environment-identifying strings
 
@@ -77,9 +78,18 @@ Test fixtures, sample paths, and example identifiers in code must use obviously-
 
 ## Docs
 
-- [docs/decisions.md](docs/decisions.md) — Architecture Decision Records
+- [docs/decisions/](docs/decisions/) — Architecture Decision Records (個別 ADR は `docs/decisions/ADR-NNN-*.md`、index は [docs/decisions/README.md](docs/decisions/README.md))
 
 ## Logs
 
 - Server: `server/mikura-server.log` (`console.log/warn/error` tee, append mode)
 - Client: `client/src/Mikura.App/bin/Debug/<TFM>/mikura-client.log` (`Trace.WriteLine` + uncaught exceptions logged as `[FATAL]`/`[ERROR]`)
+
+## Working efficiently (codebase 探索 / context 節約)
+
+- **log は絶対 `Read` しない**。`mikura-client.log` は CDM 等の負荷テスト後に **数十 MB** まで成長する。常に `grep` または `tail -N` で部分取り込み (`grep "ERROR\|FATAL" log | tail -30` や `tail -200 log` 等)。1 回うっかり全体 Read すると context が一発で吹き飛ぶ
+- **800 行超の hot file** (`Mikura.Core/FileSystem/FileSystemBackend.cs`, `WinFsp.Native/FileSystemHost.cs` 等) は `grep -n <symbol> <file>` で対象行特定 → `Read offset:N limit:M` で部分取り込み。全体 Read は避ける
+- **「どこで X してるか」「Y はどのファイル」「Z の責務は誰」**のような探索が 3 query 超になりそうなら `Explore` subagent を `Agent(subagent_type='Explore', ...)` で spawn。main loop の context を消費しないで結論だけ受け取れる
+- **`dotnet test` 出力**は常に `--verbosity quiet 2>&1 | tail -10` でフィルタ。verbose だと test ごとに数行ずつ流れる
+- **`dotnet build` 出力**も `2>&1 | tail -8` で末尾だけ取る。warning / error は末尾の "X Warning(s) Y Error(s)" 行に集約される
+- **ADR は分割済み** (`docs/decisions/ADR-NNN-*.md`)、特定 ADR の内容が必要なら個別ファイルだけ Read。`docs/decisions/README.md` が index、まずそれを見て該当 ADR を特定する

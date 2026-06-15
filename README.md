@@ -69,5 +69,5 @@ Device ID は `device.json` に永続化されます (実行ファイル隣)。
 
 ## ドキュメント
 
-- [docs/decisions.md](docs/decisions.md) — Architecture Decision Records (ADR-021 が現行アーキの根拠、ADR-025 が chunked upload セッション API)
+- [docs/decisions/](docs/decisions/) — Architecture Decision Records (ADR-021 が現行アーキの根拠、ADR-025 が chunked upload セッション API、ADR-032 が現行 WinFsp .NET binding)
 - [CLAUDE.md](CLAUDE.md) — リポジトリのコーディング規約 / AI アシスタント向けガイド
