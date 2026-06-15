@@ -1,6 +1,7 @@
 import { createMiddleware } from "@hono/hono/factory";
 import {
   type AuthUser,
+  PermissionContext,
   upsertDevice,
   validateToken,
 } from "../services/auth.service.ts";
@@ -8,6 +9,7 @@ import {
 type Env = {
   Variables: {
     user: AuthUser;
+    permCtx: PermissionContext;
   };
 };
 
@@ -46,5 +48,9 @@ export const authMiddleware = createMiddleware<Env>(async (c, next) => {
   }
 
   c.set("user", { ...identity, deviceId });
+  // request スコープの permission cache。groupIds / permission(path, groupId)
+  // の duplicate KV lookup を排除する (GET /tree で N entries × parent path
+  // 重複が劇的に効く)。lifetime は本 request のみ。
+  c.set("permCtx", new PermissionContext());
   await next();
 });

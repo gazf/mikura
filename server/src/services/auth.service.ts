@@ -239,7 +239,7 @@ export async function createAppToken(
   return { raw, hash };
 }
 
-async function getUserGroupIds(userId: number): Promise<number[]> {
+async function fetchUserGroupIds(userId: number): Promise<number[]> {
   const kv = await getKv();
   const groupIds: number[] = [];
   const iter = kv.list<boolean>({ prefix: Keys.userGroupsPrefix(userId) });
@@ -251,15 +251,72 @@ async function getUserGroupIds(userId: number): Promise<number[]> {
   return groupIds;
 }
 
+async function fetchPermission(
+  path: string,
+  groupId: number,
+): Promise<Permission | null> {
+  const kv = await getKv();
+  const got = await kv.get<Permission>(Keys.permission(path, groupId));
+  return got.value ?? null;
+}
+
+/**
+ * request スコープの permission 走査 cache。
+ *
+ * 課題: checkPermission は 1 request 内で何度も呼ばれる
+ *   - GET /tree: entry 数 × (group 数 × depth) KV read = 数千 op / 1 req になりうる
+ *   - WSS broadcast: peer 数 × (同上)
+ *   - PATCH /files: src + dst で 2 回
+ *
+ * 共有可能性:
+ *   - groupIds(userId): 1 request 内では同じ userId 何度叩いても 1 fetch で十分
+ *   - permission(path, groupId): tree 走査で **parent path が大量に重複** する
+ *     (例: /a/b/c と /a/b/d は /, /a, /a/b の lookup を共有)
+ *
+ * Promise を cache に格納することで Promise.all による concurrent walk でも
+ * 1 (userId, path, groupId) 当たり 1 fetch に収束する (in-flight 共有)。
+ *
+ * ライフタイム: 1 request 中だけ生存。middleware が new し、req 終了で参照が
+ * 切れて GC される (in-memory のみ、KV 書込みなし)。
+ */
+export class PermissionContext {
+  private _groupIds = new Map<number, Promise<number[]>>();
+  private _perm = new Map<string, Promise<Permission | null>>();
+
+  groupIds(userId: number): Promise<number[]> {
+    let p = this._groupIds.get(userId);
+    if (!p) {
+      p = fetchUserGroupIds(userId);
+      this._groupIds.set(userId, p);
+    }
+    return p;
+  }
+
+  permission(path: string, groupId: number): Promise<Permission | null> {
+    // key separator に null byte を使うのは、path validation で null byte を
+    // 既に弾いているため衝突が起こりえないから。
+    const key = `${path}\0${groupId}`;
+    let p = this._perm.get(key);
+    if (!p) {
+      p = fetchPermission(path, groupId);
+      this._perm.set(key, p);
+    }
+    return p;
+  }
+}
+
 export async function checkPermission(
   userId: number,
   path: string,
   requiredLevel: "read" | "write",
+  ctx?: PermissionContext,
 ): Promise<boolean> {
-  const groupIds = await getUserGroupIds(userId);
-  if (groupIds.length === 0) return false;
+  // ctx 無しの呼び出しは「1 回限りの check」として one-shot context を生成する
+  // (test や CLI から呼ぶケース、または middleware を通らない経路)。
+  const context = ctx ?? new PermissionContext();
 
-  const kv = await getKv();
+  const groupIds = await context.groupIds(userId);
+  if (groupIds.length === 0) return false;
 
   // Walk up the path hierarchy to find the most specific permission
   const pathParts = path.split("/").filter(Boolean);
@@ -274,11 +331,9 @@ export async function checkPermission(
   for (let i = pathsToCheck.length - 1; i >= 0; i--) {
     const checkPath = pathsToCheck[i];
     for (const groupId of groupIds) {
-      const perm = await kv.get<Permission>(
-        Keys.permission(checkPath, groupId),
-      );
-      if (perm.value) {
-        return hasAccess(perm.value.accessLevel, requiredLevel);
+      const perm = await context.permission(checkPath, groupId);
+      if (perm) {
+        return hasAccess(perm.accessLevel, requiredLevel);
       }
     }
   }
