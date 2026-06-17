@@ -55,7 +55,9 @@ await seedFixture();
  * legacy 実装 (全 entry stat) の等価コピー。本物の listDirectory と
  * 同じ出力 shape を返すよう揃える (sort も)。
  */
-async function listDirectoryAllStat(relativePath: string): Promise<FileEntry[]> {
+async function listDirectoryAllStat(
+  relativePath: string,
+): Promise<FileEntry[]> {
   const fullPath = path.join(DATA_ROOT, relativePath.replace(/^\/+/, ""));
   const entries: FileEntry[] = [];
   for await (const entry of Deno.readDir(fullPath)) {
@@ -74,7 +76,8 @@ async function listDirectoryAllStat(relativePath: string): Promise<FileEntry[]> 
 }
 
 Deno.bench({
-  name: `listDirectory ${DIR_COUNT} dirs + ${FILE_COUNT} files (all-stat baseline)`,
+  name:
+    `listDirectory ${DIR_COUNT} dirs + ${FILE_COUNT} files (all-stat baseline)`,
   group: "list-dir",
   baseline: true,
   async fn() {
@@ -83,7 +86,8 @@ Deno.bench({
 });
 
 Deno.bench({
-  name: `listDirectory ${DIR_COUNT} dirs + ${FILE_COUNT} files (stat-skip for dirs)`,
+  name:
+    `listDirectory ${DIR_COUNT} dirs + ${FILE_COUNT} files (stat-skip for dirs)`,
   group: "list-dir",
   async fn() {
     await listDirectory(BENCH_DIR);

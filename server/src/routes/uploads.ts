@@ -8,10 +8,7 @@ import {
   writeChunksMultipart,
 } from "../services/upload.service.ts";
 import { checkPermission } from "../services/auth.service.ts";
-import type {
-  AuthUser,
-  PermissionContext,
-} from "../services/auth.service.ts";
+import type { AuthUser, PermissionContext } from "../services/auth.service.ts";
 import { extractBoundary } from "../util/multipartRanges.ts";
 
 type Env = {

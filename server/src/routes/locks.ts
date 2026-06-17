@@ -1,10 +1,7 @@
 import { Hono } from "hono";
 import { acquireLock, getLock, releaseLock } from "../services/lock.service.ts";
 import { checkPermission } from "../services/auth.service.ts";
-import type {
-  AuthUser,
-  PermissionContext,
-} from "../services/auth.service.ts";
+import type { AuthUser, PermissionContext } from "../services/auth.service.ts";
 
 type Env = {
   Variables: {

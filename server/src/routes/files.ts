@@ -14,10 +14,7 @@ import {
 } from "../services/file.service.ts";
 import { checkPermission } from "../services/auth.service.ts";
 import { getAllLocks, isLockedByOther } from "../services/lock.service.ts";
-import type {
-  AuthUser,
-  PermissionContext,
-} from "../services/auth.service.ts";
+import type { AuthUser, PermissionContext } from "../services/auth.service.ts";
 
 type Env = {
   Variables: {
