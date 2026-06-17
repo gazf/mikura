@@ -53,15 +53,14 @@ public sealed class BackendFileSystem : IFileSystem, IAsyncFileIo
     // (1338) を吐き、「新規作成」メニューが folder 1 項目に退化したり UAC 盾が
     // 貼られる (PowerShell `Get-Acl Z:\` も同 1338 で失敗する)。
     //
-    // Lazy 化の理由: SDDL→byte[] 変換は advapi32 (Windows 専用)。BackendFileSystem は
+    // OS guard: SDDL→byte[] 変換は advapi32 (Windows 専用)。BackendFileSystem は
     // Linux 上の dotnet test でも instantiate される (Offline gate / Cleanup flag
-    // mapping 等の純 managed テスト) ため、static field eager init にすると Linux で
-    // 全テストが TypeInitializationException で爆死する。実際に GetSecurity が
-    // 呼ばれるのは WinFsp host 経由の Windows 上だけなので、最初の callback で
-    // 評価して以後 cache する。
-    private static readonly Lazy<byte[]> _defaultSd = new(
-        () => SecurityDescriptors.FromSddl(SecurityDescriptors.EveryoneFullAccessSddl),
-        LazyThreadSafetyMode.ExecutionAndPublication);
+    // mapping 等の純 managed テスト) ため、Linux ではダミーの空 byte[] を入れる。
+    // 実 callback (GetSecurity 系) は WinFsp host 経由の Windows 上でしか呼ばれない
+    // ので、Linux 側の値が参照されることは無い。
+    private static readonly byte[] _defaultSd = OperatingSystem.IsWindows()
+        ? SecurityDescriptors.FromSddl(SecurityDescriptors.EveryoneFullAccessSddl)
+        : [];
 
     // race 切り分け用の詳細ログ。env MIKURA_NATIVE_TRACE=1 で有効化。
     // Open / Cleanup / Close の入口で thread + handle path + flags を打つ。
@@ -125,7 +124,7 @@ public sealed class BackendFileSystem : IFileSystem, IAsyncFileIo
         if (entry is null) return NtStatus.ObjectNameNotFound;
 
         fileAttributes = ToWindowsAttributes(entry);
-        securityDescriptor = _defaultSd.Value;
+        securityDescriptor = _defaultSd;
         return NtStatus.Success;
     }
 
@@ -391,7 +390,7 @@ public sealed class BackendFileSystem : IFileSystem, IAsyncFileIo
         // mikura の認可は server 側 (REST 401/403) で行うので、ここは Explorer の
         // AccessCheck を通すための placeholder SD を返す (null は無効扱いで
         // ERROR_INVALID_SECURITY_DESCR の原因)。詳細は _defaultSd の comment 参照。
-        securityDescriptor = _defaultSd.Value;
+        securityDescriptor = _defaultSd;
         return NtStatus.Success;
     }
 
