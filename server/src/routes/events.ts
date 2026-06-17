@@ -11,11 +11,12 @@ import {
   registerSocket,
   unregisterSocket,
 } from "../services/wsBroadcast.service.ts";
-import type { AuthUser } from "../services/auth.service.ts";
+import type { AuthUser, PermissionContext } from "../services/auth.service.ts";
 
 type Env = {
   Variables: {
     user: AuthUser;
+    permCtx: PermissionContext;
   };
 };
 

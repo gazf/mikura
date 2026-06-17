@@ -6,11 +6,12 @@ import { registerLockRoutes } from "./routes/locks.ts";
 import { registerEventRoutes } from "./routes/events.ts";
 import { registerUploadRoutes } from "./routes/uploads.ts";
 import { auditLogger } from "./middleware/logger.ts";
-import type { AuthUser } from "./services/auth.service.ts";
+import type { AuthUser, PermissionContext } from "./services/auth.service.ts";
 
 type Env = {
   Variables: {
     user: AuthUser;
+    permCtx: PermissionContext;
   };
 };
 

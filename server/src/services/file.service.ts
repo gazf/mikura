@@ -48,6 +48,12 @@ export class FileServiceError extends Error {
   }
 }
 
+// directory entry の lastModified は mikura の同期不変量 (sync timestamp は
+// file 単位、broadcast event も path に紐づく) に含まれないので、stat を
+// 省略して epoch を返す。client 側の projection / SyncEngine は dir mtime に
+// 依存していない。
+const DIR_LAST_MODIFIED = new Date(0).toISOString();
+
 export async function listDirectory(
   relativePath: string,
 ): Promise<FileEntry[]> {
@@ -56,13 +62,26 @@ export async function listDirectory(
 
   try {
     for await (const entry of Deno.readDir(fullPath)) {
-      const stat = await Deno.stat(path.join(fullPath, entry.name));
-      entries.push({
-        name: entry.name,
-        type: entry.isDirectory ? "directory" : "file",
-        size: entry.isDirectory ? 0 : stat.size,
-        lastModified: (stat.mtime ?? new Date()).toISOString(),
-      });
+      // dir-heavy tree (深い projects/ 配下など) では readDir 1 + stat N の
+      // 後者が支配的になる。directory の size は意味的に 0、mtime は同期不変量
+      // に含まれないため、stat を省略して N→1 (readDir のみ) に削減する。
+      // file は size を readDir が返さないので stat 必須。
+      if (entry.isDirectory) {
+        entries.push({
+          name: entry.name,
+          type: "directory",
+          size: 0,
+          lastModified: DIR_LAST_MODIFIED,
+        });
+      } else {
+        const stat = await Deno.stat(path.join(fullPath, entry.name));
+        entries.push({
+          name: entry.name,
+          type: "file",
+          size: stat.size,
+          lastModified: (stat.mtime ?? new Date()).toISOString(),
+        });
+      }
     }
   } catch (e) {
     if (e instanceof Deno.errors.NotFound) {
