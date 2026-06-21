@@ -23,6 +23,34 @@ type Env = {
   };
 };
 
+/**
+ * `/files/*`, `/folders/*`, `/content/*` の wildcard route から、mount prefix を
+ * 剥がして「root 相対のファイルパス」(必ず `/` 始まり) を取り出す。
+ *
+ * 設計判断:
+ *   - 旧実装は per-route で `c.req.path.replace(/^\/files\/?/, "")` + `"/" + ...`
+ *     を 7 箇所にコピペしており、prefix だけ違う 3 種の regex literal が散らばっていた。
+ *     ヘルパー 1 本に集約することで、追加 route が増えた時の編集箇所を 1 つにする。
+ *   - Hono の `*` wildcard は **non-capturing** (= `c.req.param("*")` は常に
+ *     undefined)。`:path{.*}` (capturing) は空 path で Hono 内部 crash、
+ *     `:path{.+}` は `/files/` で 404 になるため route 定義は `/files/*` を維持し、
+ *     mount prefix は呼び出し側で渡す。
+ *   - `c.req.path` は Hono が percent-decode 済み (slash 文字 `%2F` のみ保護)。
+ *     旧 regex 実装も同じ decoded path に対して動作していたので、本ヘルパーへの
+ *     置換で `resolveAndValidate` に渡る文字列は完全に同一 (decode 挙動の差なし)。
+ *   - 純関数として書いておけば fixture なしで edge case (末尾 `/`, mount root のみ,
+ *     日本語名, `..` 含み) を直接 unit test できる。
+ */
+export function wildcardPath(reqPath: string, mountPrefix: string): string {
+  // mountPrefix は "/files" の形式 (末尾スラッシュなし) を想定。
+  //   /files/foo   → after = "/foo"  → "/foo"
+  //   /files/      → after = "/"     → "/"
+  //   /files       → after = ""      → "/"   (mount root)
+  const after = reqPath.slice(mountPrefix.length);
+  if (after === "" || after === "/") return "/";
+  return after[0] === "/" ? after : "/" + after;
+}
+
 export function registerFileRoutes(app: Hono<Env>) {
   // GET /volume — storage が乗っている FS の容量 (Z: ドライブの「ディスクの空き容量」表示用)
   app.get("/volume", async (c) => {
@@ -76,8 +104,7 @@ export function registerFileRoutes(app: Hono<Env>) {
 
   // GET /files/*path — list directory or get file info
   app.get("/files/*", async (c) => {
-    const wildcard = c.req.path.replace(/^\/files\/?/, "");
-    const filePath = "/" + wildcard;
+    const filePath = wildcardPath(c.req.path, "/files");
     const user = c.get("user");
     const permCtx = c.get("permCtx");
     // const t0 = performance.now();
@@ -105,8 +132,7 @@ export function registerFileRoutes(app: Hono<Env>) {
 
   // DELETE /files/*path — delete file or directory
   app.delete("/files/*", async (c) => {
-    const wildcard = c.req.path.replace(/^\/files\/?/, "");
-    const filePath = "/" + wildcard;
+    const filePath = wildcardPath(c.req.path, "/files");
     const user = c.get("user");
 
     if (filePath === "/" || filePath === "") {
@@ -131,8 +157,7 @@ export function registerFileRoutes(app: Hono<Env>) {
 
   // POST /folders/*path — create directory (non-recursive: 親が無ければ 404)
   app.post("/folders/*", async (c) => {
-    const wildcard = c.req.path.replace(/^\/folders\/?/, "");
-    const filePath = "/" + wildcard;
+    const filePath = wildcardPath(c.req.path, "/folders");
     const user = c.get("user");
 
     if (filePath === "/" || filePath === "") {
@@ -157,8 +182,7 @@ export function registerFileRoutes(app: Hono<Env>) {
 
   // PATCH /files/*path — rename. body: { newPath: string }
   app.patch("/files/*", async (c) => {
-    const wildcard = c.req.path.replace(/^\/files\/?/, "");
-    const oldPath = "/" + wildcard;
+    const oldPath = wildcardPath(c.req.path, "/files");
     const user = c.get("user");
 
     if (oldPath === "/" || oldPath === "") {
@@ -198,8 +222,7 @@ export function registerFileRoutes(app: Hono<Env>) {
 
   // GET /content/*path — download file content
   app.get("/content/*", async (c) => {
-    const wildcard = c.req.path.replace(/^\/content\/?/, "");
-    const filePath = "/" + wildcard;
+    const filePath = wildcardPath(c.req.path, "/content");
     const user = c.get("user");
     const permCtx = c.get("permCtx");
     // const t0 = performance.now();
@@ -262,8 +285,7 @@ export function registerFileRoutes(app: Hono<Env>) {
 
   // PUT /content/*path — upload file
   app.put("/content/*", async (c) => {
-    const wildcard = c.req.path.replace(/^\/content\/?/, "");
-    const filePath = "/" + wildcard;
+    const filePath = wildcardPath(c.req.path, "/content");
     const user = c.get("user");
     const permCtx = c.get("permCtx");
 

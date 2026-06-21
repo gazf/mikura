@@ -126,6 +126,63 @@ Deno.test("/tree: isReadOnly=false for the lock holder's own device", async () =
   });
 });
 
+Deno.test("/files/{japanese}: 日本語ファイル名を含む path で正しく取得できる (wildcardPath decode 経路)", async () => {
+  // 旧実装は `c.req.path.replace(/^\/files\/?/, "")`、新実装は `wildcardPath`
+  // helper だが、Hono が `c.req.path` を percent-decode 済みで返す前提は
+  // 両者で共通。本テストは「日本語名で end-to-end で stat が引ける」ことを
+  // 固定して、refactor 経由で encode/decode の取り回しが壊れていないことを担保する。
+  await withTestKv(async (kv) => {
+    const tokens = await setupUsers(kv);
+    const fx = await setupFixture();
+    try {
+      const name = "あいう.txt";
+      await Deno.writeTextFile(path.join(fx.root, name), "japanese content");
+
+      // GET /files/{FIXTURE_DIR}/あいう.txt (percent-encoded で投げる、本物 client と同じ流儀)
+      const url = "http://localhost/files/" + FIXTURE_DIR + "/" +
+        encodeURIComponent(name);
+      const res = await app.fetch(
+        authReq("GET", url, tokens.alice, "dev-alice-pc"),
+      );
+      assertEquals(res.status, 200, "Japanese filename should be stat-able");
+      const info = (await res.json()) as {
+        name: string;
+        type: string;
+        size: number;
+      };
+      assertEquals(info.type, "file");
+      assertEquals(info.name, name);
+      assertEquals(info.size, "japanese content".length);
+    } finally {
+      await fx.cleanup();
+    }
+  });
+});
+
+Deno.test("/files/{FIXTURE_DIR}/: 末尾スラッシュ付き dir も list 可能", async () => {
+  // wildcardPath は `/files/{FIXTURE_DIR}/` を `/{FIXTURE_DIR}/` に変換するが、
+  // resolveAndValidate 側で正規化される (`path.normalize` で末尾 `/` は除去)。
+  // 旧実装も同じ経路だったので、refactor 後も dir list が壊れていないことを固定。
+  await withTestKv(async (kv) => {
+    const tokens = await setupUsers(kv);
+    const fx = await setupFixture();
+    try {
+      const url = "http://localhost/files/" + FIXTURE_DIR + "/";
+      const res = await app.fetch(
+        authReq("GET", url, tokens.alice, "dev-alice-pc"),
+      );
+      assertEquals(res.status, 200);
+      const entries = (await res.json()) as Array<{ name: string }>;
+      assert(
+        entries.some((e) => e.name === "shared.txt"),
+        "directory listing should include seeded shared.txt",
+      );
+    } finally {
+      await fx.cleanup();
+    }
+  });
+});
+
 Deno.test("/volume: storage が乗っている FS の totalSize / freeSize を返す", async () => {
   await withTestKv(async (kv) => {
     const tokens = await setupUsers(kv);
