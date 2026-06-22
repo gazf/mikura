@@ -1,37 +1,27 @@
 using System.Diagnostics;
-using System.Net.Http;
-using System.Net.Http.Headers;
 using System.Windows.Forms;
 using Mikura.App.Config;
-using Mikura.Core.FileSystem;
+using Mikura.App.Profiles;
 using Mikura.Core.Identity;
-using Mikura.Core.Sync;
-using Mikura.Transport;
-using WinFsp.Interop;
 
 namespace Mikura.App.Ui;
 
+/// <summary>
+/// WinForms tray host。実 mount / WSS / sync の責務は <see cref="ProfileManager"/>
+/// + <see cref="ProfileSession"/> に移譲し、本クラスは tray icon + menu + lifecycle
+/// に専念する。
+/// </summary>
+/// <remarks>
+/// Phase C 過渡: 単一 profile 想定の menu (Open / Sync now / Remount) を維持。
+/// Phase D で「Profiles ▶ [name1] / [name2]」サブメニュー + per-profile 操作に拡張。
+/// </remarks>
 public sealed class TrayAppContext : ApplicationContext
 {
-    // Phase B 過渡: 単一 profile を直接保持し、null なら「未設定」表示。
-    // Phase C で ProfileManager に差し替える。
     private readonly ProfileStore _store;
     private readonly GlobalSettings _globalSettings;
-    private Profile? _profile;
-    private string? _token;
     private readonly NotifyIcon _tray;
 
-    private static readonly TimeSpan WssHeartbeatInterval = TimeSpan.FromSeconds(10);
-
-    private HttpServerApi? _server;
-    private FileSystemBackend? _backend;
-    private BackendFileSystemHost? _fsHost;
-    private SyncEngine? _syncEngine;
-    private HttpEventStream? _eventStream;
-    private CancellationTokenSource? _eventLoopCts;
-    private string? _deviceId;
-    private string? _mountPoint;
-    private readonly OnlineGate _onlineGate = new();
+    private ProfileManager? _manager;
 
     private readonly ToolStripMenuItem _statusItem;
     private readonly ToolStripMenuItem _openItem;
@@ -39,14 +29,10 @@ public sealed class TrayAppContext : ApplicationContext
     private readonly ToolStripMenuItem _settingsItem;
     private readonly ToolStripMenuItem _resetItem;
 
-    public TrayAppContext(
-        ProfileStore store,
-        GlobalSettings globalSettings,
-        Profile? profile)
+    public TrayAppContext(ProfileStore store, GlobalSettings globalSettings)
     {
         _store = store;
         _globalSettings = globalSettings;
-        _profile = profile;
 
         _statusItem = new ToolStripMenuItem("Initializing...") { Enabled = false };
         _openItem = new ToolStripMenuItem("Open sync folder", null, OnOpenFolder);
@@ -126,7 +112,8 @@ public sealed class TrayAppContext : ApplicationContext
 
     private async Task StartAsync()
     {
-        if (_profile is null)
+        var profiles = _store.LoadProfiles();
+        if (profiles.Count == 0)
         {
             SetStatus("No profile");
             ShowBalloon(
@@ -137,71 +124,12 @@ public sealed class TrayAppContext : ApplicationContext
 
         try
         {
-            SetStatus("Connecting...");
-            _deviceId = DeviceIdProvider.Compute();
-            Trace.WriteLine($"Device ID: {_deviceId}");
+            var deviceId = DeviceIdProvider.Compute();
+            Trace.WriteLine($"Device ID: {deviceId}");
 
-            // secret.bin を DPAPI 復号して in-memory に展開。失敗 (= 別 user / 別 PC の
-            // file をコピーされた等) なら再 enroll を案内する。
-            try
-            {
-                _token = _store.LoadSecret(_profile.Name);
-            }
-            catch (Exception ex)
-            {
-                Trace.WriteLine($"[ERROR] secret.bin Unprotect failed: {ex.Message}");
-                SetStatus("Re-enrollment required");
-                ShowBalloon(
-                    "MIKURA: token decrypt failed",
-                    "Re-enroll by dropping a new *.init.json file.",
-                    ToolTipIcon.Error);
-                return;
-            }
-            if (string.IsNullOrEmpty(_token))
-            {
-                SetStatus("Re-enrollment required");
-                ShowBalloon(
-                    "MIKURA: missing bearer token",
-                    "secret.bin not found for this profile. Re-enroll.");
-                return;
-            }
-
-            // SocketsHttpHandler を明示構成しないと SocketsHttpHandler の既定が
-            // PooledConnectionLifetime = Infinite、MaxConnectionsPerServer =
-            // int.MaxValue になり、接続が永久に keep-alive で残る。各接続は
-            // Http1Connection 内部に _writeBuffer / _readBuffer (ArrayBuffer)
-            // を持ち、4MB チャンクの PATCH を流すたびにそれらが auto-grow して
-            // 巨大なまま (実機: 複数 connection × 数十 MB ≈ 100MB 超) 居座る。
-            // chunked upload 4 並列 + WSS + その他で MaxConnections を 8 に絞り、
-            // 短めの lifetime で循環させて、接続側のメモリを bound する。
-            var handler = new SocketsHttpHandler
-            {
-                PooledConnectionLifetime = TimeSpan.FromMinutes(1),
-                PooledConnectionIdleTimeout = TimeSpan.FromSeconds(15),
-                MaxConnectionsPerServer = 8,
-            };
-            var http = new HttpClient(handler);
-            http.DefaultRequestHeaders.Authorization =
-                new AuthenticationHeaderValue("Bearer", _token);
-            http.DefaultRequestHeaders.Add("X-Device-Id", _deviceId);
-            _server = new HttpServerApi(http, _profile.ServerUrl);
-
-            _backend = new FileSystemBackend(_server);
-            Trace.WriteLine($"Initializing backend (server={_profile.ServerUrl})");
-            await _backend.InitializeAsync().ConfigureAwait(true);
-            Trace.WriteLine($"Backend initialized: {_backend.TreeSnapshot.Count} entries cached");
-
-            _fsHost = new BackendFileSystemHost(_backend, _onlineGate);
-            Trace.WriteLine($"Mounting at '{_profile.MountLetter}'");
-            _mountPoint = _fsHost.Mount(_profile.MountLetter);
-            Trace.WriteLine($"Mounted at {_mountPoint}");
-
-            _syncEngine = new SyncEngine(_backend, _mountPoint, _deviceId,
-                notifyKernelCache: _fsHost.NotifyExternalChange);
-            _eventLoopCts = new CancellationTokenSource();
-            _ = RunEventLoopWithReconnectAsync(_eventLoopCts.Token);
-
-            SetStatus($"Connected: {_profile.ServerUrl}");
+            _manager = new ProfileManager(_store, deviceId);
+            _manager.LoadAndStartAllAsync(OnSessionAdded).GetAwaiter().GetResult();
+            await UpdateStatusFromManagerAsync();
         }
         catch (Exception ex)
         {
@@ -211,74 +139,37 @@ public sealed class TrayAppContext : ApplicationContext
         }
     }
 
-    private async Task RunEventLoopWithReconnectAsync(CancellationToken ct)
+    /// <summary>新 session 発火時の hook。各 session の status 変化を tray に集約する。</summary>
+    private void OnSessionAdded(ProfileSession session)
     {
-        var deviceId = _deviceId
-            ?? throw new InvalidOperationException("Device ID not initialized");
-
-        while (!ct.IsCancellationRequested)
+        session.StatusChanged += s =>
         {
-            using var heartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            try
-            {
-                var stream = await HttpEventStream.ConnectAsync(
-                    _profile!.ServerUrl, _token!, deviceId, ct);
-                _eventStream = stream;
-                _onlineGate.Set(true);
-
-                await using (stream)
-                {
-                    var heartbeat = Task.Run(() => RunHeartbeatAsync(stream, heartbeatCts.Token));
-                    try
-                    {
-                        await _syncEngine!.RunEventLoopAsync(stream, ct).ConfigureAwait(false);
-                    }
-                    finally
-                    {
-                        heartbeatCts.Cancel();
-                        try { await heartbeat.ConfigureAwait(false); } catch { /* ignore */ }
-                    }
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                _eventStream = null;
-                // ADR-021 core requirement: when the WSS link drops, flip the
-                // gate so all in-flight Read/Write/Open IRPs fail immediately
-                // with STATUS_NETWORK_UNREACHABLE — the Samba-equivalent UX.
-                _onlineGate.Set(false);
-                Trace.WriteLine($"EventLoop disconnected: {ex.Message}, reconnecting in 5s...");
-                try { await Task.Delay(5000, ct); }
-                catch (OperationCanceledException) { break; }
-            }
-        }
-        _eventStream = null;
-        _onlineGate.Set(false);
+            // Phase C 過渡: 単一 session 想定で先頭 session の status をそのまま表示。
+            // Phase D で「2/3 profiles connected」等の集約表示に変える。
+            _ = UpdateStatusFromManagerAsync();
+        };
     }
 
-    private static async Task RunHeartbeatAsync(HttpEventStream stream, CancellationToken ct)
+    private Task UpdateStatusFromManagerAsync()
     {
-        var sentCount = 0;
-        while (!ct.IsCancellationRequested)
+        var first = _manager?.FirstOrDefault();
+        if (first is null)
         {
-            if (ct.WaitHandle.WaitOne(WssHeartbeatInterval)) break;
-            try
-            {
-                await stream.SendHeartbeatAsync(ct).ConfigureAwait(false);
-                sentCount++;
-                if (sentCount == 1 || sentCount % 6 == 0)
-                    Trace.WriteLine($"WSS heartbeat sent (total={sentCount})");
-            }
-            catch (OperationCanceledException) { break; }
-            catch (Exception ex)
-            {
-                Trace.WriteLine($"Heartbeat failed: {ex.Message}");
-            }
+            SetStatus("No profile");
         }
+        else if (first.Status == ProfileSessionStatus.Connected)
+        {
+            SetStatus($"Connected: {first.Profile.ServerUrl}");
+        }
+        else if (first.Status == ProfileSessionStatus.Failed)
+        {
+            SetStatus($"Error: {first.StatusMessage}");
+        }
+        else
+        {
+            SetStatus(first.StatusMessage ?? first.Status.ToString());
+        }
+        return Task.CompletedTask;
     }
 
     private void SetStatus(string text)
@@ -287,7 +178,6 @@ public sealed class TrayAppContext : ApplicationContext
             _statusItem.Owner.Invoke(() => _statusItem.Text = text);
         else
             _statusItem.Text = text;
-        _tray.Text = $"MIKURA - {text}".Length > 63 ? "MIKURA" : $"MIKURA - {text}";
     }
 
     private void ShowBalloon(string title, string text, ToolTipIcon icon = ToolTipIcon.Info)
@@ -300,11 +190,15 @@ public sealed class TrayAppContext : ApplicationContext
 
     private void OnOpenFolder(object? sender, EventArgs e)
     {
-        var target = _mountPoint ?? _profile?.MountLetter ?? "(none)";
+        var first = _manager?.FirstOrDefault();
+        var target = first?.MountPoint ?? first?.Profile.MountLetter;
         if (string.IsNullOrEmpty(target)) return;
         try
         {
-            Process.Start(new ProcessStartInfo("explorer.exe", target) { UseShellExecute = true });
+            Process.Start(new ProcessStartInfo("explorer.exe", target)
+            {
+                UseShellExecute = true,
+            });
         }
         catch (Exception ex)
         {
@@ -314,36 +208,37 @@ public sealed class TrayAppContext : ApplicationContext
 
     private async void OnSyncNow(object? sender, EventArgs e)
     {
-        if (_syncEngine is null) return;
+        var first = _manager?.FirstOrDefault();
+        if (first is null) return;
         SetStatus("Syncing...");
-        try
-        {
-            await _syncEngine.FullSyncAsync(CancellationToken.None);
-            SetStatus($"Connected: {_profile?.ServerUrl ?? "no-profile"}");
-        }
-        catch (Exception ex)
+        var ok = await first.SyncNowAsync(CancellationToken.None);
+        if (!ok)
         {
             SetStatus("Error");
-            ShowBalloon("Sync failed", ex.Message, ToolTipIcon.Error);
+            ShowBalloon("Sync failed", "See log for details.", ToolTipIcon.Error);
+            return;
         }
+        await UpdateStatusFromManagerAsync();
     }
 
     private void OnOpenSettings(object? sender, EventArgs e)
     {
-        // Phase B: SettingsForm は profile-aware UI 未完成。情報表示のみ。
+        // Phase C 過渡: SettingsForm は profile-aware UI 未完成。情報表示のみ。
         using var form = new SettingsForm();
         form.ShowDialog();
     }
 
     /// <summary>
-    /// Re-mount the volume. Replaces the old "reset local cache" action — under
-    /// ADR-020/021 there is no persistent local cache to clear. Tearing down and
-    /// remounting effectively re-fetches /tree and rebuilds in-memory state.
+    /// Re-mount the current (first) profile. ADR-020/021: persistent local cache が
+    /// 無いので、tear down + remount で /tree refetch + 内部 cache rebuild に等価。
     /// </summary>
     private async void OnReset(object? sender, EventArgs e)
     {
+        var first = _manager?.FirstOrDefault();
+        if (first is null) return;
+        var target = first.MountPoint ?? first.Profile.MountLetter;
         var result = MessageBox.Show(
-            $"Remount the mikura drive at {_mountPoint ?? _profile?.MountLetter ?? "(none)"}?\n\nIn-flight handles will fail.",
+            $"Remount the mikura drive at {target}?\n\nIn-flight handles will fail.",
             "Remount",
             MessageBoxButtons.OKCancel,
             MessageBoxIcon.Information,
@@ -353,31 +248,9 @@ public sealed class TrayAppContext : ApplicationContext
         SetStatus("Remounting...");
         try
         {
-            _eventLoopCts?.Cancel();
-            _eventLoopCts?.Dispose();
-            _eventLoopCts = null;
-            _ = _eventStream?.DisposeAsync().AsTask();
-            _eventStream = null;
-
-            _fsHost?.Dispose();
-            _fsHost = null;
-
-            if (_profile is null)
-            {
-                SetStatus("No profile");
-                return;
-            }
-            await _backend!.InitializeAsync();
-            _fsHost = new BackendFileSystemHost(_backend, _onlineGate);
-            _mountPoint = _fsHost.Mount(_profile.MountLetter);
-
-            _syncEngine = new SyncEngine(_backend, _mountPoint, _deviceId!,
-                notifyKernelCache: _fsHost.NotifyExternalChange);
-            _eventLoopCts = new CancellationTokenSource();
-            _ = RunEventLoopWithReconnectAsync(_eventLoopCts.Token);
-
-            SetStatus($"Connected: {_profile?.ServerUrl ?? "no-profile"}");
-            ShowBalloon("Remount complete", $"Drive available at {_mountPoint}.");
+            await first.RestartAsync().ConfigureAwait(true);
+            await UpdateStatusFromManagerAsync();
+            ShowBalloon("Remount complete", $"Drive available at {first.MountPoint}.");
         }
         catch (Exception ex)
         {
@@ -396,32 +269,15 @@ public sealed class TrayAppContext : ApplicationContext
     {
         try
         {
-            _eventLoopCts?.Cancel();
-            _eventLoopCts?.Dispose();
-            _eventLoopCts = null;
-
-            // ADR-018 Step 3: WSS dispose で terminate メッセージを送信。
-            // プロセス終了前に届くよう短時間ブロックする (送信失敗時は KV TTL 30s に委ねる)。
-            if (_eventStream is not null)
+            if (_manager is not null)
             {
-                try { _eventStream.DisposeAsync().AsTask().Wait(TimeSpan.FromSeconds(2)); }
-                catch { /* best-effort */ }
-                _eventStream = null;
+                // 同期的に dispose (ADR-018 Step 3: WSS terminate 送信を待つ短時間 block)
+                _manager.DisposeAsync().AsTask().Wait(TimeSpan.FromSeconds(3));
+                _manager = null;
             }
-
-            _fsHost?.Dispose();
-            _fsHost = null;
-            _server?.Dispose();
         }
         catch { /* ignore shutdown errors */ }
 
         _tray.Visible = false;
-        _tray.Dispose();
-    }
-
-    protected override void Dispose(bool disposing)
-    {
-        if (disposing) Shutdown();
-        base.Dispose(disposing);
     }
 }

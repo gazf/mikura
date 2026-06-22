@@ -23,13 +23,9 @@ internal static class Program
         var store = new ProfileStore();
         TryEnrollFromInits(store);
 
-        var profiles = store.LoadProfiles();
-        // Phase B では「単一 profile (一覧の先頭)」で従来通り動かす compat 経路。
-        // Phase C で ProfileManager + ProfileSession を導入し、Phase D で多重 mount に
-        // 拡張する。
-        var profile = profiles.FirstOrDefault();
-
-        using var context = new TrayAppContext(store, globalSettings, profile);
+        // Phase C: ProfileManager 経由で 1+ 個の profile を起動する。TrayAppContext は
+        // store / globalSettings を渡せば自分で manager を立ち上げる。
+        using var context = new TrayAppContext(store, globalSettings);
         Application.Run(context);
     }
 
