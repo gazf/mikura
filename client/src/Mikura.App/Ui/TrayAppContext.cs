@@ -13,7 +13,12 @@ namespace Mikura.App.Ui;
 
 public sealed class TrayAppContext : ApplicationContext
 {
-    private readonly AppSettings _settings;
+    // Phase B 過渡: 単一 profile を直接保持し、null なら「未設定」表示。
+    // Phase C で ProfileManager に差し替える。
+    private readonly ProfileStore _store;
+    private readonly GlobalSettings _globalSettings;
+    private Profile? _profile;
+    private string? _token;
     private readonly NotifyIcon _tray;
 
     private static readonly TimeSpan WssHeartbeatInterval = TimeSpan.FromSeconds(10);
@@ -34,9 +39,14 @@ public sealed class TrayAppContext : ApplicationContext
     private readonly ToolStripMenuItem _settingsItem;
     private readonly ToolStripMenuItem _resetItem;
 
-    public TrayAppContext(AppSettings settings)
+    public TrayAppContext(
+        ProfileStore store,
+        GlobalSettings globalSettings,
+        Profile? profile)
     {
-        _settings = settings;
+        _store = store;
+        _globalSettings = globalSettings;
+        _profile = profile;
 
         _statusItem = new ToolStripMenuItem("Initializing...") { Enabled = false };
         _openItem = new ToolStripMenuItem("Open sync folder", null, OnOpenFolder);
@@ -116,19 +126,45 @@ public sealed class TrayAppContext : ApplicationContext
 
     private async Task StartAsync()
     {
-        if (!_settings.IsConfigured)
+        if (_profile is null)
         {
-            SetStatus("Not configured");
-            ShowBalloon("Please configure MIKURA", "Right-click the tray icon → Settings.");
-            OnOpenSettings(this, EventArgs.Empty);
-            if (!_settings.IsConfigured) return;
+            SetStatus("No profile");
+            ShowBalloon(
+                "MIKURA: no profile configured",
+                $"Drop *.init.json into '{Path.Combine(AppContext.BaseDirectory, "inits")}' and restart.");
+            return;
         }
 
         try
         {
             SetStatus("Connecting...");
-            _deviceId = DeviceIdProvider.GetOrCreate();
+            _deviceId = DeviceIdProvider.Compute();
             Trace.WriteLine($"Device ID: {_deviceId}");
+
+            // secret.bin を DPAPI 復号して in-memory に展開。失敗 (= 別 user / 別 PC の
+            // file をコピーされた等) なら再 enroll を案内する。
+            try
+            {
+                _token = _store.LoadSecret(_profile.Name);
+            }
+            catch (Exception ex)
+            {
+                Trace.WriteLine($"[ERROR] secret.bin Unprotect failed: {ex.Message}");
+                SetStatus("Re-enrollment required");
+                ShowBalloon(
+                    "MIKURA: token decrypt failed",
+                    "Re-enroll by dropping a new *.init.json file.",
+                    ToolTipIcon.Error);
+                return;
+            }
+            if (string.IsNullOrEmpty(_token))
+            {
+                SetStatus("Re-enrollment required");
+                ShowBalloon(
+                    "MIKURA: missing bearer token",
+                    "secret.bin not found for this profile. Re-enroll.");
+                return;
+            }
 
             // SocketsHttpHandler を明示構成しないと SocketsHttpHandler の既定が
             // PooledConnectionLifetime = Infinite、MaxConnectionsPerServer =
@@ -146,18 +182,18 @@ public sealed class TrayAppContext : ApplicationContext
             };
             var http = new HttpClient(handler);
             http.DefaultRequestHeaders.Authorization =
-                new AuthenticationHeaderValue("Bearer", _settings.BearerToken);
+                new AuthenticationHeaderValue("Bearer", _token);
             http.DefaultRequestHeaders.Add("X-Device-Id", _deviceId);
-            _server = new HttpServerApi(http, _settings.ServerUrl);
+            _server = new HttpServerApi(http, _profile.ServerUrl);
 
             _backend = new FileSystemBackend(_server);
-            Trace.WriteLine($"Initializing backend (server={_settings.ServerUrl})");
+            Trace.WriteLine($"Initializing backend (server={_profile.ServerUrl})");
             await _backend.InitializeAsync().ConfigureAwait(true);
             Trace.WriteLine($"Backend initialized: {_backend.TreeSnapshot.Count} entries cached");
 
             _fsHost = new BackendFileSystemHost(_backend, _onlineGate);
-            Trace.WriteLine($"Mounting at '{_settings.SyncRootPath}'");
-            _mountPoint = _fsHost.Mount(_settings.SyncRootPath);
+            Trace.WriteLine($"Mounting at '{_profile.MountLetter}'");
+            _mountPoint = _fsHost.Mount(_profile.MountLetter);
             Trace.WriteLine($"Mounted at {_mountPoint}");
 
             _syncEngine = new SyncEngine(_backend, _mountPoint, _deviceId,
@@ -165,7 +201,7 @@ public sealed class TrayAppContext : ApplicationContext
             _eventLoopCts = new CancellationTokenSource();
             _ = RunEventLoopWithReconnectAsync(_eventLoopCts.Token);
 
-            SetStatus($"Connected: {_settings.ServerUrl}");
+            SetStatus($"Connected: {_profile.ServerUrl}");
         }
         catch (Exception ex)
         {
@@ -186,7 +222,7 @@ public sealed class TrayAppContext : ApplicationContext
             try
             {
                 var stream = await HttpEventStream.ConnectAsync(
-                    _settings.ServerUrl, _settings.BearerToken, deviceId, ct);
+                    _profile!.ServerUrl, _token!, deviceId, ct);
                 _eventStream = stream;
                 _onlineGate.Set(true);
 
@@ -264,7 +300,7 @@ public sealed class TrayAppContext : ApplicationContext
 
     private void OnOpenFolder(object? sender, EventArgs e)
     {
-        var target = _mountPoint ?? _settings.SyncRootPath;
+        var target = _mountPoint ?? _profile?.MountLetter ?? "(none)";
         if (string.IsNullOrEmpty(target)) return;
         try
         {
@@ -283,7 +319,7 @@ public sealed class TrayAppContext : ApplicationContext
         try
         {
             await _syncEngine.FullSyncAsync(CancellationToken.None);
-            SetStatus($"Connected: {_settings.ServerUrl}");
+            SetStatus($"Connected: {_profile?.ServerUrl ?? "no-profile"}");
         }
         catch (Exception ex)
         {
@@ -294,11 +330,9 @@ public sealed class TrayAppContext : ApplicationContext
 
     private void OnOpenSettings(object? sender, EventArgs e)
     {
-        using var form = new SettingsForm(_settings);
-        if (form.ShowDialog() == DialogResult.OK)
-        {
-            ShowBalloon("Settings saved", "Restart MIKURA to apply changes.");
-        }
+        // Phase B: SettingsForm は profile-aware UI 未完成。情報表示のみ。
+        using var form = new SettingsForm();
+        form.ShowDialog();
     }
 
     /// <summary>
@@ -309,7 +343,7 @@ public sealed class TrayAppContext : ApplicationContext
     private async void OnReset(object? sender, EventArgs e)
     {
         var result = MessageBox.Show(
-            $"Remount the mikura drive at {_mountPoint ?? _settings.SyncRootPath}?\n\nIn-flight handles will fail.",
+            $"Remount the mikura drive at {_mountPoint ?? _profile?.MountLetter ?? "(none)"}?\n\nIn-flight handles will fail.",
             "Remount",
             MessageBoxButtons.OKCancel,
             MessageBoxIcon.Information,
@@ -328,16 +362,21 @@ public sealed class TrayAppContext : ApplicationContext
             _fsHost?.Dispose();
             _fsHost = null;
 
+            if (_profile is null)
+            {
+                SetStatus("No profile");
+                return;
+            }
             await _backend!.InitializeAsync();
             _fsHost = new BackendFileSystemHost(_backend, _onlineGate);
-            _mountPoint = _fsHost.Mount(_settings.SyncRootPath);
+            _mountPoint = _fsHost.Mount(_profile.MountLetter);
 
             _syncEngine = new SyncEngine(_backend, _mountPoint, _deviceId!,
                 notifyKernelCache: _fsHost.NotifyExternalChange);
             _eventLoopCts = new CancellationTokenSource();
             _ = RunEventLoopWithReconnectAsync(_eventLoopCts.Token);
 
-            SetStatus($"Connected: {_settings.ServerUrl}");
+            SetStatus($"Connected: {_profile?.ServerUrl ?? "no-profile"}");
             ShowBalloon("Remount complete", $"Drive available at {_mountPoint}.");
         }
         catch (Exception ex)

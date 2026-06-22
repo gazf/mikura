@@ -1,98 +1,60 @@
 using System;
-using System.IO;
-using System.Reflection;
-using System.Text.Json;
 using Mikura.Core.Identity;
 using Xunit;
 
 namespace Mikura.Core.Tests.Identity;
 
 /// <summary>
-/// DeviceIdProvider の責務:
-///   - 実行ファイル同ディレクトリの device.json を読み書きし、
-///     起動間で同じ deviceId を返す (= 「インストール単位」の永続 ID)。
-///   - 未存在なら新規 UUID を生成して保存する。
-///   - 壊れた JSON は再生成する (例外で落ちない)。
+/// 新 <see cref="DeviceIdProvider"/> の責務:
+///   - MachineGuid + 現 user SID から derive した安定 UUID を返す。
+///   - process 寿命内で同じ ID を返す (cache)。
+///   - 再計算でも同じ値 (deterministic)。
 ///
-/// 注意: AppContext.BaseDirectory は固定なので、テスト用に書き換えできない。
-/// テストでは「実 BaseDirectory に居る device.json を退避 → テスト → 復元」
-/// で隔離する。
+/// Windows 以外では Microsoft.Win32 / WindowsIdentity が
+/// PlatformNotSupportedException を投げるので、OS guard で early return。
+/// Test project は net10.0-windows TFM だが、`dotnet test` を Linux で走らせると
+/// runtime が Linux 扱いになり、Win32 API が落ちる。
 /// </summary>
-public class DeviceIdProviderTests : IDisposable
+public class DeviceIdProviderTests
 {
-    private const string FileName = "device.json";
-    private readonly string _path;
-    private readonly string? _backup;
+    private static bool IsWindows => OperatingSystem.IsWindows();
 
     public DeviceIdProviderTests()
     {
-        _path = Path.Combine(AppContext.BaseDirectory, FileName);
-        if (File.Exists(_path))
-        {
-            _backup = _path + ".test-backup";
-            File.Move(_path, _backup, overwrite: true);
-        }
-    }
-
-    public void Dispose()
-    {
-        if (File.Exists(_path)) File.Delete(_path);
-        if (_backup is not null && File.Exists(_backup))
-            File.Move(_backup, _path, overwrite: true);
+        // 各テスト前に static cache を reset (Compute() の cache が前 test の
+        // 結果を引きずらないように)。
+        DeviceIdProvider._ResetCacheForTesting();
     }
 
     [Fact]
-    public void GetOrCreate_FirstCall_GeneratesAndPersistsUuid()
+    public void Compute_ReturnsValidGuidFormat()
     {
-        Assert.False(File.Exists(_path));
+        if (!IsWindows) return;
 
-        var id = DeviceIdProvider.GetOrCreate();
-
-        Assert.True(File.Exists(_path), "device.json は生成されるべき");
-        Assert.True(Guid.TryParse(id, out _), "deviceId は UUID 形式であるべき");
+        var id = DeviceIdProvider.Compute();
+        Assert.True(Guid.TryParse(id, out _), $"derived ID is not GUID format: {id}");
     }
 
     [Fact]
-    public void GetOrCreate_SubsequentCall_ReturnsSamePersistedId()
+    public void Compute_IsDeterministic()
     {
-        var first = DeviceIdProvider.GetOrCreate();
-        var second = DeviceIdProvider.GetOrCreate();
+        if (!IsWindows) return;
+
+        var first = DeviceIdProvider.Compute();
+        DeviceIdProvider._ResetCacheForTesting();
+        var second = DeviceIdProvider.Compute();
         Assert.Equal(first, second);
     }
 
     [Fact]
-    public void GetOrCreate_AcrossDifferentProcessRuns_ReadsExistingFile()
+    public void Compute_CachedAcrossCalls()
     {
-        // プロセス再起動を模擬: 直接 device.json を書き、Provider が読み出すこと。
-        var preset = Guid.NewGuid().ToString();
-        var json = JsonSerializer.Serialize(new { deviceId = preset, createdAt = DateTime.UtcNow });
-        File.WriteAllText(_path, json);
+        if (!IsWindows) return;
 
-        var id = DeviceIdProvider.GetOrCreate();
-        Assert.Equal(preset, id);
-    }
-
-    [Fact]
-    public void GetOrCreate_CorruptFile_RegeneratesNewId()
-    {
-        File.WriteAllText(_path, "this is not valid JSON ::");
-
-        var id = DeviceIdProvider.GetOrCreate();
-        Assert.True(Guid.TryParse(id, out _), "壊れた JSON でも新 UUID を返すべき");
-
-        // 再生成の結果がディスクにも反映されている
-        var second = DeviceIdProvider.GetOrCreate();
-        Assert.Equal(id, second);
-    }
-
-    [Fact]
-    public void GetOrCreate_EmptyDeviceId_TreatsAsCorruptAndRegenerates()
-    {
-        var json = JsonSerializer.Serialize(new { deviceId = "", createdAt = DateTime.UtcNow });
-        File.WriteAllText(_path, json);
-
-        var id = DeviceIdProvider.GetOrCreate();
-        Assert.False(string.IsNullOrWhiteSpace(id));
-        Assert.True(Guid.TryParse(id, out _));
+        // Reset せずに 2 回呼ぶと、内部 cache 経由で同じ参照値が返る (= deterministic
+        // の subset だが、cache の存在を明示的に固定)。
+        var first = DeviceIdProvider.Compute();
+        var second = DeviceIdProvider.Compute();
+        Assert.Equal(first, second);
     }
 }
