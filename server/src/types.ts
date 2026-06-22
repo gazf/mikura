@@ -21,6 +21,42 @@ export interface TokenData {
   name: string;
   expiresAt: string;
   createdAt: string;
+  /**
+   * Token を発行した enrollment 時点の Device ID。以後の request は X-Device-Id
+   * header がこの値と一致する場合のみ valid と判定する。盗難 secret.bin を
+   * 別 PC (= 別 derived deviceId) で使う攻撃を防ぐための binding。
+   *
+   * 既存 seed (admin) 由来の token は未 bind (= 任意 device で valid) として
+   * undefined を許容する。新規 enrollment 経由で発行される token は必ず
+   * 値を持つ。
+   */
+  boundDeviceId?: string;
+  /**
+   * 直近 successful request の IP / 時刻。盗難検知 (= 短時間で違う IP 等) の
+   * 観測点。throttle 30s で頻繁書込みを抑える。
+   */
+  lastUsedIp?: string;
+  lastUsedAt?: string;
+}
+
+/**
+ * Admin が user に配布する init.json の元になる single-use enrollment secret。
+ * raw secret は admin の手元 (= init.json) と user の client にのみ存在し、
+ * server 側は hash しか持たない (token と同じ流儀)。consume されたら
+ * consumedAt が立ち、二度目の consume は失敗する。
+ */
+export interface EnrollmentSecret {
+  /** SHA256(raw) — KV key の構成要素、検索用にも値側にも入れる */
+  secretHash: string;
+  /** 発行対象の user */
+  userId: number;
+  /** 発行 admin (audit 用) */
+  createdBy: number;
+  createdAt: string;
+  expiresAt: string;
+  /** consume された場合のみ値が入る */
+  consumedAt?: string;
+  consumedByDeviceId?: string;
 }
 
 export interface AuditEntry {

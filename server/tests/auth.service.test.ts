@@ -3,6 +3,7 @@ import {
   checkPermission,
   createAppToken,
   hashToken,
+  revokeToken,
   upsertDevice,
   validateToken,
 } from "../src/services/auth.service.ts";
@@ -152,6 +153,153 @@ Deno.test("upsertDevice: changed ip bypasses throttle and writes immediately", a
 
     const after = await kv.get<DeviceData>(Keys.device("dev-throttle2"));
     assertEquals(after.value?.ipAddress, "10.0.0.1");
+  });
+});
+
+// ----- validateToken deviceId binding -----
+
+async function makeBoundToken(
+  kv: Deno.Kv,
+  userId: number,
+  boundDeviceId: string,
+): Promise<{ raw: string; hash: string }> {
+  // createAppToken は boundDeviceId を設定しないので、直接 KV に書き込む。
+  // enrollment.service.consumeEnrollment と同じ shape を作る。
+  const raw = crypto.randomUUID();
+  const hash = await hashToken(raw);
+  const data: TokenData = {
+    userId,
+    name: "bound-test",
+    expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString(),
+    createdAt: new Date().toISOString(),
+    boundDeviceId,
+  };
+  await kv
+    .atomic()
+    .set(Keys.token(hash), data)
+    .set(Keys.tokenByUser(userId, hash), true)
+    .commit();
+  return { raw, hash };
+}
+
+Deno.test("validateToken: bound token は同 deviceId なら通る", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "alice",
+      groupId: 10,
+      groupName: "alice-g",
+    });
+    const deviceId = "dev-bound-alice-0001-zzzz";
+    const { raw } = await makeBoundToken(kv, 1, deviceId);
+    assertEquals(await validateToken(raw, { deviceId }), {
+      id: 1,
+      name: "alice",
+    });
+  });
+});
+
+Deno.test("validateToken: bound token は別 deviceId だと null", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "alice",
+      groupId: 10,
+      groupName: "alice-g",
+    });
+    const { raw } = await makeBoundToken(kv, 1, "dev-real-pc-0000000001zz");
+    const identity = await validateToken(raw, {
+      deviceId: "dev-attacker-0001-zzzzzzzz",
+    });
+    assertEquals(identity, null);
+  });
+});
+
+Deno.test("validateToken: bound token は deviceId 未指定だと null", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "alice",
+      groupId: 10,
+      groupName: "alice-g",
+    });
+    const { raw } = await makeBoundToken(kv, 1, "dev-real-pc-0000000001zz");
+    // opts 未指定 = deviceId undefined。bound 値 !== undefined なので null。
+    assertEquals(await validateToken(raw), null);
+  });
+});
+
+Deno.test("validateToken: cache hit 経路でも deviceId binding を enforce", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "alice",
+      groupId: 10,
+      groupName: "alice-g",
+    });
+    const realDevice = "dev-cache-alice-0001zzzzz";
+    const { raw } = await makeBoundToken(kv, 1, realDevice);
+    // 1 回目: cache 投入
+    assertEquals(await validateToken(raw, { deviceId: realDevice }), {
+      id: 1,
+      name: "alice",
+    });
+    // 2 回目: cache hit 経路、別 deviceId は弾かれる
+    assertEquals(
+      await validateToken(raw, { deviceId: "dev-other-pc-zzzzzzzzzzzz" }),
+      null,
+    );
+  });
+});
+
+Deno.test("validateToken: unbound (boundDeviceId 未設定) は deviceId 不問で通る", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "alice",
+      groupId: 10,
+      groupName: "alice-g",
+    });
+    // createAppToken は boundDeviceId を設定しない (= 旧 seed 由来 token と等価)
+    const { raw } = await createAppToken(1, "alice");
+    assertEquals(
+      await validateToken(raw, { deviceId: "dev-any-zzzzzzzzzzzzzzzz" }),
+      { id: 1, name: "alice" },
+    );
+    assertEquals(await validateToken(raw), { id: 1, name: "alice" });
+  });
+});
+
+// ----- revokeToken -----
+
+Deno.test("revokeToken: 既存 token を消去 + cache invalidate", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "alice",
+      groupId: 10,
+      groupName: "alice-g",
+    });
+    const { raw, hash } = await createAppToken(1, "alice");
+    // warm cache
+    assertEquals(await validateToken(raw), { id: 1, name: "alice" });
+
+    const ok = await revokeToken(hash);
+    assert(ok);
+    // KV からも消えている
+    const got = await kv.get<TokenData>(Keys.token(hash));
+    assertEquals(got.value, null);
+    const fwd = await kv.get(Keys.tokenByUser(1, hash));
+    assertEquals(fwd.value, null);
+    // cache も invalidate されてる
+    assertEquals(await validateToken(raw), null);
+  });
+});
+
+Deno.test("revokeToken: 存在しない hash は false", async () => {
+  await withTestKv(async (_kv) => {
+    const ok = await revokeToken("0".repeat(64));
+    assertFalse(ok);
   });
 });
 

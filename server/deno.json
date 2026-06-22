@@ -3,6 +3,7 @@
     "dev": "deno run --watch --allow-net --allow-read --allow-write --allow-env --allow-sys=statfs --unstable-kv src/main.ts",
     "test": "deno test --allow-net --allow-read --allow-write --allow-env --allow-sys=statfs --unstable-kv tests/",
     "seed": "deno run --allow-read --allow-write --allow-env --unstable-kv src/kv/seed.ts",
+    "admin": "deno run --allow-net --allow-env --allow-read --allow-write src/cli/admin.ts",
     "bench:micro": "deno bench --allow-env --unstable-kv bench/multipart-parse.bench.ts",
     "bench:loopback": "deno run --allow-net --allow-read --allow-write --allow-env --allow-run --allow-sys=statfs --unstable-kv bench/upload-loopback.ts",
     "bench:start-server": "deno run --allow-all --unstable-kv bench/start-server.ts",

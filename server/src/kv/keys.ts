@@ -16,6 +16,8 @@
  * ["uploads", uploadId]              → UploadSession (ADR-025)
  * ["uploads_by_device", deviceId, uploadId] → null (deviceId 逆引きインデックス)
  * ["counters", entity]               → number (auto-increment)
+ * ["enrollments", secretHash]        → EnrollmentSecret (single-use bootstrap)
+ * ["enrollments_by_user", userId, secretHash] → true (admin が user の outstanding を見るための逆引き)
  */
 
 export const Keys = {
@@ -80,5 +82,15 @@ export const Keys = {
   uploadsByDevicePrefix: (deviceId: string): Deno.KvKey => [
     "uploads_by_device",
     deviceId,
+  ],
+  enrollment: (secretHash: string): Deno.KvKey => ["enrollments", secretHash],
+  enrollmentByUser: (userId: number, secretHash: string): Deno.KvKey => [
+    "enrollments_by_user",
+    userId,
+    secretHash,
+  ],
+  enrollmentsByUserPrefix: (userId: number): Deno.KvKey => [
+    "enrollments_by_user",
+    userId,
   ],
 } as const;

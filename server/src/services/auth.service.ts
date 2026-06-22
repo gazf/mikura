@@ -65,6 +65,11 @@ interface CachedToken {
   identity: TokenIdentity;
   tokenExpiresAtMs: number;
   cacheUntilMs: number;
+  /**
+   * Token に紐付いた device ID。新仕様 (enrollment 経由) の token は必ず値、
+   * 旧 seed 由来 / 既存 token は undefined (= 任意 device で valid)。
+   */
+  boundDeviceId?: string;
 }
 
 const tokenCache = new Map<string, CachedToken>();
@@ -106,6 +111,17 @@ interface DeviceUpsertCacheEntry {
 
 const deviceUpsertCache = new Map<string, DeviceUpsertCacheEntry>();
 
+// Token の lastUsedIp / lastUsedAt update は audit 情報。同じく 30 秒 throttle。
+// (tokenHash, ip) が変わったら throttle を破って即書き込む (= 異 IP は即記録)。
+const TOKEN_LAST_USED_THROTTLE_MS = 30 * 1000;
+
+interface TokenLastUsedCacheEntry {
+  ip?: string;
+  atMs: number;
+}
+
+const tokenLastUsedCache = new Map<string, TokenLastUsedCacheEntry>();
+
 /**
  * テスト間でモジュールレベル cache を漏らさないためのリセット。
  * `_helpers.ts` の withTestKv から呼ばれる。
@@ -113,6 +129,7 @@ const deviceUpsertCache = new Map<string, DeviceUpsertCacheEntry>();
 export function _resetAuthCachesForTesting(): void {
   tokenCache.clear();
   deviceUpsertCache.clear();
+  tokenLastUsedCache.clear();
 }
 
 export async function upsertDevice(
@@ -159,8 +176,25 @@ export async function upsertDevice(
   deviceUpsertCache.set(deviceId, { userId, ipAddress, atMs: now });
 }
 
+export interface ValidateOptions {
+  /**
+   * Request の X-Device-Id header 値。指定された場合、token に紐付いた
+   * `boundDeviceId` と完全一致しないと null 返却 (= 盗難 secret.bin を別端末で
+   * 使う攻撃を防ぐ defense layer)。
+   *
+   * 後方互換: `boundDeviceId` が undefined な token (= 旧 seed admin token) は
+   * device check を skip する。新規 enrollment 由来の token は必ず bound 値を
+   * 持つので、deviceId の指定がないと弾かれる (= production では middleware が
+   * 必ず deviceId を渡す前提)。
+   */
+  deviceId?: string;
+  /** lastUsedIp の throttled update に使う。未指定なら update スキップ。 */
+  ip?: string;
+}
+
 export async function validateToken(
   rawToken: string,
+  opts: ValidateOptions = {},
 ): Promise<TokenIdentity | null> {
   const hash = await hashToken(rawToken);
   const now = Date.now();
@@ -173,6 +207,18 @@ export async function validateToken(
       return null;
     }
     if (cached.cacheUntilMs > now) {
+      // cache hit 経路でも deviceId binding は必ず enforce する (cache の寿命内に
+      // attacker が別 device から叩いてきた場合に素通しさせない)。
+      if (
+        cached.boundDeviceId !== undefined &&
+        cached.boundDeviceId !== opts.deviceId
+      ) {
+        logDeviceMismatch(hash, cached.boundDeviceId, opts.deviceId, opts.ip);
+        return null;
+      }
+      // lastUsedIp/At を背後で throttled update (return は待たない、cache hit 経路の
+      // latency を増やさない)。
+      void maybeUpdateLastUsed(hash, opts.ip, now);
       return cached.identity;
     }
     // 寿命切れ: KV で再検証 (cache は下で put し直す)
@@ -194,6 +240,16 @@ export async function validateToken(
     return null;
   }
 
+  // Device binding check (cache miss 経路)
+  if (
+    tokenData.boundDeviceId !== undefined &&
+    tokenData.boundDeviceId !== opts.deviceId
+  ) {
+    logDeviceMismatch(hash, tokenData.boundDeviceId, opts.deviceId, opts.ip);
+    // cache には put しない (= attacker の hash で cache を warm させない)
+    return null;
+  }
+
   const user = await kv.get<User>(Keys.user(tokenData.userId));
   if (!user.value) {
     tokenCache.delete(hash);
@@ -208,8 +264,90 @@ export async function validateToken(
     identity,
     tokenExpiresAtMs,
     cacheUntilMs: now + TOKEN_CACHE_TTL_MS,
+    boundDeviceId: tokenData.boundDeviceId,
   });
+  void maybeUpdateLastUsed(hash, opts.ip, now);
   return identity;
+}
+
+function logDeviceMismatch(
+  hash: string,
+  bound: string,
+  got: string | undefined,
+  ip?: string,
+): void {
+  // hash と deviceId の先頭だけ出して PII / 完全な token leak を避ける。
+  // 「盗難 secret を別端末で使った」signal なので WARN レベル + audit 連携余地。
+  console.warn(
+    `[auth] token deviceId mismatch hash=${hash.slice(0, 8)} bound=${
+      bound.slice(0, 8)
+    } got=${got?.slice(0, 8) ?? "<none>"} ip=${ip ?? "<unknown>"}`,
+  );
+}
+
+/**
+ * tokenHash, ip ごとに throttled で KV の lastUsedIp / lastUsedAt を更新。
+ * 同 (hash, ip) は 30 秒に 1 回、ip が変わったら即書き込む (= 異常検知の input)。
+ * write 失敗は audit 情報なので silently 握りつぶす (request 全体を落とさない)。
+ *
+ * 注意: atomic.check で versionstamp 一致時のみ書き込む (= 並列 request や
+ * 外部 KV 操作 (revoke, expire 設定変更等) を上書きしない)。失敗時は次回 throttle
+ * 期間外でリトライする機会がある。
+ */
+async function maybeUpdateLastUsed(
+  tokenHash: string,
+  ip: string | undefined,
+  nowMs: number,
+): Promise<void> {
+  const last = tokenLastUsedCache.get(tokenHash);
+  if (
+    last !== undefined &&
+    last.ip === ip &&
+    nowMs - last.atMs < TOKEN_LAST_USED_THROTTLE_MS
+  ) {
+    return;
+  }
+  tokenLastUsedCache.set(tokenHash, { ip, atMs: nowMs });
+
+  try {
+    const kv = await getKv();
+    const entry = await kv.get<TokenData>(Keys.token(tokenHash));
+    if (!entry.value) return; // race で消えた、無視
+    const updated: TokenData = {
+      ...entry.value,
+      lastUsedIp: ip,
+      lastUsedAt: new Date(nowMs).toISOString(),
+    };
+    await kv
+      .atomic()
+      .check({ key: Keys.token(tokenHash), versionstamp: entry.versionstamp })
+      .set(Keys.token(tokenHash), updated)
+      .commit();
+    // commit fail は他経路 (revoke / 直接書換) が先勝、無視で OK。
+  } catch (err) {
+    console.error("maybeUpdateLastUsed failed:", err);
+  }
+}
+
+/**
+ * Token revoke の hook。memory cache を invalidate + KV から削除。
+ * 戻り値: KV に entry があり削除したなら true、そもそも無かったら false。
+ */
+export async function revokeToken(tokenHash: string): Promise<boolean> {
+  const kv = await getKv();
+  const entry = await kv.get<TokenData>(Keys.token(tokenHash));
+  if (!entry.value) {
+    invalidateToken(tokenHash);
+    return false;
+  }
+  await kv
+    .atomic()
+    .delete(Keys.token(tokenHash))
+    .delete(Keys.tokenByUser(entry.value.userId, tokenHash))
+    .commit();
+  invalidateToken(tokenHash);
+  tokenLastUsedCache.delete(tokenHash);
+  return true;
 }
 
 export async function createAppToken(
@@ -308,7 +446,7 @@ export class PermissionContext {
 export async function checkPermission(
   userId: number,
   path: string,
-  requiredLevel: "read" | "write",
+  requiredLevel: "read" | "write" | "admin",
   ctx?: PermissionContext,
 ): Promise<boolean> {
   // ctx 無しの呼び出しは「1 回限りの check」として one-shot context を生成する
@@ -341,7 +479,11 @@ export async function checkPermission(
   return false;
 }
 
-function hasAccess(granted: AccessLevel, required: "read" | "write"): boolean {
+function hasAccess(
+  granted: AccessLevel,
+  required: "read" | "write" | "admin",
+): boolean {
+  if (required === "admin") return granted === "admin";
   if (granted === "admin") return true;
   if (granted === "write") return true;
   if (granted === "read" && required === "read") return true;
