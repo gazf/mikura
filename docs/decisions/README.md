@@ -36,3 +36,5 @@ Each ADR is split into its own file.
 | ADR-030 | [WriteCoalescer ArrayPool selection — adopting bounded `maxArraysPerBucket=16`](ADR-030-writecoalescer-arraypool-selection-adopting-bounde.md) |
 | ADR-031 | [Per-handle read-ahead prefetch cache for the read path (Samba-style next-sequential)](ADR-031-per-handle-read-ahead-prefetch-cache-for-the-read.md) |
 | ADR-032 | [Replacing the WinFsp .NET binding with an in-house modern P/Invoke binding](ADR-032-replacing-the-winfsp-net-binding-with-an-in-house.md) |
+| ADR-033 | [Admin console as a separate BFF process (`console/`)](ADR-033-admin-console-as-a-separate-bff-process.md) |
+| ADR-034 | [Enrollment handoff via a `mikura://` URI instead of an `init.json` file](ADR-034-enrollment-handoff-via-mikura-uri-instead-of-init.md) |

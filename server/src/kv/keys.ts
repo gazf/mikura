@@ -36,6 +36,8 @@ export const Keys = {
     groupId,
   ],
   permissionsPrefix: (path: string): Deno.KvKey => ["permissions", path],
+  /** 全 path 分の permission を舐める (admin console の権限マトリクス用)。 */
+  permissionsAllPrefix: (): Deno.KvKey => ["permissions"],
   token: (tokenHash: string): Deno.KvKey => ["tokens", tokenHash],
   tokenByUser: (userId: number, tokenHash: string): Deno.KvKey => [
     "tokens_by_user",
@@ -46,6 +48,9 @@ export const Keys = {
     "tokens_by_user",
     userId,
   ],
+  /** 全 user 分の token を舐める。prefix は key part 単位の一致なので
+   * "tokens_by_user" は引っ掛からない。 */
+  tokensAllPrefix: (): Deno.KvKey => ["tokens"],
   audit: (timestamp: string, id: number): Deno.KvKey => [
     "audit",
     timestamp,
@@ -63,6 +68,8 @@ export const Keys = {
     "devices_by_user",
     userId,
   ],
+  /** 全 user 分の device を舐める。 */
+  devicesAllPrefix: (): Deno.KvKey => ["devices"],
   deviceLock: (deviceId: string, path: string): Deno.KvKey => [
     "device_locks",
     deviceId,
@@ -93,4 +100,6 @@ export const Keys = {
     "enrollments_by_user",
     userId,
   ],
+  /** 全 user 分の enrollment を舐める (未消費の招待一覧用)。 */
+  enrollmentsAllPrefix: (): Deno.KvKey => ["enrollments"],
 } as const;

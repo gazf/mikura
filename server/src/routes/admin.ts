@@ -27,8 +27,11 @@ import {
 } from "../services/enrollment.service.ts";
 import { getKv } from "../kv/store.ts";
 import { Keys } from "../kv/keys.ts";
+import { buildEnrollUrl, getPublicBaseUrl } from "../util/enrollUrl.ts";
 import type {
   AccessLevel,
+  AuditEntry,
+  DeviceData,
   EnrollmentSecret,
   Group,
   Permission,
@@ -75,6 +78,26 @@ const VALID_ACCESS_LEVELS: ReadonlySet<AccessLevel> = new Set([
 
 function isValidAccessLevel(v: unknown): v is AccessLevel {
   return typeof v === "string" && VALID_ACCESS_LEVELS.has(v as AccessLevel);
+}
+
+/**
+ * 「省略可能な `userId` query」を解釈する。console の一覧画面は全件を、
+ * user 詳細画面は絞り込みを要求するので、同じ endpoint で両方を賄う。
+ *
+ * 未指定 (`undefined`) と不正値 (`"abc"`) を区別するのが要点 — 後者を
+ * 「全件」に倒すと、typo が静かに全件表示になってしまう。
+ */
+function parseOptionalUserId(
+  raw: string | undefined,
+):
+  | { ok: true; userId: number | undefined }
+  | { ok: false; message: string } {
+  if (raw === undefined || raw === "") return { ok: true, userId: undefined };
+  const userId = parseInt(raw, 10);
+  if (!Number.isFinite(userId)) {
+    return { ok: false, message: "userId query must be a number if present" };
+  }
+  return { ok: true, userId };
 }
 
 /** Path validation: file.service.resolveAndValidate の subset (= 文字列のみ)。 */
@@ -336,6 +359,36 @@ export function registerAdminRoutes(app: Hono<Env>) {
     return c.json({ userId, groupId }, 201);
   });
 
+  /**
+   * user の所属グループ一覧。`GET /admin/users/:id` は id / name / createdAt
+   * しか返さないので、console の user 詳細画面はこちらを併せて叩く。
+   *
+   * group name まで解決して返す: 呼び出し側で group 一覧と突き合わせるのは
+   * 毎画面で同じ join を書くことになるし、削除済み group id が membership に
+   * 残っていた場合の扱いもここで一箇所に閉じられる (= name を null にする)。
+   */
+  app.get("/admin/user-groups/:userId", async (c) => {
+    const user = c.get("user");
+    const permCtx = c.get("permCtx");
+    const auth = await requireAdmin(user, permCtx);
+    if (!auth.ok) return c.json({ message: "Forbidden" }, auth.status);
+
+    const userId = parseInt(c.req.param("userId"), 10);
+    if (!Number.isFinite(userId)) return c.json({ message: "Invalid id" }, 400);
+
+    const kv = await getKv();
+    const memberships: Array<{ groupId: number; groupName: string | null }> =
+      [];
+    for await (
+      const e of kv.list<true>({ prefix: Keys.userGroupsPrefix(userId) })
+    ) {
+      const groupId = e.key[2] as number;
+      const g = await kv.get<Group>(Keys.group(groupId));
+      memberships.push({ groupId, groupName: g.value?.name ?? null });
+    }
+    return c.json(memberships);
+  });
+
   app.delete("/admin/user-groups/:userId/:groupId", async (c) => {
     const user = c.get("user");
     const permCtx = c.get("permCtx");
@@ -353,6 +406,45 @@ export function registerAdminRoutes(app: Hono<Env>) {
   });
 
   // ---- Permissions ----
+
+  /**
+   * Permission の読み出し。従来 PUT / DELETE しか無く、設定済みの権限を
+   * 一覧する経路が存在しなかった (= console の権限マトリクスが作れない)。
+   *
+   * `path` query を渡せばその path のみ、省略すれば全 path 分を返す。
+   * key layout は ["permissions", path, groupId] なので、どちらも prefix
+   * scan 1 回で済む。
+   */
+  app.get("/admin/permissions", async (c) => {
+    const user = c.get("user");
+    const permCtx = c.get("permCtx");
+    const auth = await requireAdmin(user, permCtx);
+    if (!auth.ok) return c.json({ message: "Forbidden" }, auth.status);
+
+    const path = c.req.query("path");
+    if (path !== undefined && !isValidPath(path)) {
+      return c.json(
+        { message: "path query must be absolute (no .. / null)" },
+        400,
+      );
+    }
+    const prefix = path !== undefined
+      ? Keys.permissionsPrefix(path)
+      : Keys.permissionsAllPrefix();
+
+    const kv = await getKv();
+    const perms: Array<
+      { path: string; groupId: number; accessLevel: AccessLevel }
+    > = [];
+    for await (const e of kv.list<Permission>({ prefix })) {
+      perms.push({
+        path: e.key[1] as string,
+        groupId: e.key[2] as number,
+        accessLevel: e.value.accessLevel,
+      });
+    }
+    return c.json(perms);
+  });
 
   app.put("/admin/permissions", async (c) => {
     const user = c.get("user");
@@ -446,6 +538,9 @@ export function registerAdminRoutes(app: Hono<Env>) {
         secret: result.raw,
         secretHash: result.secretHash,
         expiresAt: result.expiresAt,
+        // ADR-034: 配布物を 1 本の URI にする。MIKURA_PUBLIC_URL 未設定時は
+        // null (= 推測した URL を配るくらいなら console 側で気付かせる)。
+        enrollUrl: buildEnrollUrl(getPublicBaseUrl(), result.raw),
       }, 201);
     } catch (e) {
       if (e instanceof Error && e.message === "user_not_found") {
@@ -455,18 +550,33 @@ export function registerAdminRoutes(app: Hono<Env>) {
     }
   });
 
+  /**
+   * `userId` query は **任意**。省略時は全 user 分を返す (= console の
+   * 「未消費の招待一覧」画面用)。指定時は従来通り該当 user のみ。
+   */
   app.get("/admin/enrollments", async (c) => {
     const user = c.get("user");
     const permCtx = c.get("permCtx");
     const auth = await requireAdmin(user, permCtx);
     if (!auth.ok) return c.json({ message: "Forbidden" }, auth.status);
 
-    const userIdStr = c.req.query("userId");
-    const userId = parseInt(userIdStr ?? "", 10);
-    if (!Number.isFinite(userId)) {
-      return c.json({ message: "userId query required (number)" }, 400);
+    const scope = parseOptionalUserId(c.req.query("userId"));
+    if (!scope.ok) return c.json({ message: scope.message }, 400);
+
+    let list: EnrollmentSecret[];
+    if (scope.userId !== undefined) {
+      list = await listEnrollmentsByUser(scope.userId);
+    } else {
+      const kv = await getKv();
+      list = [];
+      for await (
+        const e of kv.list<EnrollmentSecret>({
+          prefix: Keys.enrollmentsAllPrefix(),
+        })
+      ) {
+        list.push(e.value);
+      }
     }
-    const list = await listEnrollmentsByUser(userId);
     // raw secret は server に存在しないので、metadata だけ返す。
     return c.json(list.map((e: EnrollmentSecret) => ({
       secretHash: e.secretHash,
@@ -481,25 +591,35 @@ export function registerAdminRoutes(app: Hono<Env>) {
 
   // ---- Tokens ----
 
+  /** `userId` query は任意。省略時は全 user 分 (= console のトークン一覧)。 */
   app.get("/admin/tokens", async (c) => {
     const user = c.get("user");
     const permCtx = c.get("permCtx");
     const auth = await requireAdmin(user, permCtx);
     if (!auth.ok) return c.json({ message: "Forbidden" }, auth.status);
 
-    const userIdStr = c.req.query("userId");
-    const userId = parseInt(userIdStr ?? "", 10);
-    if (!Number.isFinite(userId)) {
-      return c.json({ message: "userId query required (number)" }, 400);
-    }
+    const scope = parseOptionalUserId(c.req.query("userId"));
+    if (!scope.ok) return c.json({ message: scope.message }, 400);
+
     const kv = await getKv();
     const tokens: Array<TokenData & { tokenHash: string }> = [];
-    for await (
-      const e of kv.list<true>({ prefix: Keys.tokensByUserPrefix(userId) })
-    ) {
-      const hash = e.key[2] as string;
-      const got = await kv.get<TokenData>(Keys.token(hash));
-      if (got.value) tokens.push({ ...got.value, tokenHash: hash });
+    if (scope.userId !== undefined) {
+      for await (
+        const e of kv.list<true>({
+          prefix: Keys.tokensByUserPrefix(scope.userId),
+        })
+      ) {
+        const hash = e.key[2] as string;
+        const got = await kv.get<TokenData>(Keys.token(hash));
+        if (got.value) tokens.push({ ...got.value, tokenHash: hash });
+      }
+    } else {
+      // 全件は ["tokens", hash] を直接舐める (逆引き index 経由の N+1 を回避)。
+      for await (
+        const e of kv.list<TokenData>({ prefix: Keys.tokensAllPrefix() })
+      ) {
+        tokens.push({ ...e.value, tokenHash: e.key[1] as string });
+      }
     }
     // raw token は返さない (hash と metadata のみ)。
     return c.json(tokens);
@@ -517,5 +637,82 @@ export function registerAdminRoutes(app: Hono<Env>) {
     }
     const ok = await revokeToken(tokenHash);
     return c.json({ revoked: ok });
+  });
+
+  // ---- Devices ----
+
+  /**
+   * `authMiddleware` の `upsertDevice` が書いている device registry の読み出し。
+   * 書く経路だけあって読む経路が無かった。console の「このユーザーがどの端末
+   * から繋いでいるか」画面用。
+   *
+   * `userId` query は任意 (省略時は全件)。
+   */
+  app.get("/admin/devices", async (c) => {
+    const user = c.get("user");
+    const permCtx = c.get("permCtx");
+    const auth = await requireAdmin(user, permCtx);
+    if (!auth.ok) return c.json({ message: "Forbidden" }, auth.status);
+
+    const scope = parseOptionalUserId(c.req.query("userId"));
+    if (!scope.ok) return c.json({ message: scope.message }, 400);
+
+    const kv = await getKv();
+    const devices: DeviceData[] = [];
+    if (scope.userId !== undefined) {
+      for await (
+        const e of kv.list<true>({
+          prefix: Keys.devicesByUserPrefix(scope.userId),
+        })
+      ) {
+        const deviceId = e.key[2] as string;
+        const got = await kv.get<DeviceData>(Keys.device(deviceId));
+        if (got.value) devices.push(got.value);
+      }
+    } else {
+      for await (
+        const e of kv.list<DeviceData>({ prefix: Keys.devicesAllPrefix() })
+      ) {
+        devices.push(e.value);
+      }
+    }
+    return c.json(devices);
+  });
+
+  // ---- Audit ----
+
+  /**
+   * 監査ログの読み出し。key が ["audit", ISO timestamp, id] で、ISO 文字列は
+   * 辞書順 = 時系列順なので、`reverse: true` がそのまま「新しい順」になる。
+   *
+   * `limit` は既定 100 / 上限 1000。audit は現状 TTL を持たず単調増加する
+   * ので、全件返す経路は最初から作らない。
+   */
+  app.get("/admin/audit", async (c) => {
+    const user = c.get("user");
+    const permCtx = c.get("permCtx");
+    const auth = await requireAdmin(user, permCtx);
+    if (!auth.ok) return c.json({ message: "Forbidden" }, auth.status);
+
+    const limitStr = c.req.query("limit");
+    let limit = 100;
+    if (limitStr !== undefined && limitStr !== "") {
+      limit = parseInt(limitStr, 10);
+      if (!Number.isFinite(limit) || limit < 1 || limit > 1000) {
+        return c.json({ message: "limit must be 1..1000" }, 400);
+      }
+    }
+
+    const kv = await getKv();
+    const entries: Array<AuditEntry & { timestamp: string }> = [];
+    for await (
+      const e of kv.list<AuditEntry>(
+        { prefix: Keys.auditPrefix() },
+        { reverse: true, limit },
+      )
+    ) {
+      entries.push({ ...e.value, timestamp: e.key[1] as string });
+    }
+    return c.json(entries);
   });
 }
