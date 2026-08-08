@@ -4,6 +4,7 @@ using Mikura.App.Config;
 using Mikura.App.Enrollment;
 using Mikura.App.Ui;
 using Mikura.App.Util;
+using Mikura.Core.Enrollment;
 
 namespace Mikura.App;
 
@@ -12,21 +13,58 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        // ADR-034: mikura:// リンクのクリックはそのたびに新しいプロセスを起動する。
+        // tray アプリはドライブをマウントするので、二重起動を許すと同じレターを
+        // 取り合って壊れる。後発プロセスは引数を先発に渡して即座に終了する。
+        using var instance = SingleInstance.Acquire();
+        var invitationArg = FindInvitationArgument(args);
+
+        if (!instance.IsPrimary)
+        {
+            if (invitationArg is not null)
+            {
+                SingleInstance.TrySendToPrimary(invitationArg);
+            }
+            return;
+        }
+
         FileLogger.Initialize();
 
         ApplicationConfiguration.Initialize();
 
-        // Phase B: 起動時に inits/*.init.json を scan して enrollment を試みる。
-        // 既存 profile はそのまま、新規 profile があれば profiles/ 配下に追加される。
-        // ProfileStore + GlobalSettings は新 layout (= profile per dir) を使う。
+        // 起動時に inits/*.init.json を scan して enrollment を試みる (ヘッドレス /
+        // 大量展開用の経路)。既存 profile はそのまま、新規があれば追加される。
         var globalSettings = GlobalSettings.Load();
         var store = new ProfileStore();
         TryEnrollFromInits(store);
 
-        // Phase C: ProfileManager 経由で 1+ 個の profile を起動する。TrayAppContext は
-        // store / globalSettings を渡せば自分で manager を立ち上げる。
-        using var context = new TrayAppContext(store, globalSettings);
+        if (OperatingSystem.IsWindows())
+        {
+            UriSchemeRegistrar.TryRegister(Environment.ProcessPath ?? Application.ExecutablePath);
+        }
+
+        using var context = new TrayAppContext(store, globalSettings)
+        {
+            PendingInvitationText = invitationArg,
+        };
+        instance.StartListening(context.HandleActivationPayload);
         Application.Run(context);
+    }
+
+    /// <summary>
+    /// argv から招待リンクを拾う。
+    /// </summary>
+    /// <remarks>
+    /// protocol handler 経由では argv[0] に URI が入るが、位置に依存させない —
+    /// ショートカットに他の引数が付いている環境で壊れないようにする。
+    /// ここでは形式検証まではせず、scheme 一致だけを見る (中身の妥当性は
+    /// ダイアログ側で判定して、理由を user に見せる)。
+    /// </remarks>
+    private static string? FindInvitationArgument(string[] args)
+    {
+        var prefix = $"{EnrollmentInvitation.UriScheme}:";
+        return args.FirstOrDefault(a =>
+            a.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
     }
 
     private static void TryEnrollFromInits(ProfileStore store)

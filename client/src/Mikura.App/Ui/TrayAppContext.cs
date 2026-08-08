@@ -4,6 +4,7 @@ using System.Windows.Forms;
 using Mikura.App.Config;
 using Mikura.App.Enrollment;
 using Mikura.App.Profiles;
+using Mikura.Core.Enrollment;
 using Mikura.Core.Identity;
 
 namespace Mikura.App.Ui;
@@ -27,14 +28,31 @@ public sealed class TrayAppContext : ApplicationContext
     private readonly ToolStripMenuItem _addProfileItem;
     private readonly ToolStripMenuItem _settingsItem;
 
+    /// <summary>
+    /// UI スレッドへの marshal 用。<see cref="NotifyIcon"/> は Control ではなく
+    /// Invoke を持たないので、ハンドルを持つ不可視 Control を 1 つ立てておく。
+    /// </summary>
+    private readonly Control _marshaller;
+
+    /// <summary>
+    /// 起動引数で渡された mikura:// リンク。初期化完了後にダイアログを開く。
+    /// </summary>
+    public string? PendingInvitationText { get; init; }
+
     public TrayAppContext(ProfileStore store, GlobalSettings globalSettings)
     {
         _store = store;
         _globalSettings = globalSettings;
 
+        _marshaller = new Control();
+        // Handle を触ることで、この (= UI) スレッド上でウィンドウハンドルを
+        // 確定させる。CreateControl() は非表示・親なしのコントロールでは
+        // ハンドルを作らないので、BeginInvoke の marshal 先にならない。
+        _ = _marshaller.Handle;
+
         _statusItem = new ToolStripMenuItem("Initializing...") { Enabled = false };
         _profilesItem = new ToolStripMenuItem("Profiles");
-        _addProfileItem = new ToolStripMenuItem("Add Profile...", null, OnAddProfile);
+        _addProfileItem = new ToolStripMenuItem("プロファイルを追加...", null, OnAddProfile);
         _settingsItem = new ToolStripMenuItem("Settings...", null, OnOpenSettings);
 
         _menu = new ContextMenuStrip();
@@ -116,11 +134,17 @@ public sealed class TrayAppContext : ApplicationContext
             RefreshProfilesMenu();
             UpdateAggregateStatus();
 
-            if (_manager.Sessions.Count == 0)
+            // mikura:// リンクから起動された場合は、マウントが落ち着いてから
+            // ダイアログを出す (ドライブレター候補が確定した状態で見せるため)。
+            if (!string.IsNullOrWhiteSpace(PendingInvitationText))
+            {
+                await ShowAddProfileAsync(PendingInvitationText).ConfigureAwait(true);
+            }
+            else if (_manager.Sessions.Count == 0)
             {
                 ShowBalloon(
-                    "MIKURA: no profile configured",
-                    $"Use 'Add Profile...' menu or drop *.init.json into '{Path.Combine(AppContext.BaseDirectory, "inits")}'.");
+                    "MIKURA: プロファイル未設定",
+                    "メニューの「プロファイルを追加」から、管理者に発行してもらった招待リンクを貼り付けてください。");
             }
         }
         catch (Exception ex)
@@ -276,76 +300,69 @@ public sealed class TrayAppContext : ApplicationContext
     }
 
     /// <summary>
-    /// init.json file を選択 → POST /enroll → ProfileManager に登録。
-    /// 多 profile 中の操作経路として scope された scanner (inits/ dir 一括ではなく
-    /// 単一 file 直接) を使う。
+    /// 招待リンクを貼り付け → POST /enroll → ProfileManager に登録。
     /// </summary>
-    private async void OnAddProfile(object? sender, EventArgs e)
+    /// <remarks>
+    /// ADR-034: 入口はファイル選択ではなく貼り付け 1 欄。ダイアログ側で招待の
+    /// 形式検証とドライブレター選択まで済ませてから、ここで実際に enrollment を
+    /// 走らせる。失敗理由は balloon に出す (従来は inits/failed/ に黙って
+    /// 移動するだけで user からは見えなかった)。
+    /// </remarks>
+    private void OnAddProfile(object? sender, EventArgs e) => _ = ShowAddProfileAsync(null);
+
+    /// <summary>
+    /// mikura:// リンクのクリックで後発プロセスから渡された引数を処理する。
+    /// パイプのスレッドから呼ばれるので、UI スレッドへ marshal する。
+    /// </summary>
+    public void HandleActivationPayload(string payload)
     {
-        if (_manager is null) return;
-        using var dialog = new OpenFileDialog
-        {
-            Title = "Select init.json from admin",
-            Filter = "init.json (*.json)|*.json|All files|*.*",
-        };
-        if (dialog.ShowDialog() != DialogResult.OK) return;
-
-        var sourcePath = dialog.FileName;
-        var initsDir = Path.Combine(AppContext.BaseDirectory, "inits");
-        Directory.CreateDirectory(initsDir);
-
-        // EnrollmentScanner は inits/ 配下を scan する想定なので、選択した file を
-        // 一旦 inits/ 直下に copy してから scan を回す。成功すれば scanner が
-        // file 自体を削除する。
-        var destFile = Path.Combine(initsDir,
-            $"{Path.GetFileNameWithoutExtension(sourcePath)}.{Guid.NewGuid():N}.init.json");
+        if (string.IsNullOrWhiteSpace(payload)) return;
         try
         {
-            File.Copy(sourcePath, destFile);
+            _marshaller.BeginInvoke(() => _ = ShowAddProfileAsync(payload));
         }
         catch (Exception ex)
         {
-            ShowBalloon("Add Profile failed", ex.Message, ToolTipIcon.Error);
-            return;
+            Trace.WriteLine($"[Tray] activation payload dropped: {ex.Message}");
+        }
+    }
+
+    private async Task ShowAddProfileAsync(string? prefill)
+    {
+        if (_manager is null) return;
+
+        var reserved = _store.LoadProfiles().Select(p => p.MountLetter).ToArray();
+        EnrollmentInvitation invitation;
+        string? mountLetter;
+        using (var dialog = new AddProfileForm(reserved, prefill))
+        {
+            if (dialog.ShowDialog() != DialogResult.OK || dialog.Invitation is null)
+            {
+                return;
+            }
+            invitation = dialog.Invitation;
+            mountLetter = dialog.MountLetter;
         }
 
         try
         {
-            using var http = new HttpClient
-            {
-                Timeout = TimeSpan.FromSeconds(15),
-            };
-            var scanner = new EnrollmentScanner(_store, http);
-            var created = await scanner.ScanAndEnrollAsync().ConfigureAwait(true);
-            if (created == 0)
-            {
-                ShowBalloon("Add Profile",
-                    "No new profile created. See inits/failed/ for details.",
-                    ToolTipIcon.Warning);
-                return;
-            }
+            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
+            var client = new EnrollmentClient(_store, http);
+            var profile = await client
+                .EnrollAsync(invitation, mountLetter)
+                .ConfigureAwait(true);
 
-            // 新規 profile が ProfileStore に乗ったので、まだ session 化されていない
-            // ものを spawn する。
-            var existing = _manager.Sessions.Select(s => s.Profile.Name).ToHashSet();
-            foreach (var profile in _store.LoadProfiles())
-            {
-                if (existing.Contains(profile.Name)) continue;
-                // token は store に保存済み、AddAndStart は保存も含むので
-                // 既に保存済みなら overwrite される (= idempotent)。代わりに
-                // session だけ立ち上げる経路として、LoadAndStartAll を再実行する。
-            }
-            // 簡単化: scanner 完了後に LoadAndStartAll を再実行 (= 既存 session は
-            // 重複 add で skip される、新規だけ追加される)。
+            // 新規 profile は store に乗っているので、LoadAndStartAll を再実行して
+            // session だけ立ち上げる (既存 session は重複 add で skip される)。
             await _manager.LoadAndStartAllAsync(OnSessionAdded).ConfigureAwait(true);
             RefreshProfilesMenu();
             UpdateAggregateStatus();
-            ShowBalloon("Add Profile",
-                $"{created} profile(s) enrolled and mounted.");
+            ShowBalloon("プロファイルを追加しました",
+                $"{profile.Name} を {profile.MountLetter} にマウントしました。");
         }
         catch (Exception ex)
         {
-            ShowBalloon("Add Profile failed", ex.Message, ToolTipIcon.Error);
+            ShowBalloon("プロファイルの追加に失敗しました", ex.Message, ToolTipIcon.Error);
         }
     }
 
@@ -400,5 +417,6 @@ public sealed class TrayAppContext : ApplicationContext
         catch { /* ignore shutdown errors */ }
 
         _tray.Visible = false;
+        _marshaller.Dispose();
     }
 }

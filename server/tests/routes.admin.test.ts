@@ -646,3 +646,40 @@ Deno.test("POST /admin/enrollments: MIKURA_PUBLIC_URL 未設定なら enrollUrl 
     }
   });
 });
+
+// ---- whoami (console login の入口) ----
+
+Deno.test("GET /admin/whoami: 呼び出し元の identity を返す", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    const res = await app.fetch(
+      req("GET", "/admin/whoami", adminToken, ADMIN_DEVICE),
+    );
+    assertEquals(res.status, 200);
+    assertEquals(await res.json(), {
+      id: 1,
+      name: "admin",
+      deviceId: ADMIN_DEVICE,
+    });
+  });
+});
+
+Deno.test("GET /admin/whoami: admin でなければ 403 (console はここで弾く)", async () => {
+  await withTestKv(async (kv) => {
+    const { nonAdminToken } = await setup(kv);
+    const res = await app.fetch(
+      req("GET", "/admin/whoami", nonAdminToken, NON_ADMIN_DEVICE),
+    );
+    assertEquals(res.status, 403);
+  });
+});
+
+Deno.test("GET /admin/whoami: 無効な token は 401", async () => {
+  await withTestKv(async (kv) => {
+    await setup(kv);
+    const res = await app.fetch(
+      req("GET", "/admin/whoami", "not-a-real-token", ADMIN_DEVICE),
+    );
+    assertEquals(res.status, 401);
+  });
+});

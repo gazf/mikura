@@ -28,6 +28,9 @@ mikura server (Deno + Hono + Deno KV)
   ├─ Range PATCH ベースの chunked upload セッション (ADR-025)
   ├─ ファイルロック管理 (ADR-018: TTL 30s + WSS heartbeat 10s)
   └─ イベント配信 (API-driven broadcast)
+
+mikura console (Deno + Hono、別プロセス / 既定は起動しない)
+  └─ 管理画面。KV には触れず `/admin/*` を HTTP で叩く BFF (ADR-033)
 ```
 
 - **読み取り**: per-IRP byte-range fetch (`GET /content` + `Range:` ヘッダ)
@@ -60,6 +63,41 @@ deno task test   # テスト
 - `data/` — 確定済みファイルツリー (`MIKURA_DATA_ROOT`)
 - `staging/` — chunked upload セッションの中間置き場 (`MIKURA_STAGING_ROOT`)、finalize で `data/` に rename(2)
 
+### 管理コンソール (任意 / 管理作業をするときだけ起動)
+
+```bash
+cd console
+MIKURA_API_URL=http://127.0.0.1:8700 deno task dev
+# → http://127.0.0.1:8701/console/
+```
+
+ユーザー・グループ・権限・招待・端末・監査ログをブラウザから操作できます。
+ログインには管理トークンを貼り付けます (`cd server && deno task seed` の出力、
+または `deno run --allow-all --unstable-kv issue-token.ts` で再発行)。
+
+設計上の性質 (ADR-033):
+
+- API サーバとは**別プロセス**。既定で loopback にしか bind しないので、
+  外から見えるポートには一切現れません。リモートから使うときは SSH
+  ポートフォワード等を経由してください。
+- Deno KV もデータルートも開きません。パーミッション (`--unstable-kv` なし、
+  書き込み権限なし) でそれが強制されています。
+- 管理トークンは console プロセスのメモリにしか置かれず、ブラウザにも
+  ディスクにも出ません。console を止めれば攻撃面はゼロになります。
+
+| 環境変数 | 既定 | 意味 |
+| --- | --- | --- |
+| `MIKURA_API_URL` | `http://127.0.0.1:8700` | API サーバの内部アドレス |
+| `MIKURA_CONSOLE_HOST` | `127.0.0.1` | bind 先 |
+| `MIKURA_CONSOLE_PORT` | `8701` | listen ポート |
+| `MIKURA_CONSOLE_COOKIE_SECURE` | `false` | TLS の後ろに置くなら `true` |
+| `MIKURA_CONSOLE_SESSION_IDLE_MINUTES` | `30` | 無操作でセッション破棄 |
+| `MIKURA_CONSOLE_SESSION_MAX_HOURS` | `8` | セッションの絶対寿命 |
+
+招待リンクを発行するには、**API サーバ側**に `MIKURA_PUBLIC_URL`
+(クライアントから到達できる URL) を設定してください。未設定の場合はシークレット
+のみ表示され、そのまま配れるリンクは作られません (ADR-034)。
+
 ### クライアント (Windows)
 
 ```bash
@@ -68,8 +106,17 @@ dotnet build
 dotnet run --project src/Mikura.App
 ```
 
-設定で `Sync Root` にドライブ文字 (例 `Z:`) を入れると、その文字でマウントされます。
+初回はタスクトレイの「プロファイルを追加」から、管理者に発行してもらった
+招待リンク (`mikura://enroll?...`) を貼り付けます。クリップボードにリンクが
+入っていれば自動で埋まります。マウント先のドライブ文字は空いているものから
+選べます。
+
+`mikura://` はクライアント起動時に現在のユーザーへ関連付けられるので、
+チャット等で送られたリンクをクリックするだけでも追加できます (管理者権限不要)。
 Device ID は `device.json` に永続化されます (実行ファイル隣)。
+
+多数の端末に一括展開する場合は、`inits/` に `*.init.json` を置く従来の経路も
+そのまま使えます。
 
 ## ドキュメント
 

@@ -1,6 +1,6 @@
 ## ADR-034: Enrollment handoff via a `mikura://` URI instead of an `init.json` file
 
-**Decision**: Replace the `init.json` file as the primary enrollment artifact with a **single `mikura://enroll?...` URI** that carries both the server URL and the enrollment secret. The console displays it as copyable text and as a QR code; the client accepts it by paste in a one-field dialog, and — once the URI scheme is registered — by clicking the link directly. The file-drop path (`inits/*.init.json`) is retained for headless and bulk provisioning. The enrollment secret itself is **not** shortened.
+**Decision**: Replace the `init.json` file as the primary enrollment artifact with a **single `mikura://enroll?...` URI** that carries both the server URL and the enrollment secret. The console displays it as copyable text; the client accepts it by paste in a one-field dialog, and by clicking the link directly once the URI scheme is registered. The file-drop path (`inits/*.init.json`) is retained for headless and bulk provisioning. The enrollment secret itself is **not** shortened.
 
 ### Background
 
@@ -39,7 +39,7 @@ When `MIKURA_PUBLIC_URL` is not configured, `enrollUrl` is `null` rather than a 
 
 A shorter, hand-typeable code (roughly 12 base32 characters) was considered so that the invitation could be dictated verbally. It is rejected for now:
 
-- Paste and click are the primary paths. Hand-typing is a fallback that, in practice, nobody would use once a QR code exists.
+- Paste and click are the primary paths. Hand-typing is a fallback nobody reaches for when the link is one click away, and it stops being useful entirely once the console renders a QR code (not implemented yet, but the format already supports it — a QR of the URI needs no shorter secret).
 - `POST /enroll` currently has **no rate limiting**. Reducing the secret from a UUID's entropy to ~60 bits is only defensible with a throttle in front of it, and that throttle is real work — it needs to be per-IP and per-secret-prefix, and it must not become a denial-of-service lever against legitimate enrollment.
 
 Keeping `crypto.randomUUID()` costs nothing given the transport, and leaves the rate-limiting work optional rather than blocking. If a typeable code is wanted later, the rate limiter is the prerequisite and should be its own decision.
@@ -54,6 +54,8 @@ The tray's Add Profile dialog becomes a single text field instead of a file pick
 4. Surface enrollment failures in the dialog. The existing scanner moves failed `init.json` files to `inits/failed/` and logs via `Trace`, which is invisible to the user at the moment they need the information.
 
 Registering `mikura://` as a protocol handler (`HKCU\Software\Classes\mikura`, no installer or elevation required) makes a link sent over chat launch the client with the dialog prefilled, reducing the user's part of the flow to a single confirmation.
+
+That registration has a consequence worth naming: every click starts a **new process**, and the tray app mounts drives. Two instances would fight over the same drive letter. So the scheme handler forces a single-instance guard — a named mutex plus a one-way named pipe on which the running instance receives the URI and the second process exits immediately. Without that guard the feature is not merely incomplete, it is actively destructive, so the two ship together.
 
 ### Security notes
 

@@ -1,21 +1,25 @@
 using System.Net.Http;
-using System.Net.Http.Json;
 using System.Runtime.Versioning;
-using System.Text.Json;
-using System.Text.Json.Serialization;
 using Mikura.App.Config;
-using Mikura.Core.Identity;
+using Mikura.Core.Enrollment;
 
 namespace Mikura.App.Enrollment;
 
 /// <summary>
-/// `<exe-dir>/inits/*.init.json` を scan して、未消費の enrollment secret を
-/// server に POST /enroll する。成功したら profile を生成 + token を secret.bin
-/// に保存 + init.json を削除。失敗したら `inits/failed/` に move + Trace log。
+/// <c>&lt;exe-dir&gt;/inits/*.init.json</c> を scan して、未消費の enrollment
+/// secret を server に登録する。成功したら init.json を削除、失敗したら
+/// <c>inits/failed/</c> に move + Trace log。
 /// </summary>
 /// <remarks>
-/// admin が user に配布する init.json の典型 shape (= server の `deno task admin
-/// issue-init --out` 出力):
+/// <para>ADR-034 で対話的な入口は貼り付け方式 (<c>AddProfileForm</c>) に移った。
+/// この scanner は **ヘッドレス / 大量展開用** として残る — 多数の端末に配る
+/// ときに、ファイルを置くだけで設定が済む経路には依然として価値がある。</para>
+///
+/// <para>enrollment の実処理は <see cref="EnrollmentClient"/> に委譲する。
+/// UI 経路と同じコードを通るので、片方だけ挙動がずれることがない。</para>
+///
+/// <para>admin が配布する init.json の shape (= <c>deno task admin issue-init
+/// --out</c> の出力):</para>
 /// <code>
 /// {
 ///   "ServerUrl": "https://server.example.com:8700",
@@ -24,14 +28,12 @@ namespace Mikura.App.Enrollment;
 ///   "UserName": "alice"
 /// }
 /// </code>
-/// MountLetter は init.json には**含めない**設計 (= drive letter は user 側で
-/// 選ぶべき情報、admin が決めて固定するのは windows-shared PC で衝突する)。
-/// 現状は固定 letter (Z:) を入れて、Phase D の UI で対話的に変更させる。
+/// <para>MountLetter は init.json には**含めない** (= drive letter は user 側が
+/// 選ぶ情報。admin が固定すると共有 PC で衝突する)。空きレターを自動選択する。</para>
 /// </remarks>
 public sealed class EnrollmentScanner
 {
-    private readonly ProfileStore _store;
-    private readonly HttpClient _http;
+    private readonly EnrollmentClient _client;
     private readonly string _initsDir;
     private readonly string _failedDir;
 
@@ -40,8 +42,7 @@ public sealed class EnrollmentScanner
         HttpClient http,
         string? initsDir = null)
     {
-        _store = store;
-        _http = http;
+        _client = new EnrollmentClient(store, http);
         _initsDir = initsDir ?? Path.Combine(AppContext.BaseDirectory, "inits");
         _failedDir = Path.Combine(_initsDir, "failed");
     }
@@ -50,7 +51,6 @@ public sealed class EnrollmentScanner
 
     /// <summary>
     /// inits/ 配下の *.init.json を全て処理する。新規 profile 数を返す。
-    /// Linux test 等で Windows API を呼びたくない場合は `dryRun=true`。
     /// </summary>
     [SupportedOSPlatform("windows")]
     public async Task<int> ScanAndEnrollAsync(CancellationToken ct = default)
@@ -62,7 +62,7 @@ public sealed class EnrollmentScanner
             if (ct.IsCancellationRequested) break;
             try
             {
-                if (await TryEnrollOneAsync(path, ct))
+                if (await TryEnrollOneAsync(path, ct).ConfigureAwait(false))
                 {
                     created++;
                 }
@@ -80,70 +80,16 @@ public sealed class EnrollmentScanner
     [SupportedOSPlatform("windows")]
     private async Task<bool> TryEnrollOneAsync(string initPath, CancellationToken ct)
     {
-        var json = await File.ReadAllTextAsync(initPath, ct);
-        var init = JsonSerializer.Deserialize<InitFile>(json) ??
-            throw new InvalidDataException("init.json parse returned null");
-        if (string.IsNullOrWhiteSpace(init.ServerUrl) ||
-            string.IsNullOrWhiteSpace(init.EnrollmentSecret))
+        var json = await File.ReadAllTextAsync(initPath, ct).ConfigureAwait(false);
+        if (!EnrollmentInvitation.TryParse(json, out var invitation, out var error))
         {
-            throw new InvalidDataException(
-                "init.json must contain ServerUrl and EnrollmentSecret");
+            throw new InvalidDataException(error ?? "init.json を解釈できませんでした。");
         }
 
-        var deviceId = DeviceIdProvider.Compute();
+        await _client.EnrollAsync(invitation!, mountLetter: null, ct).ConfigureAwait(false);
 
-        // Server に POST /enroll
-        var enrollUrl = init.ServerUrl.TrimEnd('/') + "/enroll";
-        var req = new HttpRequestMessage(HttpMethod.Post, enrollUrl)
-        {
-            Content = JsonContent.Create(new EnrollRequest(
-                init.EnrollmentSecret, deviceId)),
-        };
-        using var res = await _http.SendAsync(req, ct);
-        if (!res.IsSuccessStatusCode)
-        {
-            var body = await res.Content.ReadAsStringAsync(ct);
-            throw new InvalidOperationException(
-                $"POST /enroll failed: {(int)res.StatusCode} {body}");
-        }
-        var payload = await res.Content.ReadFromJsonAsync<EnrollResponse>(ct) ??
-            throw new InvalidDataException("enroll response parse returned null");
-        if (string.IsNullOrEmpty(payload.BearerToken))
-        {
-            throw new InvalidDataException("enroll response missing bearerToken");
-        }
-
-        // Profile 名 = userName 優先、無ければ "default" の連番。同名 profile が
-        // 既にあれば suffix で衝突回避 (例 alice → alice-2)。
-        var baseName = SanitizeName(init.UserName ?? payload.UserName ?? "profile");
-        var name = baseName;
-        var suffix = 2;
-        while (_store.Exists(name))
-        {
-            name = $"{baseName}-{suffix++}";
-            if (suffix > 100)
-            {
-                throw new InvalidOperationException(
-                    "too many profiles with similar name; remove unused ones first");
-            }
-        }
-
-        // MountLetter は admin が指定しない設計 (= user 側で選ぶ)。default は Z:。
-        // Phase D で UI から対話的に変更可能にする。
-        var profile = new Profile(
-            Name: name,
-            ServerUrl: init.ServerUrl,
-            MountLetter: "Z:",
-            EnrolledAt: DateTime.UtcNow);
-
-        _store.SaveProfile(profile);
-        _store.SaveSecret(name, payload.BearerToken);
-
-        // Init file を消す (= secret は consume 済み、再利用不可なので痕跡を残さない)
+        // secret は consume 済みで再利用不可なので、痕跡を残さず消す。
         File.Delete(initPath);
-
-        System.Diagnostics.Trace.WriteLine(
-            $"[Enrollment] success: profile={name} serverUrl={init.ServerUrl}");
         return true;
     }
 
@@ -161,28 +107,4 @@ public sealed class EnrollmentScanner
                 $"[Enrollment] could not move to failed dir: {ex.Message}");
         }
     }
-
-    private static string SanitizeName(string raw)
-    {
-        var chars = raw.Where(ch =>
-            (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
-            (ch >= '0' && ch <= '9') || ch == '_' || ch == '-').ToArray();
-        var s = new string(chars);
-        return string.IsNullOrEmpty(s) ? "profile" : s[..Math.Min(s.Length, 32)];
-    }
-
-    private sealed record InitFile(
-        [property: JsonPropertyName("ServerUrl")] string ServerUrl,
-        [property: JsonPropertyName("EnrollmentSecret")] string EnrollmentSecret,
-        [property: JsonPropertyName("ExpiresAt")] string? ExpiresAt,
-        [property: JsonPropertyName("UserName")] string? UserName);
-
-    private sealed record EnrollRequest(
-        [property: JsonPropertyName("secret")] string Secret,
-        [property: JsonPropertyName("deviceId")] string DeviceId);
-
-    private sealed record EnrollResponse(
-        [property: JsonPropertyName("bearerToken")] string BearerToken,
-        [property: JsonPropertyName("userId")] int UserId,
-        [property: JsonPropertyName("userName")] string? UserName);
 }

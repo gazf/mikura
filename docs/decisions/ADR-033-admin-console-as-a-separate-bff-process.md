@@ -82,10 +82,12 @@ Instead, `console/src/routes/admin.ts` declares one thin handler per endpoint th
 The separation is not merely a convention; it is enforced by the runtime permission set the console is launched with:
 
 ```
-deno run --allow-net=<api-host> --allow-read=./src/ui --allow-env src/main.ts
+deno run --allow-net --allow-read=./src/ui --allow-env src/main.ts
 ```
 
-No `--unstable-kv`, no write access to the data root, and outbound network restricted to the API host. An implementation mistake that calls `getKv()` fails at startup rather than silently widening the console's reach. This is why the console gets its own `deno.json` with its own task definitions rather than sharing the server's.
+No `--unstable-kv`, and no write permission at all — read access is confined to the UI asset directory, which is consumed once at startup and never touched again. An implementation mistake that calls `getKv()` fails at startup rather than silently widening the console's reach. This is why the console gets its own `deno.json` with its own task definitions rather than sharing the server's.
+
+`--allow-net` is left unrestricted in the checked-in tasks because the API host is a runtime setting (`MIKURA_API_URL`) and Deno permission flags are static. Narrowing it to `--allow-net=<api-host>` is a deployment-time refinement worth making wherever the host is known; the load-bearing guarantees here are the absence of KV and write access, not the network scope.
 
 ### Types are not shared with the server
 

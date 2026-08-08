@@ -9,6 +9,7 @@ ADR-021 documents the migration from CfApi to WinFsp — undertaken to gain SMB-
 ## Layout
 
 - `server/` — Deno + TypeScript (Hono, Deno KV)
+- `console/` — Deno + TypeScript admin console (ADR-033). Separate process, own `deno.json`. Never opens Deno KV or the data root; talks to the API server's `/admin/*` over HTTP as a BFF. Loopback-bound, started only when administering. Declares its own wire DTOs — do **not** import `server/src/types.ts`.
 - `client/` — C# .NET 10 / Windows Forms. 5 projects:
   - `WinFsp.Native` — in-house WinFsp .NET binding (LibraryImport + function pointers + `[UnmanagedCallersOnly]`). Provides `IFileSystem` / optional `IAsyncFileIo` + `FileSystemHost`. AOT-ready, no `winfsp-msil` dependency. (ADR-032)
   - `WinFsp.Interop` — adapter that bridges `IFileSystemBackend` (Mikura.Core) ↔ `IFileSystem` (WinFsp.Native). Holds `BackendFileSystem`, `BackendFileSystemHost`, `OnlineGate`.
@@ -28,6 +29,8 @@ ADR-021 documents the migration from CfApi to WinFsp — undertaken to gain SMB-
 - Event broadcast: API-driven. Each mutation route calls `broadcastFileEvent("created"|"modified"|"deleted", path, meta?)`; `Deno.watchFs` retired (rename events were unreliable).
 - Device ID: persisted in `device.json` next to the client executable.
 - Authorization: REST and WSS both filter through `checkPermission`.
+- Admin console: separate `console/` process (ADR-033). Browser holds only an opaque session cookie; the console holds the admin bearer token in memory and relays to `/admin/*`. Relay handlers are declared one-by-one in `console/src/routes/admin.ts` — that file **is** the permission boundary. The console may call `/admin/*` and `GET /tree`, nothing else; never turn it into a pass-through proxy.
+- Enrollment handoff: a single `mikura://enroll?u=..&s=..` URI (ADR-034), emitted by `POST /admin/enrollments` as `enrollUrl` when the API server has `MIKURA_PUBLIC_URL` set. The client accepts it by paste or via the registered URI scheme; `EnrollmentInvitation.TryParse` also accepts pasted `init.json` text so both inputs share one path. The `inits/*.init.json` drop directory is retained for headless/bulk provisioning.
 
 ## Prerequisites
 
@@ -48,6 +51,17 @@ Server data layout (siblings under `server/`, both auto-created at startup):
 
 - `data/` — committed file tree (`MIKURA_DATA_ROOT`)
 - `staging/` — in-flight chunked upload sessions (`MIKURA_STAGING_ROOT`); finalize = `rename(2)` into `data/`
+
+## Console dev
+
+```bash
+cd console
+MIKURA_API_URL=http://127.0.0.1:8700 deno task dev   # http://127.0.0.1:8701/console/
+deno task test
+deno task check
+```
+
+Log in with an admin bearer token (`deno task seed` output, or `issue-token.ts`). The token must be unbound (`boundDeviceId` unset) — enrollment-issued tokens are device-bound and will not authenticate from the console.
 
 ## Client dev
 
