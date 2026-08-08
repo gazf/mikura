@@ -683,3 +683,141 @@ Deno.test("GET /admin/whoami: 無効な token は 401", async () => {
     assertEquals(res.status, 401);
   });
 });
+
+// ---- 自己締め出しガード ----
+//
+// console の権限エディタは「自分に admin を与えている設定」そのものを編集できる。
+// 適用してしまうと以後どの admin API も 403 になり、KV を直接書き換える以外に
+// 復旧手段が無くなる。全経路で事前に弾けていることを固定する。
+
+Deno.test("PUT /admin/permissions: root の自分の admin を降格させる操作は 409", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    const res = await app.fetch(
+      req("PUT", "/admin/permissions", adminToken, ADMIN_DEVICE, {
+        path: "/",
+        groupId: 1, // admin 自身が所属する admins
+        accessLevel: "read",
+      }),
+    );
+    assertEquals(res.status, 409);
+    // KV は変更されていない
+    const stored = await kv.get<Permission>(Keys.permission("/", 1));
+    assertEquals(stored.value?.accessLevel, "admin");
+  });
+});
+
+Deno.test("PUT /admin/permissions: 他 group の root 権限は下げられる", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    const res = await app.fetch(
+      req("PUT", "/admin/permissions", adminToken, ADMIN_DEVICE, {
+        path: "/",
+        groupId: 2, // carol の group。admin は所属していない
+        accessLevel: "read",
+      }),
+    );
+    assertEquals(res.status, 200);
+  });
+});
+
+Deno.test("PUT /admin/permissions: root 以外なら自 group でも下げられる", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    // requireAdmin が見るのは "/" だけなので、配下パスの変更は締め出さない
+    const res = await app.fetch(
+      req("PUT", "/admin/permissions", adminToken, ADMIN_DEVICE, {
+        path: "/shared",
+        groupId: 1,
+        accessLevel: "read",
+      }),
+    );
+    assertEquals(res.status, 200);
+  });
+});
+
+Deno.test("DELETE /admin/permissions: root の自分の admin 権限は消せない", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    const url = "/admin/permissions?path=" + encodeURIComponent("/") +
+      "&groupId=1";
+    const res = await app.fetch(req("DELETE", url, adminToken, ADMIN_DEVICE));
+    assertEquals(res.status, 409);
+    assert((await kv.get<Permission>(Keys.permission("/", 1))).value);
+  });
+});
+
+Deno.test("DELETE /admin/user-groups: 自分を admin グループから外せない", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    const res = await app.fetch(
+      req("DELETE", "/admin/user-groups/1/1", adminToken, ADMIN_DEVICE),
+    );
+    assertEquals(res.status, 409);
+    assertEquals((await kv.get<true>(Keys.userGroup(1, 1))).value, true);
+  });
+});
+
+Deno.test("DELETE /admin/user-groups: 他人の membership は外せる", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    const res = await app.fetch(
+      req("DELETE", "/admin/user-groups/2/2", adminToken, ADMIN_DEVICE),
+    );
+    assertEquals(res.status, 200);
+    assertEquals((await kv.get<true>(Keys.userGroup(2, 2))).value, null);
+  });
+});
+
+Deno.test("DELETE /admin/groups: 自分に admin を与えている group は消せない", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    const res = await app.fetch(
+      req("DELETE", "/admin/groups/1", adminToken, ADMIN_DEVICE),
+    );
+    assertEquals(res.status, 409);
+    assert((await kv.get<Group>(Keys.group(1))).value);
+  });
+});
+
+Deno.test("DELETE /admin/groups: 無関係な group は消せる", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    const res = await app.fetch(
+      req("DELETE", "/admin/groups/2", adminToken, ADMIN_DEVICE),
+    );
+    assertEquals(res.status, 200);
+  });
+});
+
+Deno.test("二重に admin を持っていれば片方は外せる", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    // admin を 2 つ目の admin group にも所属させ、そちらにも root admin を張る。
+    // checkPermission は first-match-wins なので、group 1 を外しても group 3 が
+    // admin を持っていれば締め出されない。
+    await kv.set(Keys.group(3), { id: 3, name: "admins2" });
+    await kv.set(Keys.userGroup(1, 3), true);
+    await kv.set(Keys.permission("/", 3), { accessLevel: "admin" });
+
+    const res = await app.fetch(
+      req("DELETE", "/admin/user-groups/1/1", adminToken, ADMIN_DEVICE),
+    );
+    assertEquals(res.status, 200);
+  });
+});
+
+Deno.test("後続 group が read しか持たないなら admin group は外せない", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    // admin を group 2 (root=write) にも所属させる。group 1 を外すと、次に
+    // 当たるのは group 2 の write なので admin ではなくなる。
+    await kv.set(Keys.userGroup(1, 2), true);
+
+    const res = await app.fetch(
+      req("DELETE", "/admin/user-groups/1/1", adminToken, ADMIN_DEVICE),
+    );
+    assertEquals(res.status, 409);
+    assertEquals((await kv.get<true>(Keys.userGroup(1, 1))).value, true);
+  });
+});

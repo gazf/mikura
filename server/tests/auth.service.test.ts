@@ -3,6 +3,7 @@ import {
   checkPermission,
   createAppToken,
   hashToken,
+  retainsRootAdmin,
   revokeToken,
   upsertDevice,
   validateToken,
@@ -414,5 +415,124 @@ Deno.test("upsertDevice: existing device keeps firstSeenAt, updates lastSeenAt",
     assertEquals(second.value?.firstSeenAt, firstSeen);
     assertEquals(second.value?.ipAddress, "10.0.0.1");
     assert(second.value!.lastSeenAt >= firstSeen);
+  });
+});
+
+// ----- retainsRootAdmin (自己締め出しガードの判定器) -----
+//
+// 責務: checkPermission の path="/" と**同じ順序依存**で「変更後も admin か」を
+// 答えること。first-match-wins を再現できていないと、ガードは通ったのに実際は
+// 締め出される (= 最悪の失敗) が起きる。
+
+Deno.test("retainsRootAdmin: 変更なしなら現状の判定と一致する", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "admin",
+      groupId: 1,
+      groupName: "admins",
+      permissions: [{ path: "/", accessLevel: "admin" }],
+    });
+    assert(await retainsRootAdmin(1, {}));
+    assertEquals(await checkPermission(1, "/", "admin"), true);
+  });
+});
+
+Deno.test("retainsRootAdmin: 唯一の admin group を外すと false", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "admin",
+      groupId: 1,
+      groupName: "admins",
+      permissions: [{ path: "/", accessLevel: "admin" }],
+    });
+    assertFalse(await retainsRootAdmin(1, { droppedGroupIds: [1] }));
+  });
+});
+
+Deno.test("retainsRootAdmin: root を read に落とす override は false", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "admin",
+      groupId: 1,
+      groupName: "admins",
+      permissions: [{ path: "/", accessLevel: "admin" }],
+    });
+    assertFalse(
+      await retainsRootAdmin(1, {
+        rootOverride: { groupId: 1, accessLevel: "read" },
+      }),
+    );
+  });
+});
+
+Deno.test("retainsRootAdmin: 他 group を触る override は影響しない", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "admin",
+      groupId: 1,
+      groupName: "admins",
+      permissions: [{ path: "/", accessLevel: "admin" }],
+    });
+    assert(
+      await retainsRootAdmin(1, {
+        rootOverride: { groupId: 99, accessLevel: "read" },
+      }),
+    );
+  });
+});
+
+Deno.test("retainsRootAdmin: first-match-wins — 先に並ぶ group の read が admin を隠す", async () => {
+  await withTestKv(async (kv) => {
+    // group 1 = read, group 2 = admin。checkPermission は最初に permission を
+    // 持つ group で打ち切るので、この user は admin ではない。
+    // 「より緩い方が勝つ」と誤って実装していると true を返してしまう。
+    await seedUser(kv, {
+      userId: 1,
+      userName: "alice",
+      groupId: 1,
+      groupName: "everyone",
+      permissions: [{ path: "/", accessLevel: "read" }],
+    });
+    await kv.set(Keys.group(2), { id: 2, name: "admins" });
+    await kv.set(Keys.userGroup(1, 2), true);
+    await kv.set(Keys.permission("/", 2), { accessLevel: "admin" });
+
+    assertEquals(await checkPermission(1, "/", "admin"), false);
+    assertFalse(await retainsRootAdmin(1, {}));
+
+    // 先に並ぶ read の group を外すと、初めて admin が見える
+    assert(await retainsRootAdmin(1, { droppedGroupIds: [1] }));
+  });
+});
+
+Deno.test("retainsRootAdmin: root の permission 削除で後続 group に判定が移る", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "alice",
+      groupId: 1,
+      groupName: "everyone",
+      permissions: [{ path: "/", accessLevel: "read" }],
+    });
+    await kv.set(Keys.group(2), { id: 2, name: "admins" });
+    await kv.set(Keys.userGroup(1, 2), true);
+    await kv.set(Keys.permission("/", 2), { accessLevel: "admin" });
+
+    // group 1 の root permission を消せば、次に当たる group 2 の admin が効く
+    assert(
+      await retainsRootAdmin(1, {
+        rootOverride: { groupId: 1, accessLevel: null },
+      }),
+    );
+  });
+});
+
+Deno.test("retainsRootAdmin: どの group にも所属していなければ false", async () => {
+  await withTestKv(async () => {
+    assertFalse(await retainsRootAdmin(999, {}));
   });
 });

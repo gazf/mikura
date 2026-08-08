@@ -30,6 +30,16 @@
   box-sizing: border-box;
 }
 
+/*
+ * hidden 属性は UA スタイルシートの `[hidden] { display: none }` で効くが、
+ * 作成者スタイルの display 宣言の方が詳細度に関係なく優先される。
+ * `.login { display: grid }` のような指定があると hidden が無視されるので、
+ * 作成者側で明示的に打ち消しておく。
+ */
+[hidden] {
+  display: none !important;
+}
+
 body {
   margin: 0;
   background: var(--bg);

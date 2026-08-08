@@ -479,6 +479,56 @@ export async function checkPermission(
   return false;
 }
 
+/**
+ * 「まだ適用していない変更」の記述。<see cref="retainsRootAdmin"/> 用。
+ */
+export interface PendingPermissionChange {
+  /** 所属から外れる group (membership 解除 / group 自体の削除)。 */
+  droppedGroupIds?: readonly number[];
+  /** root ("/") の permission 差し替え。`accessLevel: null` は削除を表す。 */
+  rootOverride?: { groupId: number; accessLevel: AccessLevel | null };
+}
+
+/**
+ * 「この変更を適用した後も、当該 user は root の admin 権限を保つか」。
+ *
+ * admin console の権限エディタは、自分に admin を与えている設定そのものを
+ * 編集できてしまう — root の permission を read に落とす、admins グループから
+ * 自分を外す、admins グループごと削除する。適用してしまうと以後どの admin API
+ * も 403 になり、KV を直接書き換える以外に復旧手段が無くなる。事前に弾く。
+ *
+ * 判定は `checkPermission` の path="/" における挙動を厳密になぞる。とくに
+ * **最初に permission を持つ group で結果が決まる** (= より緩い group が
+ * 先に並んでいると、後続 group の admin は参照されない) という順序依存を
+ * 再現している。ここがずれると「ガードは通ったのに実際には締め出される」
+ * という最悪の失敗をする。
+ */
+export async function retainsRootAdmin(
+  userId: number,
+  change: PendingPermissionChange,
+): Promise<boolean> {
+  // 呼び出しごとに新しい context を作る。middleware が持ち回っている context を
+  // 使い回すと、同一リクエスト内で既に読んだ古い値を見てしまう。
+  const ctx = new PermissionContext();
+
+  const dropped = change.droppedGroupIds;
+  const groupIds = (await ctx.groupIds(userId))
+    .filter((id) => !dropped?.includes(id));
+
+  for (const groupId of groupIds) {
+    let perm: Permission | null;
+    if (change.rootOverride?.groupId === groupId) {
+      const level = change.rootOverride.accessLevel;
+      perm = level === null ? null : { accessLevel: level };
+    } else {
+      perm = await ctx.permission("/", groupId);
+    }
+    // checkPermission と同じ first-match-wins。
+    if (perm) return hasAccess(perm.accessLevel, "admin");
+  }
+  return false;
+}
+
 function hasAccess(
   granted: AccessLevel,
   required: "read" | "write" | "admin",

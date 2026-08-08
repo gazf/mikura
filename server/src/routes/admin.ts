@@ -18,7 +18,9 @@ import { Hono } from "hono";
 import {
   type AuthUser,
   checkPermission,
+  type PendingPermissionChange,
   type PermissionContext,
+  retainsRootAdmin,
   revokeToken,
 } from "../services/auth.service.ts";
 import {
@@ -99,6 +101,27 @@ function parseOptionalUserId(
   }
   return { ok: true, userId };
 }
+
+/**
+ * 呼び出し元が自分の admin 権限を失う変更を弾く。
+ *
+ * console の権限エディタは、自分に admin を与えている設定そのものを編集できて
+ * しまう。締め出されると KV を直接触るしか復旧手段が無いので、`DELETE
+ * /admin/users/:id` の「自分自身は削除不可」と同じ考えで事前に止める。
+ *
+ * 他の admin が同時に権限を動かしていれば判定はすり抜けうるが、その窓を
+ * 塞ぐには権限変更全体を直列化する必要があり、防ぎたい事故 (単独運用者の
+ * 自爆) に対して割に合わない。
+ */
+async function blocksSelfLockout(
+  user: AuthUser,
+  change: PendingPermissionChange,
+): Promise<boolean> {
+  return !(await retainsRootAdmin(user.id, change));
+}
+
+const SELF_LOCKOUT_MESSAGE =
+  "この変更は自分自身の admin 権限を失わせます。先に別の admin を用意してください。";
 
 /** Path validation: file.service.resolveAndValidate の subset (= 文字列のみ)。 */
 function isValidPath(p: unknown): p is string {
@@ -319,6 +342,12 @@ export function registerAdminRoutes(app: Hono<Env>) {
     const target = await kv.get<Group>(Keys.group(id));
     if (!target.value) return c.json({ message: "Not found" }, 404);
 
+    // group 削除は membership と permission の両方を巻き取るので、自分が
+    // その group 経由で admin を得ていれば締め出される。
+    if (await blocksSelfLockout(user, { droppedGroupIds: [id] })) {
+      return c.json({ message: SELF_LOCKOUT_MESSAGE }, 409);
+    }
+
     // Cascade: user_groups (全 user で本 group を参照する entry を引き、削除する)
     // permissions (全 path で本 group の permission を削除する)
     const tx = kv.atomic().delete(Keys.group(id));
@@ -418,6 +447,15 @@ export function registerAdminRoutes(app: Hono<Env>) {
     if (!Number.isFinite(userId) || !Number.isFinite(groupId)) {
       return c.json({ message: "Invalid id" }, 400);
     }
+
+    // 自分を admin グループから外す操作。他人の membership は締め出しに無関係。
+    if (
+      userId === user.id &&
+      await blocksSelfLockout(user, { droppedGroupIds: [groupId] })
+    ) {
+      return c.json({ message: SELF_LOCKOUT_MESSAGE }, 409);
+    }
+
     const kv = await getKv();
     await kv.delete(Keys.userGroup(userId, groupId));
     return c.json({ removed: { userId, groupId } });
@@ -495,6 +533,16 @@ export function registerAdminRoutes(app: Hono<Env>) {
     const g = await kv.get<Group>(Keys.group(body.groupId));
     if (!g.value) return c.json({ message: "group not found" }, 404);
 
+    // root の権限を下げる操作だけが自分を締め出しうる (requireAdmin は "/" を見る)。
+    if (
+      body.path === "/" &&
+      await blocksSelfLockout(user, {
+        rootOverride: { groupId: body.groupId, accessLevel: body.accessLevel },
+      })
+    ) {
+      return c.json({ message: SELF_LOCKOUT_MESSAGE }, 409);
+    }
+
     const perm: Permission = { accessLevel: body.accessLevel };
     await kv.set(Keys.permission(body.path, body.groupId), perm);
     return c.json({
@@ -519,6 +567,16 @@ export function registerAdminRoutes(app: Hono<Env>) {
     if (!Number.isFinite(groupId)) {
       return c.json({ message: "groupId query required (number)" }, 400);
     }
+
+    if (
+      path === "/" &&
+      await blocksSelfLockout(user, {
+        rootOverride: { groupId, accessLevel: null },
+      })
+    ) {
+      return c.json({ message: SELF_LOCKOUT_MESSAGE }, 409);
+    }
+
     const kv = await getKv();
     await kv.delete(Keys.permission(path, groupId));
     return c.json({ removed: { path, groupId } });
