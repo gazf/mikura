@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>mikura console</title>
+    <link rel="stylesheet" href="/console/assets/app.css">
+  </head>
+  <body>
+    <div id="login" class="login" hidden>
+      <form class="login-card" id="login-form">
+        <h1>mikura <span>console</span></h1>
+        <p class="hint">
+          管理トークンを貼り付けてください。トークンはこのブラウザには保存されず、
+          console プロセスのメモリ上だけに保持されます。
+        </p>
+        <label for="login-token">管理トークン</label>
+        <input
+          type="password"
+          id="login-token"
+          autocomplete="off"
+          spellcheck="false"
+          required
+        >
+        <button type="submit">ログイン</button>
+        <p class="error" id="login-error" hidden></p>
+      </form>
+    </div>
+
+    <div id="app" hidden>
+      <header class="topbar">
+        <div class="brand">mikura <span>console</span></div>
+        <div class="who">
+          <span id="who-name"></span>
+          <button type="button" id="logout">ログアウト</button>
+        </div>
+      </header>
+
+      <div class="layout">
+        <nav class="sidenav">
+          <button type="button" data-view="users" class="active">
+            ユーザー
+          </button>
+          <button type="button" data-view="groups">グループ</button>
+          <button type="button" data-view="permissions">権限</button>
+          <button type="button" data-view="invitations">招待</button>
+          <button type="button" data-view="devices">端末とトークン</button>
+          <button type="button" data-view="audit">監査ログ</button>
+        </nav>
+
+        <main id="view"></main>
+      </div>
+    </div>
+
+    <div id="toast" class="toast" hidden></div>
+
+    <script src="/console/assets/app.js"></script>
+  </body>
+</html>

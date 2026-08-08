@@ -112,6 +112,24 @@ function isValidPath(p: unknown): p is string {
 }
 
 export function registerAdminRoutes(app: Hono<Env>) {
+  // ---- Identity ----
+
+  /**
+   * 「この token は誰のもので、admin 権限があるか」を 1 往復で確かめる。
+   *
+   * console の login はこれ 1 本で済む: 401 なら token が無効、403 なら
+   * admin ではない、200 なら本人が判る。`GET /admin/users` で代用すると
+   * 全 user を引いた上で「呼び出し元が誰か」は依然として判らない。
+   */
+  app.get("/admin/whoami", async (c) => {
+    const user = c.get("user");
+    const permCtx = c.get("permCtx");
+    const auth = await requireAdmin(user, permCtx);
+    if (!auth.ok) return c.json({ message: "Forbidden" }, auth.status);
+
+    return c.json({ id: user.id, name: user.name, deviceId: user.deviceId });
+  });
+
   // ---- Users ----
 
   app.post("/admin/users", async (c) => {
