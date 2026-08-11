@@ -38,3 +38,4 @@ Each ADR is split into its own file.
 | ADR-032 | [Replacing the WinFsp .NET binding with an in-house modern P/Invoke binding](ADR-032-replacing-the-winfsp-net-binding-with-an-in-house.md) |
 | ADR-033 | [Admin console as a separate BFF process (`console/`)](ADR-033-admin-console-as-a-separate-bff-process.md) |
 | ADR-034 | [Enrollment handoff via a `mikura://` URI instead of an `init.json` file](ADR-034-enrollment-handoff-via-mikura-uri-instead-of-init.md) |
+| ADR-035 | [Policy document of named roles, replacing path × group permission rows](ADR-035-policy-document-of-named-roles-replacing-path.md) |
