@@ -225,13 +225,24 @@ The reverse query is what an operator actually asks during an audit, and it is w
 
 **chmod-style symbolic modes (`r+`, `w-`).** `r`/`w`/`x` denote independent bits, and borrowing the notation invites the combinable mental model that the linear ladder deliberately rejects. `+` also means "add this bit" in chmod, not "or better", so the notation would be familiar and wrong at once.
 
+### Resolved at implementation time
+
+The five questions this ADR left open were answered when it was built. They are recorded here rather than removed, because each one is a decision someone will want the reasoning for.
+
+1. **No built-in `everyone`.** A second kind of subject would have to be understood everywhere a role is, to save one assignment per user. The console offers "assign to all users" instead, which produces ordinary assignment rows that the reverse query and the assertion layer already understand.
+2. **`seed` writes a bootstrap policy** of `role admins { allow admin / }` plus `test admins { admin / }`, and assigns it to the admin user. `installBootstrapPolicy` skips the "at least one admin" check, which necessarily fails when nobody is assigned yet, but still validates the document.
+3. **A stored version that fails to parse stops startup.** Failing closed and serving would present as "nobody can see anything", which reads as a permissions bug and gets misdiagnosed; refusing to start prints the parse error with line numbers. Since the save path validates, this can only be reached by a format change or KV corruption. Recovery is `deno task seed --policy <file>`, writing KV directly with the server down — the same break-glass shape as `seed --renew` for a lost admin token, and deliberately not reachable over HTTP, since HTTP requires the admin authority that the broken policy is withholding.
+4. **"Role" is kept.** The alternatives considered (`grant`, `profile`, `ruleset`) each read worse in at least one of the three places the word appears — the grammar, the console, and the assignment table.
+5. **The compiled policy is a plain in-memory structure**, not ephemeral KV. `Deno.openKv(":memory:")` is process-local, so it has exactly the same cross-process visibility as a `Map` while adding serialization and an async API to a per-IRP path. Multi-process deployment would poll a version counter in *persistent* KV on an interval — bounding staleness explicitly — not read the version per request.
+
+Two additions were made during implementation and are part of the design:
+
+- **`visible` is a fifth test adjective.** Derived visibility is the subtlest rule in the model, and without an adjective for it a role unit test cannot assert it at all. The ladder is `invisible < visible < readable < writable < admin`.
+- **A `deny` defeated only by a role granting `admin /` produces no warning.** Administrators reach everything by definition, so the warning would fire on every `deny` ever written and bury the cross-role collisions that actually matter.
+
 ### Open questions
 
-1. A built-in `everyone` subject, or an explicit role every user is assigned to.
-2. The bootstrap policy written by `seed`, since an empty policy denies everything including administration.
-3. Behaviour when a stored version fails to parse. Failing closed denies everything, which is safe but equivalent to an outage.
-4. Naming. "Role" reads as a job title and sits awkwardly on purpose-named sets like `shared-folder-access`.
-5. Cache invalidation across multiple API server processes. Out of scope while the server is single-process.
+None outstanding. Two known follow-ups live outside this ADR: the case-sensitivity mismatch in the file service (recorded above, belongs to that layer), and the tray-notification channel that would let a pinned-path refusal reach the user with its reason instead of a bare NTSTATUS.
 
 ### Relationship to other ADRs
 
