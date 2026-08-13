@@ -360,24 +360,91 @@ p.ok {
   color: var(--danger);
 }
 
-/* ---- ロール編集フォーム ---- */
+/* ---- ロール編集 (左に一覧 / 右に詳細) ---- */
 
-.card.role h4 {
-  margin: 16px 0 6px;
+.split {
+  display: grid;
+  grid-template-columns: minmax(200px, 260px) 1fr;
+  gap: 16px;
+  align-items: start;
+}
+
+@media (max-width: 860px) {
+  .split {
+    grid-template-columns: 1fr;
+  }
+}
+
+.rolelist {
+  padding: 10px;
+}
+
+.rolelist-items {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+
+button.roleitem {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 2px 8px;
+  width: 100%;
+  padding: 8px 10px;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+button.roleitem:hover {
+  background: var(--code-bg);
+}
+
+button.roleitem.active {
+  background: var(--code-bg);
+  border-color: var(--accent);
+}
+
+.roleitem-name {
+  font-weight: 600;
+}
+
+.roleitem-count {
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.roleitem-rules {
+  grid-column: 1 / -1;
+  font-size: 12px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+button.block {
+  width: 100%;
+}
+
+.roledetail h4 {
+  margin: 18px 0 6px;
   font-size: 13px;
   color: var(--muted);
 }
 
-.card.role h4:first-of-type {
-  margin-top: 8px;
+.roledetail h4:first-of-type {
+  margin-top: 4px;
 }
 
 .role-head input {
-  min-width: 220px;
+  min-width: 200px;
 }
 
 .role-actions {
-  margin-top: 14px;
+  margin-top: 16px;
   padding-top: 12px;
   border-top: 1px solid var(--border);
 }
