@@ -26,9 +26,9 @@ try {
     // バグに見えて誤診される。復旧コマンドをそのまま出す。
     console.warn(
       "[WARN] admin 権限を持つユーザーが 1 人もいません。" +
-        (state.version === 0
-          ? " アクセス制御ポリシーがまだ投入されていません。"
-          : ` (ポリシー版 ${state.version})`) +
+        (state.roleCount === 0
+          ? " ロールがまだ 1 つも定義されていません。"
+          : ` (ロール ${state.roleCount} 個)`) +
         "\n       すべてのアクセスが拒否され、管理コンソールにもログインできません。" +
         "\n       復旧: server を止めて `deno task seed --grant-admin` を実行してください。",
     );

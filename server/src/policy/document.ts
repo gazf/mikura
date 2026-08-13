@@ -35,9 +35,14 @@ export interface PolicyRule {
 export interface PolicyRole {
   readonly name: string;
   readonly rules: readonly PolicyRule[];
+  /**
+   * `disabled role X { ... }` と書かれていれば false。無効なロールは実効水準に
+   * 寄与しないが、定義も割り当ても残る (= 一時停止)。
+   */
+  readonly enabled: boolean;
   /** `role X {` の行。 */
   readonly line: number;
-  /** 閉じ `}` の行。コンソールがブロック単位で差し替えるのに使う。 */
+  /** 閉じ `}` の行。 */
   readonly endLine: number;
 }
 
@@ -121,7 +126,13 @@ export function parsePolicy(text: string): ParseResult {
   const tests: PolicyTest[] = [];
 
   type Open =
-    | { kind: "role"; name: string; line: number; rules: PolicyRule[] }
+    | {
+      kind: "role";
+      name: string;
+      line: number;
+      rules: PolicyRule[];
+      enabled: boolean;
+    }
     | { kind: "test"; name: string; line: number; cases: PolicyTestCase[] };
   let open: Open | null = null;
   /** role 内のパス重複検出用 (照合が case-insensitive なので畳んで持つ)。 */
@@ -143,6 +154,7 @@ export function parsePolicy(text: string): ParseResult {
         roles.push({
           name: open.name,
           rules: open.rules,
+          enabled: open.enabled,
           line: open.line,
           endLine: lineNo,
         });
@@ -159,7 +171,24 @@ export function parsePolicy(text: string): ParseResult {
       continue;
     }
 
-    const { head, rest } = splitHead(line);
+    let { head, rest } = splitHead(line);
+
+    // `disabled role X {` — 無効化の印は行頭に置く (行の先頭を見るだけで
+    // 「これは今効いていない」と分かる)。
+    let enabled = true;
+    if (head === "disabled") {
+      const next = splitHead(rest);
+      if (next.head !== "role") {
+        errors.push({
+          line: lineNo,
+          message: "disabled は role にしか付けられません",
+        });
+        continue;
+      }
+      enabled = false;
+      head = next.head;
+      rest = next.rest;
+    }
 
     if (head === "role" || head === "test") {
       if (open) {
@@ -186,7 +215,7 @@ export function parsePolicy(text: string): ParseResult {
         continue;
       }
       open = head === "role"
-        ? { kind: "role", name, line: lineNo, rules: [] }
+        ? { kind: "role", name, line: lineNo, rules: [], enabled }
         : { kind: "test", name, line: lineNo, cases: [] };
       continue;
     }

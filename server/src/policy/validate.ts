@@ -22,6 +22,7 @@ import {
   type EffectiveLevel,
   effectiveLevel,
   hasAccess,
+  roleOnlyLevel,
 } from "./evaluate.ts";
 import { foldAscii, isProperAncestor, normalizeForMatch } from "./paths.ts";
 
@@ -90,6 +91,13 @@ export function validatePolicy(
   // --- 警告 ---
   for (const role of document.roles) {
     collectDenyWarnings(role, testedRoles, warnings);
+    if (!role.enabled) {
+      warnings.push({
+        line: role.line,
+        message:
+          `ロール ${role.name} は無効です (割り当ては残りますが権限は与えません)`,
+      });
+    }
   }
   collectCrossRoleDenyWarnings(document.roles, compiled, warnings);
 
@@ -128,7 +136,9 @@ function runTestCase(
   roleName: string,
   c: PolicyTestCase,
 ): PolicyTestFailure | null {
-  const actual = effectiveLevel(policy, [roleName], c.path);
+  // 無効化されていてもテストは走る。テストはロールの意味の記述であって、
+  // 運用上の on/off とは別のもの。
+  const actual = roleOnlyLevel(policy, roleName, c.path);
   // invisible だけは「ちょうど無し」。他は「少なくともこの水準」。
   const passed = c.expect === "invisible" ? actual === null : hasAccess(
     actual,

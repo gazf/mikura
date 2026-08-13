@@ -538,168 +538,296 @@ Deno.test("GET /admin/whoami: 無効な token は 401", async () => {
   });
 });
 
-// ---- Policy document (ADR-035) ----
+// ---- Roles (ADR-036) ----
 
-const VALID_POLICY = `role admins {
-  allow admin /
-}
-
-test admins {
-  admin /
-}
-
-role projects-editor {
-  allow write /projects
-  deny /projects/secret
-}
-
-test projects-editor {
-  writable /projects/a.txt
-  invisible /projects/secret/inner.txt
-}
-`;
-
-Deno.test("GET /admin/policy: 原文 + ロール一覧 + メンバー数を返す", async () => {
+Deno.test("GET /admin/roles: 1 行 = 1 ロールで返す", async () => {
   await withTestKv(async (kv) => {
     const { adminToken } = await setup(kv);
     const res = await app.fetch(
-      req("GET", "/admin/policy", adminToken, ADMIN_DEVICE),
+      req("GET", "/admin/roles", adminToken, ADMIN_DEVICE),
     );
     assertEquals(res.status, 200);
     const body = await res.json();
-    assert(body.version > 0);
-    assert(body.text.includes("role admins"));
     const admins = body.roles.find((r: { name: string }) =>
       r.name === "admins"
     );
+    assertEquals(admins.enabled, true);
+    assertEquals(admins.generation, 1);
     assertEquals(admins.memberCount, 1);
+    assertEquals(admins.rules, [{ path: "/", level: "admin" }]);
   });
 });
 
-Deno.test("PUT /admin/policy: 保存すると版が上がり判定に効く", async () => {
+Deno.test("PUT /admin/roles/:name: 作成すると世代 1 から始まり判定に効く", async () => {
   await withTestKv(async (kv) => {
     const { adminToken } = await setup(kv);
-    const before = await (await app.fetch(
-      req("GET", "/admin/policy", adminToken, ADMIN_DEVICE),
-    )).json();
-
     const res = await app.fetch(
-      req("PUT", "/admin/policy", adminToken, ADMIN_DEVICE, {
-        text: VALID_POLICY,
-        expectedVersion: before.version,
+      req("PUT", "/admin/roles/projects-editor", adminToken, ADMIN_DEVICE, {
+        rules: [
+          { path: "/projects", level: "write" },
+          { path: "/projects/secret", level: null },
+        ],
+        tests: [
+          { expect: "writable", path: "/projects/spec.md" },
+          { expect: "invisible", path: "/projects/secret/inner.txt" },
+        ],
       }),
     );
     assertEquals(res.status, 200);
     const saved = await res.json();
     assertEquals(saved.ok, true);
-    assertEquals(saved.version, before.version + 1);
+    assertEquals(saved.generation, 1);
 
-    // carol の users ロールは新版に無いので、判定に効かなくなる
-    assertEquals(await checkPermission(2, "/projects/a.txt", "write"), false);
-    assertEquals(await checkPermission(1, "/projects/a.txt", "write"), true);
+    await app.fetch(
+      req("POST", "/admin/assignments", adminToken, ADMIN_DEVICE, {
+        userId: 2,
+        role: "projects-editor",
+      }),
+    );
+    assertEquals(await checkPermission(2, "/projects/a.txt", "write"), true);
+    assertEquals(
+      await checkPermission(2, "/projects/secret/x.txt", "visible"),
+      false,
+    );
   });
 });
 
-Deno.test("PUT /admin/policy: 構文エラーは 422 で全部の行を返す", async () => {
+Deno.test("PUT /admin/roles/:name: 更新は世代を 1 つ積む", async () => {
   await withTestKv(async (kv) => {
     const { adminToken } = await setup(kv);
-    const res = await app.fetch(
-      req("PUT", "/admin/policy", adminToken, ADMIN_DEVICE, {
-        text: "role r {\n  grant read /a\n  allow read b\n}\n",
-      }),
+    for (const level of ["read", "write"]) {
+      const res = await app.fetch(
+        req("PUT", "/admin/roles/viewers", adminToken, ADMIN_DEVICE, {
+          rules: [{ path: "/shared", level }],
+          tests: [],
+        }),
+      );
+      assertEquals(res.status, 200);
+    }
+    const detail = await (await app.fetch(
+      req("GET", "/admin/roles/viewers", adminToken, ADMIN_DEVICE),
+    )).json();
+    assertEquals(detail.generation, 2);
+    assertEquals(
+      detail.generations.map((g: { generation: number }) => g.generation),
+      [2, 1],
     );
-    assertEquals(res.status, 422);
-    const body = await res.json();
-    assertEquals(body.ok, false);
-    assertEquals(body.errors.length, 2);
   });
 });
 
-Deno.test("PUT /admin/policy: ロール単体テストが落ちれば保存されない", async () => {
+Deno.test("POST /admin/roles/:name/generation: 前の世代に戻せる", async () => {
   await withTestKv(async (kv) => {
     const { adminToken } = await setup(kv);
-    const res = await app.fetch(
-      req("PUT", "/admin/policy", adminToken, ADMIN_DEVICE, {
-        text: "role admins {\n  allow admin /\n}\n" +
-          "test admins {\n  invisible /\n}\n",
+    // carol の users ロールは /shared にしか効かないので、別のパスで見る。
+    for (const level of ["read", "write"]) {
+      await app.fetch(
+        req("PUT", "/admin/roles/viewers", adminToken, ADMIN_DEVICE, {
+          rules: [{ path: "/docs", level }],
+          tests: [],
+        }),
+      );
+    }
+    await app.fetch(
+      req("POST", "/admin/assignments", adminToken, ADMIN_DEVICE, {
+        userId: 2,
+        role: "viewers",
       }),
     );
-    assertEquals(res.status, 422);
-    const body = await res.json();
-    assertEquals(body.testFailures.length, 1);
-    assertEquals(body.testFailures[0].expected, "invisible");
+    assertEquals(await checkPermission(2, "/docs/a.txt", "write"), true);
+
+    const res = await app.fetch(
+      req(
+        "POST",
+        "/admin/roles/viewers/generation",
+        adminToken,
+        ADMIN_DEVICE,
+        { generation: 1 },
+      ),
+    );
+    assertEquals(res.status, 200);
+    assertEquals(await checkPermission(2, "/docs/a.txt", "write"), false);
+    assertEquals(await checkPermission(2, "/docs/a.txt", "read"), true);
   });
 });
 
-Deno.test("PUT /admin/policy: admin が 1 人もいなくなる版は却下される", async () => {
+Deno.test("POST /admin/roles/:name/enabled: 無効にすると権限だけ止まる", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    assertEquals(await checkPermission(2, "/shared/a.txt", "write"), true);
+
+    const off = await app.fetch(
+      req("POST", "/admin/roles/users/enabled", adminToken, ADMIN_DEVICE, {
+        enabled: false,
+      }),
+    );
+    assertEquals(off.status, 200);
+    assertEquals(await checkPermission(2, "/shared/a.txt", "write"), false);
+
+    // 割り当ては残っている
+    const assignments = await (await app.fetch(
+      req("GET", "/admin/assignments?userId=2", adminToken, ADMIN_DEVICE),
+    )).json();
+    assertEquals(assignments[0].roles, ["users"]);
+
+    const on = await app.fetch(
+      req("POST", "/admin/roles/users/enabled", adminToken, ADMIN_DEVICE, {
+        enabled: true,
+      }),
+    );
+    assertEquals(on.status, 200);
+    assertEquals(await checkPermission(2, "/shared/a.txt", "write"), true);
+  });
+});
+
+Deno.test("POST /admin/roles/:name/enabled: 最後の admin ロールは無効にできない", async () => {
   await withTestKv(async (kv) => {
     const { adminToken } = await setup(kv);
     const res = await app.fetch(
-      req("PUT", "/admin/policy", adminToken, ADMIN_DEVICE, {
-        // admins ロールは残るが admin を与えなくなる
-        text: "role admins {\n  allow read /\n}\n",
+      req("POST", "/admin/roles/admins/enabled", adminToken, ADMIN_DEVICE, {
+        enabled: false,
       }),
     );
     assertEquals(res.status, 422);
-    const body = await res.json();
-    assert(body.rejection.includes("admin"));
-    // 旧版のまま
+    assert((await res.json()).rejection.includes("admin"));
     assert(await checkPermission(1, "/", "admin"));
   });
 });
 
-Deno.test("PUT /admin/policy: dryRun は KV を変えない", async () => {
+Deno.test("PUT /admin/roles/:name: 壊れたルールは 400、テスト失敗は 422", async () => {
   await withTestKv(async (kv) => {
     const { adminToken } = await setup(kv);
-    const before = await (await app.fetch(
-      req("GET", "/admin/policy", adminToken, ADMIN_DEVICE),
-    )).json();
+
+    const bad = await app.fetch(
+      req("PUT", "/admin/roles/viewers", adminToken, ADMIN_DEVICE, {
+        rules: [{ path: "relative", level: "read" }],
+      }),
+    );
+    assertEquals(bad.status, 400);
+
+    const failing = await app.fetch(
+      req("PUT", "/admin/roles/viewers", adminToken, ADMIN_DEVICE, {
+        rules: [{ path: "/shared", level: "read" }],
+        tests: [{ expect: "writable", path: "/shared" }],
+      }),
+    );
+    assertEquals(failing.status, 422);
+    const body = await failing.json();
+    assertEquals(body.testFailures.length, 1);
+    assertEquals(body.testFailures[0].actual, "read");
+  });
+});
+
+Deno.test("PUT /admin/roles/:name: admin が 1 人もいなくなる変更は 422", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
     const res = await app.fetch(
-      req("PUT", "/admin/policy", adminToken, ADMIN_DEVICE, {
-        text: VALID_POLICY,
+      req("PUT", "/admin/roles/admins", adminToken, ADMIN_DEVICE, {
+        rules: [{ path: "/", level: "read" }],
+        tests: [],
+      }),
+    );
+    assertEquals(res.status, 422);
+    assert((await res.json()).rejection.includes("admin"));
+    assert(await checkPermission(1, "/", "admin"));
+  });
+});
+
+Deno.test("PUT /admin/roles/:name: dryRun は保存しない", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    const res = await app.fetch(
+      req("PUT", "/admin/roles/viewers", adminToken, ADMIN_DEVICE, {
+        rules: [{ path: "/shared", level: "read" }],
         dryRun: true,
       }),
     );
     assertEquals(res.status, 200);
     assertEquals((await res.json()).ok, true);
-    const after = await (await app.fetch(
-      req("GET", "/admin/policy", adminToken, ADMIN_DEVICE),
+    const list = await (await app.fetch(
+      req("GET", "/admin/roles", adminToken, ADMIN_DEVICE),
     )).json();
-    assertEquals(after.version, before.version);
-    assertEquals(after.text, before.text);
+    assertEquals(
+      list.roles.some((r: { name: string }) => r.name === "viewers"),
+      false,
+    );
   });
 });
 
-Deno.test("PUT /admin/policy: expectedVersion がずれていれば拒否 (楽観的並行制御)", async () => {
+Deno.test("DELETE /admin/roles/:name: 割り当てごと消える", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    const res = await app.fetch(
+      req("DELETE", "/admin/roles/users", adminToken, ADMIN_DEVICE),
+    );
+    assertEquals(res.status, 200);
+    assertEquals((await res.json()).removedAssignments, 1);
+    assertEquals(await checkPermission(2, "/shared/a.txt", "write"), false);
+  });
+});
+
+Deno.test("ロール名は形式を固定してからパスに使う", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    for (const bad of ["-leading", "with space", ".."]) {
+      const res = await app.fetch(
+        req(
+          "GET",
+          `/admin/roles/${encodeURIComponent(bad)}`,
+          adminToken,
+          ADMIN_DEVICE,
+        ),
+      );
+      assert(res.status === 400 || res.status === 404, `${bad}: ${res.status}`);
+    }
+  });
+});
+
+// ---- Policy text (取り込み / 書き出し) ----
+
+Deno.test("GET /admin/policy: レコードから生成したテキストを返す", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    const res = await app.fetch(
+      req("GET", "/admin/policy", adminToken, ADMIN_DEVICE),
+    );
+    assertEquals(res.status, 200);
+    const text = (await res.json()).text;
+    assert(text.includes("role admins {"));
+    assert(text.includes("allow  admin  /"));
+  });
+});
+
+Deno.test("PUT /admin/policy: 取り込みは併合ではなく置き換え", async () => {
   await withTestKv(async (kv) => {
     const { adminToken } = await setup(kv);
     const res = await app.fetch(
       req("PUT", "/admin/policy", adminToken, ADMIN_DEVICE, {
-        text: VALID_POLICY,
-        expectedVersion: 999,
+        text:
+          "role admins {\n  allow admin /\n}\n\ntest admins {\n  admin /\n}\n",
+      }),
+    );
+    assertEquals(res.status, 200);
+    assertEquals((await res.json()).roles, 1);
+
+    const list = await (await app.fetch(
+      req("GET", "/admin/roles", adminToken, ADMIN_DEVICE),
+    )).json();
+    assertEquals(list.roles.map((r: { name: string }) => r.name), ["admins"]);
+  });
+});
+
+Deno.test("PUT /admin/policy: 壊れたテキストは 422 で行番号を返す", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    const res = await app.fetch(
+      req("PUT", "/admin/policy", adminToken, ADMIN_DEVICE, {
+        text: "role r {\n  grant read /a\n}\n",
       }),
     );
     assertEquals(res.status, 422);
-    assert((await res.json()).rejection.includes("999") === false);
-  });
-});
-
-Deno.test("GET /admin/policy/versions: 版一覧と現行フラグ", async () => {
-  await withTestKv(async (kv) => {
-    const { adminToken } = await setup(kv);
-    await app.fetch(
-      req("PUT", "/admin/policy", adminToken, ADMIN_DEVICE, {
-        text: VALID_POLICY,
-      }),
-    );
-    const res = await app.fetch(
-      req("GET", "/admin/policy/versions", adminToken, ADMIN_DEVICE),
-    );
-    const list = await res.json();
-    assert(list.length >= 2);
-    assertEquals(list.filter((v: { current: boolean }) => v.current).length, 1);
-    // 本文は含めない (一覧に原文を載せない)
-    assertEquals(list[0].text, undefined);
+    const body = await res.json();
+    assertEquals(body.ok, false);
+    assertEquals(body.errors[0].line, 2);
   });
 });
 
@@ -870,8 +998,12 @@ Deno.test("GET /admin/diagnostics/effective: ロールごとの決め手を返�
   await withTestKv(async (kv) => {
     const { adminToken } = await setup(kv);
     await app.fetch(
-      req("PUT", "/admin/policy", adminToken, ADMIN_DEVICE, {
-        text: VALID_POLICY,
+      req("PUT", "/admin/roles/projects-editor", adminToken, ADMIN_DEVICE, {
+        rules: [
+          { path: "/projects", level: "write" },
+          { path: "/projects/secret", level: null },
+        ],
+        tests: [{ expect: "invisible", path: "/projects/secret/inner.txt" }],
       }),
     );
     await app.fetch(
@@ -901,8 +1033,12 @@ Deno.test("GET /admin/diagnostics/who: そのパスに届くユーザーだけ�
   await withTestKv(async (kv) => {
     const { adminToken } = await setup(kv);
     await app.fetch(
-      req("PUT", "/admin/policy", adminToken, ADMIN_DEVICE, {
-        text: VALID_POLICY,
+      req("PUT", "/admin/roles/projects-editor", adminToken, ADMIN_DEVICE, {
+        rules: [
+          { path: "/projects", level: "write" },
+          { path: "/projects/secret", level: null },
+        ],
+        tests: [{ expect: "invisible", path: "/projects/secret/inner.txt" }],
       }),
     );
     await app.fetch(

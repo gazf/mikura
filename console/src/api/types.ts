@@ -49,48 +49,68 @@ export interface ApiAssertionFailure {
   message: string;
 }
 
-/** `GET /admin/policy` — 原文 + 静的な健康診断。 */
-export interface ApiPolicy {
-  version: number;
-  text: string;
-  createdAt: string | null;
-  createdBy: number | null;
-  roles: Array<{
-    name: string;
-    /** 原文中のこのロールの範囲 (1 始まり、両端を含む)。差し替えに使う。 */
-    line: number;
-    endLine: number;
-    rules: Array<{ path: string; level: ApiAccessLevel | null }>;
-    tests: Array<{
-      line: number;
-      endLine: number;
-      cases: Array<{ expect: ApiExpectation; path: string }>;
-    }>;
-    memberCount: number;
-  }>;
-  warnings: ApiPolicyIssue[];
-  /** 実在しないパスを指しているルール。 */
-  dangling: Array<{ role: string; path: string; line: number }>;
+export interface ApiRoleRule {
+  path: string;
+  /** `null` は遮断 (deny)。 */
+  level: ApiAccessLevel | null;
 }
 
-/** `PUT /admin/policy` — 却下時も同じ形で理由が返る。 */
-export interface ApiPolicySaveResult {
+export interface ApiRoleTest {
+  expect: ApiExpectation;
+  path: string;
+}
+
+/** `GET /admin/roles` の 1 行。そのまま画面のテーブル 1 行になる。 */
+export interface ApiRole {
+  name: string;
+  enabled: boolean;
+  generation: number;
+  updatedAt: string;
+  rules: ApiRoleRule[];
+  tests: ApiRoleTest[];
+  memberCount: number;
+  /** 実在しないパスを指しているルール。 */
+  danglingPaths: string[];
+}
+
+export interface ApiRoleList {
+  roles: ApiRole[];
+  warnings: ApiPolicyIssue[];
+}
+
+export interface ApiRoleGeneration {
+  generation: number;
+  createdAt: string;
+  createdBy: number;
+  rules: ApiRoleRule[];
+  tests: ApiRoleTest[];
+  current: boolean;
+}
+
+/** `GET /admin/roles/:name` — 一覧の 1 行に世代の一覧を足したもの。 */
+export interface ApiRoleDetail extends ApiRole {
+  generations: Array<{
+    generation: number;
+    createdAt: string;
+    createdBy: number;
+    ruleCount: number;
+    testCount: number;
+    current: boolean;
+  }>;
+}
+
+/** ロールの保存結果。却下時も同じ形で理由が返る。 */
+export interface ApiRoleSaveResult {
   ok: boolean;
-  version?: number;
+  generation?: number;
   errors: ApiPolicyIssue[];
   testFailures: ApiPolicyTestFailure[];
   warnings: ApiPolicyIssue[];
   assertionFailures: ApiAssertionFailure[];
-  /** admin 不在・版競合など、文書の外側の理由。 */
+  /** admin 不在・競合など、定義の外側の理由。 */
   rejection?: string;
-}
-
-export interface ApiPolicyVersion {
-  version: number;
-  createdAt: string;
-  createdBy: number;
-  bytes: number;
-  current: boolean;
+  /** 削除時のみ: 一緒に外れた割り当ての数。 */
+  removedAssignments?: number;
 }
 
 export interface ApiAssignment {

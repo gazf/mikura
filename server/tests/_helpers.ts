@@ -5,8 +5,8 @@ import { _resetAuthCachesForTesting } from "../src/services/auth.service.ts";
 import {
   _resetPolicyCachesForTesting,
   assignRole,
-  getActivePolicyWithVersion,
-  installBootstrapPolicy,
+  getRoleView,
+  putRoleUnchecked,
 } from "../src/services/policy.service.ts";
 import type { AccessLevel, User } from "../src/types.ts";
 
@@ -61,8 +61,7 @@ export interface SeedOptions {
  * 認可テストの最小セット: user 1 人 + その user 専用ロール 1 つ (ADR-035)。
  * `permissions` はそのロールの allow ルールになる。
  *
- * ポリシー文書は 1 つしか無いので、複数回呼ぶと既存の文書に role ブロックを
- * 追記する形で積み上がる。
+ * ロールは 1 つ = 1 レコードなので、複数回呼べばその数だけ増える。
  */
 export async function seedUser(kv: Deno.Kv, opts: SeedOptions): Promise<void> {
   const user: User = {
@@ -84,20 +83,21 @@ export async function seedUser(kv: Deno.Kv, opts: SeedOptions): Promise<void> {
 }
 
 /**
- * ポリシー文書にロールを 1 つ追記する。同名が既にあれば何もしない
+ * ロールを 1 つ用意する。同名が既にあれば何もしない
  * (複数ユーザーで 1 ロールを共有するテストのため)。
+ *
+ * `saveRole` は admin 不在検査を通すが、テストの多くは admin を作らない。
+ * ここは KV を直接触る seed なので、その検査を通らない低レベル経路を使う。
  */
 export async function seedRole(
   roleName: string,
   permissions: Array<{ path: string; accessLevel: AccessLevel }>,
 ): Promise<void> {
-  const { policy } = await getActivePolicyWithVersion();
-  if (policy.document.roles.some((r) => r.name === roleName)) return;
-  const rules = permissions
-    .map((p) => `  allow ${p.accessLevel} ${p.path}`)
-    .join("\n");
-  const block = `role ${roleName} {\n${rules}\n}\n`;
-  await installBootstrapPolicy(policy.text + block, 0);
+  if (await getRoleView(roleName)) return;
+  await putRoleUnchecked(roleName, true, {
+    rules: permissions.map((p) => ({ path: p.path, level: p.accessLevel })),
+    tests: [],
+  }, 0);
 }
 
 /**

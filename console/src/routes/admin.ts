@@ -21,6 +21,13 @@ const HASH_RE = /^[a-f0-9]{64}$/;
 /** ロール名 (ADR-035)。上流のパスに載るので console 側でも形を固定する。 */
 const ROLE_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
 
+/** `:name` を検証して取り出す。中継先のパスに載せる前の検査。 */
+function roleParam(c: Context<ConsoleEnv>): string | null {
+  const raw = c.req.param("name" as never) as string | undefined;
+  if (raw === undefined || !ROLE_NAME_RE.test(raw)) return null;
+  return raw;
+}
+
 /** 逆方向診断の level。上流の query に載せる前に列挙で閉じる。 */
 const ACCESS_LEVELS: ReadonlySet<string> = new Set([
   "visible",
@@ -101,14 +108,104 @@ export function registerAdminRoutes(app: Hono<ConsoleEnv>) {
     );
   });
 
-  // ---- Policy document (ADR-035) ----
+  // ---- Roles (ADR-036) ----
 
-  /**
-   * ポリシーは 1 本のテキスト文書として読み書きする。ルール行ごとの
-   * endpoint は作らない — 「誰が何にアクセスできるか」を 1 つの成果物として
-   * 読める / diff できることが設計の目的で、行 API を生やすと旧 permission
-   * 行の山に戻る。
-   */
+  app.get("/console/api/roles", async (c) => {
+    const { api } = c.get("deps");
+    return relay(c, await api.get(c.get("session").token, "/admin/roles"));
+  });
+
+  app.get("/console/api/roles/:name", async (c) => {
+    const { api } = c.get("deps");
+    const name = roleParam(c);
+    if (name === null) return c.json({ message: "Invalid role name" }, 400);
+    return relay(
+      c,
+      await api.get(c.get("session").token, `/admin/roles/${name}`),
+    );
+  });
+
+  app.put("/console/api/roles/:name", async (c) => {
+    const { api } = c.get("deps");
+    const name = roleParam(c);
+    if (name === null) return c.json({ message: "Invalid role name" }, 400);
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ message: "Invalid JSON body" }, 400);
+    }
+    return relay(
+      c,
+      await api.put(c.get("session").token, `/admin/roles/${name}`, body),
+    );
+  });
+
+  app.delete("/console/api/roles/:name", async (c) => {
+    const { api } = c.get("deps");
+    const name = roleParam(c);
+    if (name === null) return c.json({ message: "Invalid role name" }, 400);
+    return relay(
+      c,
+      await api.delete(c.get("session").token, `/admin/roles/${name}`),
+    );
+  });
+
+  app.post("/console/api/roles/:name/enabled", async (c) => {
+    const { api } = c.get("deps");
+    const name = roleParam(c);
+    if (name === null) return c.json({ message: "Invalid role name" }, 400);
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ message: "Invalid JSON body" }, 400);
+    }
+    return relay(
+      c,
+      await api.post(
+        c.get("session").token,
+        `/admin/roles/${name}/enabled`,
+        body,
+      ),
+    );
+  });
+
+  app.post("/console/api/roles/:name/generation", async (c) => {
+    const { api } = c.get("deps");
+    const name = roleParam(c);
+    if (name === null) return c.json({ message: "Invalid role name" }, 400);
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ message: "Invalid JSON body" }, 400);
+    }
+    return relay(
+      c,
+      await api.post(
+        c.get("session").token,
+        `/admin/roles/${name}/generation`,
+        body,
+      ),
+    );
+  });
+
+  app.get("/console/api/roles/:name/generations", async (c) => {
+    const { api } = c.get("deps");
+    const name = roleParam(c);
+    if (name === null) return c.json({ message: "Invalid role name" }, 400);
+    return relay(
+      c,
+      await api.get(
+        c.get("session").token,
+        `/admin/roles/${name}/generations`,
+      ),
+    );
+  });
+
+  // ---- Policy text (取り込み / 書き出し) ----
+
   app.get("/console/api/policy", async (c) => {
     const { api } = c.get("deps");
     return relay(c, await api.get(c.get("session").token, "/admin/policy"));
@@ -125,27 +222,6 @@ export function registerAdminRoutes(app: Hono<ConsoleEnv>) {
     return relay(
       c,
       await api.put(c.get("session").token, "/admin/policy", body),
-    );
-  });
-
-  app.get("/console/api/policy/versions", async (c) => {
-    const { api } = c.get("deps");
-    return relay(
-      c,
-      await api.get(c.get("session").token, "/admin/policy/versions"),
-    );
-  });
-
-  app.get("/console/api/policy/versions/:version", async (c) => {
-    const { api } = c.get("deps");
-    const version = intParam(c, "version");
-    if (version === null) return c.json({ message: "Invalid version" }, 400);
-    return relay(
-      c,
-      await api.get(
-        c.get("session").token,
-        `/admin/policy/versions/${version}`,
-      ),
     );
   });
 

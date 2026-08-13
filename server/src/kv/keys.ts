@@ -3,8 +3,8 @@
  *
  * ["users", id]                      → User
  * ["users_by_name", name]            → id (セカンダリインデックス)
- * ["policy_current"]                 → number (適用中の版番号) (ADR-035)
- * ["policy_versions", version]       → PolicyVersion (原文 + 誰がいつ)
+ * ["roles", name]                    → RoleRecord (有効・無効 + 適用中の世代) (ADR-036)
+ * ["role_generations", name, gen]    → RoleGeneration (ルールとテストの実体)
  * ["user_roles", userId, roleName]   → true
  * ["role_users", roleName, userId]   → true (「誰がこのロールを持つか」の逆引き)
  * ["assertions", id]                 → AccessAssertion (割り当て層の主張)
@@ -25,12 +25,18 @@
 export const Keys = {
   user: (id: number): Deno.KvKey => ["users", id],
   userByName: (name: string): Deno.KvKey => ["users_by_name", name],
-  // ----- ADR-035: ポリシー文書とロール割り当て -----
-  /** 適用中の版番号。差し替えは atomic に版の set と一緒に行う。 */
-  policyCurrent: (): Deno.KvKey => ["policy_current"],
-  policyVersion: (version: number): Deno.KvKey => ["policy_versions", version],
-  /** 版の一覧 (diff / rollback 用)。 */
-  policyVersionsPrefix: (): Deno.KvKey => ["policy_versions"],
+  // ----- ADR-035 / ADR-036: ロール定義と割り当て -----
+  role: (name: string): Deno.KvKey => ["roles", name],
+  rolesPrefix: (): Deno.KvKey => ["roles"],
+  roleGeneration: (name: string, generation: number): Deno.KvKey => [
+    "role_generations",
+    name,
+    generation,
+  ],
+  roleGenerationsPrefix: (name: string): Deno.KvKey => [
+    "role_generations",
+    name,
+  ],
   userRole: (userId: number, roleName: string): Deno.KvKey => [
     "user_roles",
     userId,

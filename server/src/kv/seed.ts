@@ -3,8 +3,8 @@ import { Keys } from "./keys.ts";
 import {
   assignRole,
   findAdminRoleNames,
-  getActivePolicyWithVersion,
-  installBootstrapPolicy,
+  importPolicyText,
+  listRoles,
 } from "../services/policy.service.ts";
 import type { TokenData, User } from "../types.ts";
 
@@ -105,8 +105,8 @@ export async function seedIfEmpty(rawToken?: string): Promise<void> {
     throw new Error("Failed to seed database");
   }
 
-  // ポリシー投入 → 割り当ての順。逆にすると「未定義のロール」で弾かれる。
-  await installBootstrapPolicy(BOOTSTRAP_POLICY, adminId);
+  // ロール投入 → 割り当ての順。逆にすると「未定義のロール」で弾かれる。
+  await importPolicyText(BOOTSTRAP_POLICY, adminId, { skipGuards: true });
   const assigned = await assignRole(adminId, "admins");
   if (!assigned.ok) {
     throw new Error(`Failed to assign bootstrap role: ${assigned.error}`);
@@ -226,9 +226,16 @@ async function printExistingSeed(kv: Deno.Kv, adminId: number): Promise<void> {
  */
 async function installPolicyFromFile(path: string): Promise<void> {
   const text = await Deno.readTextFile(path);
-  const version = await installBootstrapPolicy(text, 0);
-  console.log(`Policy installed as version ${version}.`);
-  console.log("  (割り当ては変更していません)");
+  const result = await importPolicyText(text, 0, { skipGuards: true });
+  if (!result.ok) {
+    for (const e of result.errors) {
+      console.error(`  ${e.line}行目: ${e.message}`);
+    }
+    console.error("取り込めませんでした。");
+    Deno.exit(1);
+  }
+  console.log(`${result.roles} 個のロールを取り込みました。`);
+  console.log("  (既存のロールは置き換えられ、割り当ては変更していません)");
 }
 
 /**
@@ -253,12 +260,13 @@ async function grantAdmin(kv: Deno.Kv, userName: string): Promise<void> {
   }
   const userId = userIdEntry.value;
 
-  // ポリシーがまだ無ければブートストラップを入れる。既にあるなら
-  // **上書きしない** — 運用中の文書を復旧コマンドが書き換えるのは筋が悪い。
-  const { version } = await getActivePolicyWithVersion();
-  if (version === 0) {
-    const installed = await installBootstrapPolicy(BOOTSTRAP_POLICY, userId);
-    console.log(`Bootstrap policy installed as version ${installed}.`);
+  // ロールがまだ 1 つも無ければブートストラップを入れる。既にあるなら
+  // **上書きしない** — 運用中の定義を復旧コマンドが書き換えるのは筋が悪い。
+  if ((await listRoles()).length === 0) {
+    const installed = await importPolicyText(BOOTSTRAP_POLICY, userId, {
+      skipGuards: true,
+    });
+    console.log(`Bootstrap roles installed (${installed.roles}).`);
   }
 
   const adminRoles = await findAdminRoleNames();

@@ -247,6 +247,7 @@ None outstanding. Two known follow-ups live outside this ADR: the case-sensitivi
 
 ### Relationship to other ADRs
 
+- **Revised by ADR-036** on storage and editing: roles are stored one per record with per-role generations and an enabled flag, and the text document becomes a derived import/export format. Everything in this ADR about the *model* — evaluation, levels, invisibility, derived visibility, pinned paths, the two testing layers — is unchanged.
 - **Supersedes ADR-008.** The "user / group × path × action" model is replaced. Retained from it: walking the path hierarchy, and the `read` / `write` / `admin` levels. Discarded: per-user permission entries, groups as the permission anchor, and "OK if any of them grants" as an unordered union across the whole ancestor chain.
 - **Depends on ADR-033.** The console is the only editor for the policy document and the assignment layer, and it reaches them through `/admin/*` as a BFF.
 

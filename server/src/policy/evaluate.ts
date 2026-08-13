@@ -47,6 +47,15 @@ export interface CompiledRole {
   readonly rules: ReadonlyMap<string, RuleLevel>;
   /** allow ルールのパス (畳み済み)。派生可視性の計算に使う。 */
   readonly grants: readonly string[];
+  /**
+   * 無効化されたロールは実効水準に一切寄与しない。定義と割り当ては残るので、
+   * 「一時的に権限を止める」を設定を壊さずにできる。
+   *
+   * ロール単体テストは **無効でも評価する** — テストはそのロールの意味の記述
+   * であって、運用上の on/off とは別のものだから。止めている間にテストが
+   * 素通りするようになると、戻した時に何を保証していたのか分からなくなる。
+   */
+  readonly enabled: boolean;
 }
 
 export interface CompiledPolicy {
@@ -77,9 +86,16 @@ export function compilePolicy(
       const key = normalizeForMatch(rule.path);
       rules.set(key, rule.level);
       if (rule.level !== null) grants.push(key);
+      // pin は無効なロールのルールも対象にする。無効化は一時的なもので、
+      // その間にフォルダを消されるとルールが宙に浮く。
       for (const a of selfAndAncestors(key)) pinned.add(a);
     }
-    roles.set(foldAscii(role.name), { name: role.name, rules, grants });
+    roles.set(foldAscii(role.name), {
+      name: role.name,
+      rules,
+      grants,
+      enabled: role.enabled,
+    });
   }
 
   return { text, document, roles, pinnedPaths: pinned };
@@ -105,6 +121,7 @@ export function getRole(
 /**
  * role 単体の水準。最近傍祖先のルール 1 本だけが結果を決める
  * (allow → そのレベル / deny → null / 無し → null)。
+ * 有効・無効は見ない (呼び出し側の責務)。
  */
 function roleLevel(role: CompiledRole, normalized: string): AccessLevel | null {
   for (const candidate of selfAndAncestors(normalized)) {
@@ -115,9 +132,27 @@ function roleLevel(role: CompiledRole, normalized: string): AccessLevel | null {
 }
 
 /**
+ * 有効・無効を無視して 1 ロールだけを評価する。ロール単体テスト用。
+ */
+export function roleOnlyLevel(
+  policy: CompiledPolicy,
+  roleName: string,
+  path: string,
+): EffectiveLevel {
+  const role = policy.roles.get(foldAscii(roleName));
+  if (!role) return null;
+  const normalized = normalizeForMatch(path);
+  const level = roleLevel(role, normalized);
+  if (level !== null) return level;
+  return role.grants.some((g) => isProperAncestor(normalized, g))
+    ? "visible"
+    : null;
+}
+
+/**
  * user の実効水準。`roleNames` は user に割り当てられた role 名 (順不同)。
- * 未知の role 名は黙って無視する — 割り当てが残ったまま role が消えても
- * 評価は落ちない (コンソール側が警告で拾う)。
+ * 未知の role 名と無効化された role は黙って無視する — 割り当てが残ったまま
+ * role が消えても評価は落ちない (コンソール側が警告で拾う)。
  */
 export function effectiveLevel(
   policy: CompiledPolicy,
@@ -130,7 +165,7 @@ export function effectiveLevel(
 
   for (const name of roleNames) {
     const role = policy.roles.get(foldAscii(name));
-    if (!role) continue;
+    if (!role || !role.enabled) continue;
     const level = roleLevel(role, normalized);
     if (level !== null && rank(level) > rank(best)) best = level;
     if (!visible) {

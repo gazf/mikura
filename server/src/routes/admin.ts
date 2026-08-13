@@ -28,20 +28,27 @@ import {
   listEnrollmentsByUser,
 } from "../services/enrollment.service.ts";
 import {
+  activateGeneration,
   assignRole,
   createAssertion,
   deleteAssertion,
+  deleteRole,
+  exportPolicyText,
   getActivePolicy,
-  getActivePolicyWithVersion,
-  getPolicyVersion,
+  getRoleMembers,
+  getRoleView,
   getUserRoles,
+  importPolicyText,
   listAssertions,
   listAssignments,
-  listPolicyVersions,
-  savePolicy,
+  listRoleGenerations,
+  listRoles,
+  saveRole,
+  setRoleEnabled,
   unassignAllRoles,
   unassignRole,
 } from "../services/policy.service.ts";
+import type { RoleRule, RoleTestCase } from "../policy/render.ts";
 import { TEST_EXPECTATIONS, type TestExpectation } from "../policy/document.ts";
 import {
   effectiveLevel,
@@ -49,7 +56,6 @@ import {
   hasAccess,
 } from "../policy/evaluate.ts";
 import { findDanglingRules, validatePolicy } from "../policy/validate.ts";
-import { foldAscii } from "../policy/paths.ts";
 import { getTree } from "../services/file.service.ts";
 import { getKv } from "../kv/store.ts";
 import { Keys } from "../kv/keys.ts";
@@ -133,6 +139,54 @@ function isTestExpectation(v: unknown): v is TestExpectation {
  * 落ちて、理由が利用者に伝わらない。
  */
 const POLICY_MAX_BYTES = 32 * 1024;
+
+const ROLE_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
+
+/** URL パスに載るロール名。上流に流す前にここで形を固定する。 */
+function roleNameParam(
+  c: { req: { param: (n: never) => string } },
+): string | null {
+  const raw = c.req.param("name" as never) as string | undefined;
+  if (raw === undefined || !ROLE_NAME_RE.test(raw)) return null;
+  return raw;
+}
+
+/** ルール配列の検証。壊れた形は文字列 (エラーメッセージ) で返す。 */
+function parseRules(v: unknown): RoleRule[] | string {
+  if (v === undefined) return [];
+  if (!Array.isArray(v)) return "rules must be an array";
+  const out: RoleRule[] = [];
+  for (const item of v) {
+    if (typeof item !== "object" || item === null) {
+      return "rule must be an object";
+    }
+    const r = item as { path?: unknown; level?: unknown };
+    if (!isValidPath(r.path)) return "rule.path must be an absolute path";
+    if (r.level !== null && !isValidAccessLevel(r.level)) {
+      return "rule.level must be read / write / admin, or null for deny";
+    }
+    out.push({ path: r.path, level: r.level as AccessLevel | null });
+  }
+  return out;
+}
+
+function parseTests(v: unknown): RoleTestCase[] | string {
+  if (v === undefined) return [];
+  if (!Array.isArray(v)) return "tests must be an array";
+  const out: RoleTestCase[] = [];
+  for (const item of v) {
+    if (typeof item !== "object" || item === null) {
+      return "test must be an object";
+    }
+    const t = item as { path?: unknown; expect?: unknown };
+    if (!isValidPath(t.path)) return "test.path must be an absolute path";
+    if (!isTestExpectation(t.expect)) {
+      return `test.expect must be one of ${TEST_EXPECTATIONS.join(" / ")}`;
+    }
+    out.push({ path: t.path, expect: t.expect });
+  }
+  return out;
+}
 
 function countMembers(
   assignments: ReadonlyMap<number, readonly string[]>,
@@ -304,29 +358,28 @@ export function registerAdminRoutes(app: Hono<Env>) {
     return c.json({ deleted: id }, 200);
   });
 
-  // ---- Policy document (ADR-035) ----
+  // ---- Roles (ADR-036) ----
 
   /**
-   * 適用中のポリシー原文と、その静的な健康診断。
+   * ロール一覧。1 行 = 1 ロールで、そのまま画面のテーブルになる。
    *
-   * `warnings` は保存を止めない指摘 (何も削らない deny 等)、`dangling` は
-   * 実在しないパスを指しているルール。タイポ・大小文字違い・削除・API 外の
-   * `mv` の 4 つが 1 つの信号にまとまる。
+   * `warnings` と `dangling` は全体を見ないと出せないので、一覧に添えて返す。
    */
-  app.get("/admin/policy", async (c) => {
+  app.get("/admin/roles", async (c) => {
     const user = c.get("user");
     const auth = await requireAdmin(user);
     if (!auth.ok) return c.json({ message: "Forbidden" }, auth.status);
 
-    const { version, policy } = await getActivePolicyWithVersion();
-    const assignments = await listAssignments();
+    const [roles, assignments, policy] = await Promise.all([
+      listRoles(),
+      listAssignments(),
+      getActivePolicy(),
+    ]);
     const assignedRoleNames = new Set<string>();
-    for (const [, roles] of assignments) {
-      for (const r of roles) assignedRoleNames.add(r);
+    for (const [, names] of assignments) {
+      for (const n of names) assignedRoleNames.add(n);
     }
-
     const validation = validatePolicy(policy.text, { assignedRoleNames });
-    const record = version > 0 ? await getPolicyVersion(version) : null;
 
     let dangling: Array<{ role: string; path: string; line: number }> = [];
     try {
@@ -334,51 +387,189 @@ export function registerAdminRoutes(app: Hono<Env>) {
       dangling = findDanglingRules(policy, tree.map((n) => n.path));
     } catch (e) {
       // ツリーが読めない (ストレージ未マウント等) 場合、孤立検査だけ諦める。
-      // ポリシー本体の表示は落とさない。
       console.error("dangling rule scan failed:", e);
     }
 
     return c.json({
-      version,
-      text: policy.text,
-      createdAt: record?.createdAt ?? null,
-      createdBy: record?.createdBy ?? null,
-      // コンソールはロール単位のフォームで編集するが、保存は文書まるごとの
-      // PUT に戻る。そのために「このロールは原文の何行目から何行目か」を返す
-      // — フォームの結果をその範囲だけ差し替えれば、手書きのコメントや
-      // ロールの並び順が保たれる (全体を再生成するとコメントが消える)。
-      roles: policy.document.roles.map((r) => ({
+      roles: roles.map((r) => ({
         name: r.name,
-        line: r.line,
-        endLine: r.endLine,
-        rules: r.rules.map((rule) => ({ path: rule.path, level: rule.level })),
-        tests: policy.document.tests
-          .filter((t) => foldAscii(t.role) === foldAscii(r.name))
-          .map((t) => ({
-            line: t.line,
-            endLine: t.endLine,
-            cases: t.cases.map((c) => ({ expect: c.expect, path: c.path })),
-          })),
+        enabled: r.enabled,
+        generation: r.generation,
+        updatedAt: r.updatedAt,
+        rules: r.rules,
+        tests: r.tests,
         memberCount: countMembers(assignments, r.name),
+        danglingPaths: dangling
+          .filter((d) => d.role === r.name)
+          .map((d) => d.path),
       })),
       warnings: validation.warnings,
-      dangling,
+    });
+  });
+
+  app.get("/admin/roles/:name", async (c) => {
+    const user = c.get("user");
+    const auth = await requireAdmin(user);
+    if (!auth.ok) return c.json({ message: "Forbidden" }, auth.status);
+
+    const name = roleNameParam(c);
+    if (name === null) return c.json({ message: "Invalid role name" }, 400);
+    const view = await getRoleView(name);
+    if (!view) return c.json({ message: "Not found" }, 404);
+    const generations = await listRoleGenerations(view.name);
+    return c.json({
+      ...view,
+      memberCount: (await getRoleMembers(view.name)).length,
+      generations: generations.map((g) => ({
+        generation: g.generation,
+        createdAt: g.createdAt,
+        createdBy: g.createdBy,
+        ruleCount: g.rules.length,
+        testCount: g.tests.length,
+        current: g.generation === view.generation,
+      })),
     });
   });
 
   /**
-   * ポリシーの差し替え。`dryRun` を渡すと KV に触らず検証結果だけ返す。
+   * ロールの作成 / 更新。成功すると新しい世代が 1 つ積まれ、それが適用される。
    *
-   * 検証の順序は 構文 → ロール単体テスト → 割り当て層の拒否権 → admin 不在検査。
-   * 最後の 2 つは文書の外側の理由なので、文書だけ見ても分からない。
-   * 却下は全部 422 (= 形式は JSON として正しいが内容が受け入れられない)。
+   * 検証はロール単体ではなく **常に全ロールに対して** 走る (ロールをまたぐ
+   * 警告も admin 不在検査もアサーションも、全体を見ないと判定できない)。
+   * 却下は 422。
    */
+  app.put("/admin/roles/:name", async (c) => {
+    const user = c.get("user");
+    const auth = await requireAdmin(user);
+    if (!auth.ok) return c.json({ message: "Forbidden" }, auth.status);
+
+    const name = roleNameParam(c);
+    if (name === null) return c.json({ message: "Invalid role name" }, 400);
+
+    let body: {
+      rules?: unknown;
+      tests?: unknown;
+      enabled?: unknown;
+      dryRun?: unknown;
+    };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ message: "Invalid JSON body" }, 400);
+    }
+
+    const rules = parseRules(body.rules);
+    if (typeof rules === "string") return c.json({ message: rules }, 400);
+    const tests = parseTests(body.tests);
+    if (typeof tests === "string") return c.json({ message: tests }, 400);
+    if (body.enabled !== undefined && typeof body.enabled !== "boolean") {
+      return c.json({ message: "enabled must be a boolean" }, 400);
+    }
+
+    const result = await saveRole({
+      name,
+      enabled: body.enabled === undefined ? true : body.enabled,
+      definition: { rules, tests },
+      updatedBy: user.id,
+    }, { dryRun: body.dryRun === true });
+
+    return c.json(result, result.ok ? 200 : 422);
+  });
+
+  /** 有効・無効の切り替え。定義も割り当ても触らず、世代も増えない。 */
+  app.post("/admin/roles/:name/enabled", async (c) => {
+    const user = c.get("user");
+    const auth = await requireAdmin(user);
+    if (!auth.ok) return c.json({ message: "Forbidden" }, auth.status);
+
+    const name = roleNameParam(c);
+    if (name === null) return c.json({ message: "Invalid role name" }, 400);
+
+    let body: { enabled?: unknown };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ message: "Invalid JSON body" }, 400);
+    }
+    if (typeof body.enabled !== "boolean") {
+      return c.json({ message: "enabled required (boolean)" }, 400);
+    }
+
+    const result = await setRoleEnabled(name, body.enabled, user.id);
+    return c.json(result, result.ok ? 200 : 422);
+  });
+
+  /** 適用する世代の切り替え。世代は増えない。 */
+  app.post("/admin/roles/:name/generation", async (c) => {
+    const user = c.get("user");
+    const auth = await requireAdmin(user);
+    if (!auth.ok) return c.json({ message: "Forbidden" }, auth.status);
+
+    const name = roleNameParam(c);
+    if (name === null) return c.json({ message: "Invalid role name" }, 400);
+
+    let body: { generation?: unknown };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ message: "Invalid JSON body" }, 400);
+    }
+    if (typeof body.generation !== "number") {
+      return c.json({ message: "generation required (number)" }, 400);
+    }
+
+    const result = await activateGeneration(name, body.generation, user.id);
+    return c.json(result, result.ok ? 200 : 422);
+  });
+
+  /** 世代の中身 (編集画面で「この世代の内容」を見せるため)。 */
+  app.get("/admin/roles/:name/generations", async (c) => {
+    const user = c.get("user");
+    const auth = await requireAdmin(user);
+    if (!auth.ok) return c.json({ message: "Forbidden" }, auth.status);
+
+    const name = roleNameParam(c);
+    if (name === null) return c.json({ message: "Invalid role name" }, 400);
+    const view = await getRoleView(name);
+    if (!view) return c.json({ message: "Not found" }, 404);
+    const generations = await listRoleGenerations(view.name);
+    return c.json(generations.map((g) => ({
+      ...g,
+      current: g.generation === view.generation,
+    })));
+  });
+
+  app.delete("/admin/roles/:name", async (c) => {
+    const user = c.get("user");
+    const auth = await requireAdmin(user);
+    if (!auth.ok) return c.json({ message: "Forbidden" }, auth.status);
+
+    const name = roleNameParam(c);
+    if (name === null) return c.json({ message: "Invalid role name" }, 400);
+    const result = await deleteRole(name);
+    return c.json(result, result.ok ? 200 : 422);
+  });
+
+  // ---- Policy text (取り込み / 書き出し) ----
+
+  /**
+   * ロール定義のテキスト表現。保管の実体はロールのレコードで、これはそこから
+   * 決定的に導出される派生物 (ADR-036)。レビューと他所への持ち出しに使う。
+   */
+  app.get("/admin/policy", async (c) => {
+    const user = c.get("user");
+    const auth = await requireAdmin(user);
+    if (!auth.ok) return c.json({ message: "Forbidden" }, auth.status);
+    return c.json({ text: await exportPolicyText() });
+  });
+
+  /** 取り込み。**併合ではなく置き換え**なので、既存のロールは全部消える。 */
   app.put("/admin/policy", async (c) => {
     const user = c.get("user");
     const auth = await requireAdmin(user);
     if (!auth.ok) return c.json({ message: "Forbidden" }, auth.status);
 
-    let body: { text?: unknown; expectedVersion?: unknown; dryRun?: unknown };
+    let body: { text?: unknown };
     try {
       body = await c.req.json();
     } catch {
@@ -393,51 +584,9 @@ export function registerAdminRoutes(app: Hono<Env>) {
         400,
       );
     }
-    if (
-      body.expectedVersion !== undefined &&
-      typeof body.expectedVersion !== "number"
-    ) {
-      return c.json({ message: "expectedVersion must be a number" }, 400);
-    }
 
-    const result = await savePolicy({
-      text: body.text,
-      createdBy: user.id,
-      expectedVersion: body.expectedVersion as number | undefined,
-    }, { dryRun: body.dryRun === true });
-
+    const result = await importPolicyText(body.text, user.id);
     return c.json(result, result.ok ? 200 : 422);
-  });
-
-  /** 版の一覧 (diff / rollback 用)。本文は含めない。 */
-  app.get("/admin/policy/versions", async (c) => {
-    const user = c.get("user");
-    const auth = await requireAdmin(user);
-    if (!auth.ok) return c.json({ message: "Forbidden" }, auth.status);
-
-    const versions = await listPolicyVersions();
-    const current = (await getActivePolicyWithVersion()).version;
-    return c.json(versions.map((v) => ({
-      version: v.version,
-      createdAt: v.createdAt,
-      createdBy: v.createdBy,
-      bytes: v.text.length,
-      current: v.version === current,
-    })));
-  });
-
-  app.get("/admin/policy/versions/:version", async (c) => {
-    const user = c.get("user");
-    const auth = await requireAdmin(user);
-    if (!auth.ok) return c.json({ message: "Forbidden" }, auth.status);
-
-    const version = parseInt(c.req.param("version"), 10);
-    if (!Number.isFinite(version)) {
-      return c.json({ message: "Invalid version" }, 400);
-    }
-    const record = await getPolicyVersion(version);
-    if (!record) return c.json({ message: "Not found" }, 404);
-    return c.json(record);
   });
 
   // ---- Assignments (user × role) ----

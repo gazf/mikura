@@ -66,8 +66,9 @@ Deno.test("中継先は /admin/* と GET /tree に限られる", async () => {
     ["GET", "/console/api/users"],
     ["GET", "/console/api/users/2"],
     ["GET", "/console/api/policy"],
-    ["GET", "/console/api/policy/versions"],
-    ["GET", "/console/api/policy/versions/3"],
+    ["GET", "/console/api/roles"],
+    ["GET", "/console/api/roles/viewers"],
+    ["GET", "/console/api/roles/viewers/generations"],
     ["GET", "/console/api/assignments"],
     ["GET", "/console/api/assertions"],
     ["GET", "/console/api/diagnostics/effective?userId=1&path=/a"],
@@ -109,7 +110,6 @@ Deno.test("数値でない id はパスに載る前に 400 (upstream に届か�
   const bad = [
     ["GET", "/console/api/users/abc"],
     ["DELETE", "/console/api/users/abc"],
-    ["GET", "/console/api/policy/versions/abc"],
     ["DELETE", "/console/api/assertions/abc"],
     ["DELETE", "/console/api/assignments/xyz/viewers"],
   ];
@@ -165,13 +165,17 @@ Deno.test("診断の path は percent-encode されて query 境界を壊さな�
 
 Deno.test("ロール名は形式を固定してからパスに載せる", async () => {
   const h = makeHarness();
+  const paths = (bad: string) =>
+    [
+      ["DELETE", `/console/api/assignments/1/${encodeURIComponent(bad)}`],
+      ["GET", `/console/api/roles/${encodeURIComponent(bad)}`],
+      ["DELETE", `/console/api/roles/${encodeURIComponent(bad)}`],
+    ] as const;
   for (const bad of ["../../admin/users", "-leading", "with space"]) {
-    const res = await h.app.fetch(
-      req("DELETE", `/console/api/assignments/1/${encodeURIComponent(bad)}`, {
-        cookie: h.cookie,
-      }),
-    );
-    assertEquals(res.status, 400, `${bad} が 400 になっていない`);
+    for (const [method, path] of paths(bad)) {
+      const res = await h.app.fetch(req(method, path, { cookie: h.cookie }));
+      assertEquals(res.status, 400, `${method} ${path} が 400 になっていない`);
+    }
   }
   assertEquals(h.api.calls.length, 0);
 
@@ -181,6 +185,11 @@ Deno.test("ロール名は形式を固定してからパスに載せる", async 
     }),
   );
   assertEquals(h.api.lastCall?.path, "/admin/assignments/1/projects-editor");
+
+  await h.app.fetch(
+    req("GET", "/console/api/roles/projects-editor", { cookie: h.cookie }),
+  );
+  assertEquals(h.api.lastCall?.path, "/admin/roles/projects-editor");
 });
 
 Deno.test("診断の level は列挙で閉じる (任意の文字列を上流に流さない)", async () => {
