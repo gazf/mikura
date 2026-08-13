@@ -49,6 +49,7 @@ import {
   hasAccess,
 } from "../policy/evaluate.ts";
 import { findDanglingRules, validatePolicy } from "../policy/validate.ts";
+import { foldAscii } from "../policy/paths.ts";
 import { getTree } from "../services/file.service.ts";
 import { getKv } from "../kv/store.ts";
 import { Keys } from "../kv/keys.ts";
@@ -342,10 +343,22 @@ export function registerAdminRoutes(app: Hono<Env>) {
       text: policy.text,
       createdAt: record?.createdAt ?? null,
       createdBy: record?.createdBy ?? null,
+      // コンソールはロール単位のフォームで編集するが、保存は文書まるごとの
+      // PUT に戻る。そのために「このロールは原文の何行目から何行目か」を返す
+      // — フォームの結果をその範囲だけ差し替えれば、手書きのコメントや
+      // ロールの並び順が保たれる (全体を再生成するとコメントが消える)。
       roles: policy.document.roles.map((r) => ({
         name: r.name,
         line: r.line,
+        endLine: r.endLine,
         rules: r.rules.map((rule) => ({ path: rule.path, level: rule.level })),
+        tests: policy.document.tests
+          .filter((t) => foldAscii(t.role) === foldAscii(r.name))
+          .map((t) => ({
+            line: t.line,
+            endLine: t.endLine,
+            cases: t.cases.map((c) => ({ expect: c.expect, path: c.path })),
+          })),
         memberCount: countMembers(assignments, r.name),
       })),
       warnings: validation.warnings,

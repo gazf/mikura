@@ -165,3 +165,19 @@ test a {
   assert(errors[0].message.includes("role A が重複"));
   assert(errors[1].message.includes("test a が重複"));
 });
+
+Deno.test("parsePolicy: ブロックの開始行と終了行を持つ (コンソールが範囲差し替えに使う)", () => {
+  const { document, errors } = parsePolicy(`# 見出し
+
+role a {
+  allow read /a
+}
+
+test a {
+  readable /a
+}
+`);
+  assertEquals(errors, []);
+  assertEquals([document.roles[0].line, document.roles[0].endLine], [3, 5]);
+  assertEquals([document.tests[0].line, document.tests[0].endLine], [7, 9]);
+});

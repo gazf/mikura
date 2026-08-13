@@ -359,3 +359,43 @@ p.ok {
   background: color-mix(in srgb, var(--danger) 12%, transparent);
   color: var(--danger);
 }
+
+/* ---- ロール編集フォーム ---- */
+
+.card.role h4 {
+  margin: 16px 0 6px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.card.role h4:first-of-type {
+  margin-top: 8px;
+}
+
+.role-head input {
+  min-width: 220px;
+}
+
+.role-actions {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+table.form td {
+  padding: 3px 6px 3px 0;
+  border: 0;
+  vertical-align: middle;
+}
+
+table.form td.grow {
+  width: 100%;
+}
+
+table.form td.grow input {
+  width: 100%;
+}
+
+.toolbar {
+  margin-bottom: 12px;
+}

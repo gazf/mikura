@@ -57,8 +57,15 @@ export interface ApiPolicy {
   createdBy: number | null;
   roles: Array<{
     name: string;
+    /** 原文中のこのロールの範囲 (1 始まり、両端を含む)。差し替えに使う。 */
     line: number;
+    endLine: number;
     rules: Array<{ path: string; level: ApiAccessLevel | null }>;
+    tests: Array<{
+      line: number;
+      endLine: number;
+      cases: Array<{ expect: ApiExpectation; path: string }>;
+    }>;
     memberCount: number;
   }>;
   warnings: ApiPolicyIssue[];

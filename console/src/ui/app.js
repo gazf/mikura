@@ -337,30 +337,90 @@ async function renderUsers(target) {
 // -- roles (policy document) --
 
 /**
- * ポリシーは 1 本のテキストとして編集する。ルールを行ごとに CRUD させないのは
- * ADR-035 の要点そのもの — 「誰が何にアクセスできるか」を 1 つの成果物として
- * 読める / diff できることに価値があり、行 UI にすると旧権限行の山に戻る。
+ * 編集の単位はロール。ただし保存は必ず文書まるごとの PUT に戻る。
+ *
+ * ADR-035 が禁じているのは「ルール行ごとの API」であって、フォームの結果を
+ * 原文に差し戻して丸ごと保存するのは何も壊さない。検証・ロール単体テスト・
+ * アサーションの拒否権・版管理・監査は全部そのまま効く。
+ *
+ * 差し替えは **そのロールの行範囲だけ**を置き換える (全体を再生成しない)。
+ * 手書きのコメントとロールの並び順が保たれるため。
  */
+
+const LEVELS = ["read", "write", "admin"];
+const EXPECTATIONS = ["invisible", "visible", "readable", "writable", "admin"];
+
+/** ロール 1 つ分のテキストを組み立てる。列幅を揃えて読めるようにする。 */
+function renderRoleBlock(role) {
+  const lines = [`role ${role.name} {`];
+  const width = role.rules.some((r) => r.level === null) ? 5 : 5;
+  for (const rule of role.rules) {
+    if (rule.level === null) {
+      lines.push(`  ${"deny".padEnd(width)}         ${rule.path}`);
+    } else {
+      lines.push(
+        `  ${"allow".padEnd(width)}  ${rule.level.padEnd(6)} ${rule.path}`,
+      );
+    }
+  }
+  lines.push("}");
+
+  if (role.cases.length > 0) {
+    lines.push("");
+    lines.push(`test ${role.name} {`);
+    const w = Math.max(...role.cases.map((c) => c.expect.length));
+    for (const c of role.cases) {
+      lines.push(`  ${c.expect.padEnd(w)}  ${c.path}`);
+    }
+    lines.push("}");
+  }
+  return lines.join("\n");
+}
+
+/**
+ * 原文から [from, to] 行 (1 始まり・両端含む) を取り除き、replacement を挿す。
+ * ranges は複数渡せる (role ブロックと test ブロックは離れていることがある)。
+ */
+function spliceBlocks(text, ranges, replacement) {
+  const lines = text.split("\n");
+  const sorted = [...ranges].sort((a, b) => b.from - a.from);
+  let insertAt = null;
+  for (const r of sorted) {
+    lines.splice(r.from - 1, r.to - r.from + 1);
+    insertAt = r.from - 1;
+  }
+  if (replacement !== null) {
+    lines.splice(insertAt, 0, ...replacement.split("\n"));
+  }
+  // 削除で生まれた 3 行以上の空行を 1 つに畳む。
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n");
+}
+
+/** 現在のロール状態を編集用の平坦な形に落とす。 */
+function toEditable(role) {
+  return {
+    name: role.name,
+    rules: role.rules.map((r) => ({ ...r })),
+    cases: role.tests.flatMap((t) => t.cases.map((c) => ({ ...c }))),
+    ranges: [
+      { from: role.line, to: role.endLine },
+      ...role.tests.map((t) => ({ from: t.line, to: t.endLine })),
+    ],
+  };
+}
+
 async function renderRoles(target) {
-  const [policy, versions, assignments] = await Promise.all([
+  const [policy, versions] = await Promise.all([
     api.get("/console/api/policy"),
     api.get("/console/api/policy/versions"),
-    api.get("/console/api/assignments"),
   ]);
-
-  const editor = el("textarea", {
-    class: "policy",
-    spellcheck: "false",
-    rows: "22",
-  });
-  editor.value = policy.text;
 
   const report = el("div", { class: "report" });
 
-  function showResult(result, savedMessage) {
+  function showResult(result, okMessage) {
     const blocks = [];
     const group = (title, items, cls) => {
-      if (items.length === 0) return;
+      if (!items || items.length === 0) return;
       blocks.push(
         el(
           "div",
@@ -378,54 +438,335 @@ async function renderRoles(target) {
         ),
       );
     };
-    group("構文エラー", result.errors ?? [], "bad");
-    group("テスト失敗", result.testFailures ?? [], "bad");
+    group("構文エラー", result.errors, "bad");
+    group("テスト失敗", result.testFailures, "bad");
     group(
       "アサーション違反 (割り当て層が拒否)",
-      result.assertionFailures ?? [],
+      result.assertionFailures,
       "bad",
     );
     if (result.rejection) {
       group("却下", [{ line: 0, message: result.rejection }], "bad");
     }
-    group("警告", result.warnings ?? [], "warn");
-    if (result.ok && savedMessage) {
-      blocks.unshift(el("p", { class: "ok", text: savedMessage }));
+    group("警告", result.warnings, "warn");
+    if (result.ok && okMessage) {
+      blocks.unshift(el("p", { class: "ok", text: okMessage }));
     }
     report.replaceChildren(...blocks);
+    report.scrollIntoView({ block: "nearest" });
   }
 
-  const actions = el(
-    "div",
-    { class: "row" },
-    el("button", {
-      text: "検証だけする",
-      onclick: () =>
-        guard(async () => {
-          const result = await api.put("/console/api/policy", {
-            text: editor.value,
-            dryRun: true,
-          }).catch((e) => e.body ?? Promise.reject(e));
-          showResult(result, "この内容なら保存できます");
+  /** 文書を丸ごと保存する。却下されたら理由を出して画面は保つ。 */
+  async function saveDocument(text, okMessage) {
+    const result = await api.put("/console/api/policy", {
+      text,
+      expectedVersion: policy.version,
+    }).catch((e) => e.body ?? Promise.reject(e));
+    if (result.ok) {
+      toast(okMessage);
+      render();
+      return true;
+    }
+    showResult(result);
+    toast("保存できませんでした", true);
+    return false;
+  }
+
+  // ---- ロールカード ----
+
+  function roleCard(role, isNew) {
+    const draft = isNew
+      ? { name: "", rules: [], cases: [], ranges: [] }
+      : toEditable(role);
+
+    const rulesBody = el("tbody");
+    const casesBody = el("tbody");
+
+    function drawRules() {
+      rulesBody.replaceChildren(
+        ...draft.rules.map((rule, i) => {
+          const kind = el(
+            "select",
+            {
+              onchange: () => {
+                rule.level = kind.value === "deny" ? null : "read";
+                drawRules();
+              },
+            },
+            el("option", { value: "allow", text: "許可" }),
+            el("option", { value: "deny", text: "遮断" }),
+          );
+          kind.value = rule.level === null ? "deny" : "allow";
+
+          const level = el(
+            "select",
+            { onchange: () => (rule.level = level.value) },
+            LEVELS.map((l) => el("option", { value: l, text: l })),
+          );
+          if (rule.level !== null) level.value = rule.level;
+          level.disabled = rule.level === null;
+
+          const path = el("input", {
+            type: "text",
+            value: rule.path,
+            placeholder: "/projects",
+            oninput: () => (rule.path = path.value),
+          });
+
+          return el(
+            "tr",
+            null,
+            el("td", null, kind),
+            el("td", null, level),
+            el("td", { class: "grow" }, path),
+            el(
+              "td",
+              { class: "actions" },
+              el("button", {
+                text: "×",
+                title: "このルールを削除",
+                onclick: () => {
+                  draft.rules.splice(i, 1);
+                  drawRules();
+                },
+              }),
+            ),
+          );
         }),
+      );
+    }
+
+    function drawCases() {
+      casesBody.replaceChildren(
+        ...draft.cases.map((c, i) => {
+          const expect = el(
+            "select",
+            { onchange: () => (c.expect = expect.value) },
+            EXPECTATIONS.map((x) => el("option", { value: x, text: x })),
+          );
+          expect.value = c.expect;
+          const path = el("input", {
+            type: "text",
+            value: c.path,
+            placeholder: "/projects/spec.md",
+            oninput: () => (c.path = path.value),
+          });
+          return el(
+            "tr",
+            null,
+            el("td", null, expect),
+            el("td", { class: "grow" }, path),
+            el(
+              "td",
+              { class: "actions" },
+              el("button", {
+                text: "×",
+                onclick: () => {
+                  draft.cases.splice(i, 1);
+                  drawCases();
+                },
+              }),
+            ),
+          );
+        }),
+      );
+    }
+
+    drawRules();
+    drawCases();
+
+    const nameInput = el("input", {
+      type: "text",
+      value: draft.name,
+      placeholder: "projects-editor",
+      oninput: () => (draft.name = nameInput.value.trim()),
+    });
+    if (!isNew) {
+      // 改名は割り当て (user_roles) を宙に浮かせるので、ここでは許さない。
+      nameInput.disabled = true;
+      nameInput.title = "ロール名は変更できません (割り当てが外れるため)";
+    }
+
+    function apply() {
+      if (!draft.name) {
+        toast("ロール名を入力してください", true);
+        return null;
+      }
+      if (draft.rules.some((r) => !r.path.trim())) {
+        toast("パスが空のルールがあります", true);
+        return null;
+      }
+      const block = renderRoleBlock(draft);
+      if (isNew) {
+        return `${policy.text.replace(/\s*$/, "")}\n\n${block}\n`;
+      }
+      return spliceBlocks(policy.text, draft.ranges, block);
+    }
+
+    return el(
+      "div",
+      { class: "card role" },
+      el(
+        "div",
+        { class: "row role-head" },
+        el("strong", { text: isNew ? "新しいロール" : "ロール" }),
+        nameInput,
+        isNew ? null : el("span", {
+          class: "muted",
+          text: role.memberCount === 0
+            ? "未割り当て"
+            : `${role.memberCount} 人に割り当て済み`,
+        }),
+      ),
+      el("h4", { text: "ルール" }),
+      el(
+        "div",
+        { class: "scroll" },
+        el("table", { class: "form" }, rulesBody),
+      ),
+      el(
+        "div",
+        { class: "row" },
+        el("button", {
+          text: "＋ ルールを追加",
+          onclick: () => {
+            draft.rules.push({ level: "read", path: "" });
+            drawRules();
+          },
+        }),
+      ),
+      el("h4", { text: "確かめたいこと (テスト)" }),
+      el("p", {
+        class: "hint",
+        text:
+          "このロール単体での期待値です。1 つでも外れると保存できません。遮断を書いたロールには必ず 1 つ以上置いてください。",
+      }),
+      el(
+        "div",
+        { class: "scroll" },
+        el("table", { class: "form" }, casesBody),
+      ),
+      el(
+        "div",
+        { class: "row" },
+        el("button", {
+          text: "＋ テストを追加",
+          onclick: () => {
+            draft.cases.push({ expect: "readable", path: "" });
+            drawCases();
+          },
+        }),
+      ),
+      el(
+        "div",
+        { class: "row role-actions" },
+        el("button", {
+          class: "primary",
+          text: isNew ? "このロールを作成" : "保存",
+          onclick: () =>
+            guard(async () => {
+              const text = apply();
+              if (text === null) return;
+              await saveDocument(
+                text,
+                isNew
+                  ? `${draft.name} を作成しました`
+                  : `${draft.name} を保存しました`,
+              );
+            }),
+        }),
+        el("button", {
+          text: "検証だけする",
+          onclick: () =>
+            guard(async () => {
+              const text = apply();
+              if (text === null) return;
+              const result = await api.put("/console/api/policy", {
+                text,
+                dryRun: true,
+              }).catch((e) => e.body ?? Promise.reject(e));
+              showResult(result, "この内容なら保存できます");
+            }),
+        }),
+        isNew ? null : el("button", {
+          class: "danger",
+          text: "このロールを削除",
+          onclick: () =>
+            guard(async () => {
+              const warn = role.memberCount > 0
+                ? `${role.name} は ${role.memberCount} 人に割り当てられています。削除すると全員がこのロール由来の権限を失います。`
+                : `${role.name} を削除します。`;
+              if (!confirm(warn)) return;
+              await saveDocument(
+                spliceBlocks(policy.text, draft.ranges, null),
+                `${role.name} を削除しました`,
+              );
+            }),
+        }),
+      ),
+    );
+  }
+
+  // ---- 原文の直接編集 (取り込み・レビュー用) ----
+
+  const rawEditor = el("textarea", {
+    class: "policy",
+    spellcheck: "false",
+    rows: "20",
+  });
+  rawEditor.value = policy.text;
+
+  const rawCard = el(
+    "div",
+    { class: "card", hidden: "" },
+    el("p", {
+      class: "hint",
+      text:
+        "文書そのものを編集します。他所からの取り込みや、コメントを含めた全体の書き換え向け。",
     }),
+    rawEditor,
+    el(
+      "div",
+      { class: "row" },
+      el("button", {
+        class: "primary",
+        text: "保存",
+        onclick: () =>
+          guard(() => saveDocument(rawEditor.value, "保存しました")),
+      }),
+      el("button", {
+        text: "検証だけする",
+        onclick: () =>
+          guard(async () => {
+            const result = await api.put("/console/api/policy", {
+              text: rawEditor.value,
+              dryRun: true,
+            }).catch((e) => e.body ?? Promise.reject(e));
+            showResult(result, "この内容なら保存できます");
+          }),
+      }),
+    ),
+  );
+
+  const newRoleSlot = el("div", { hidden: "" });
+
+  const toolbar = el(
+    "div",
+    { class: "row toolbar" },
     el("button", {
       class: "primary",
-      text: "保存",
-      onclick: () =>
-        guard(async () => {
-          const result = await api.put("/console/api/policy", {
-            text: editor.value,
-            expectedVersion: policy.version,
-          }).catch((e) => e.body ?? Promise.reject(e));
-          if (result.ok) {
-            toast(`版 ${result.version} として保存しました`);
-            render();
-            return;
-          }
-          showResult(result);
-          toast("保存できませんでした", true);
-        }),
+      text: "＋ ロールを追加",
+      onclick: () => {
+        newRoleSlot.hidden = false;
+        newRoleSlot.replaceChildren(roleCard(null, true));
+        newRoleSlot.scrollIntoView({ block: "nearest" });
+      },
+    }),
+    el("button", {
+      text: "文書を直接編集",
+      onclick: () => {
+        rawCard.hidden = !rawCard.hidden;
+      },
     }),
     el("span", {
       class: "muted",
@@ -436,42 +777,37 @@ async function renderRoles(target) {
 
   const dangling = policy.dangling.length === 0 ? null : el(
     "div",
-    { class: "issues warn" },
-    el("h4", { text: "⚠ 実在しないパスを指しているルール" }),
+    { class: "card" },
     el(
-      "ul",
-      null,
-      policy.dangling.map((d) =>
-        el("li", {
-          text:
-            `${d.line} 行目 (${d.role}): ${d.path} — タイポ / 大小文字違い / 削除 / API 外の mv`,
-        })
+      "div",
+      { class: "issues warn" },
+      el("h4", { text: "⚠ 実在しないパスを指しているルール" }),
+      el(
+        "ul",
+        null,
+        policy.dangling.map((d) =>
+          el("li", {
+            text:
+              `${d.role}: ${d.path} — タイポ / 大小文字違い / 削除 / API 外の mv`,
+          })
+        ),
       ),
     ),
   );
 
-  const roleRows = policy.roles.map((r) =>
+  const warnings = policy.warnings.length === 0 ? null : el(
+    "div",
+    { class: "card" },
     el(
-      "tr",
-      null,
-      el("td", null, el("strong", { text: r.name })),
+      "div",
+      { class: "issues warn" },
+      el("h4", { text: "警告" }),
       el(
-        "td",
+        "ul",
         null,
-        r.rules.map((rule) =>
-          el("span", {
-            class: rule.level === null ? "pill deny" : "pill",
-            text: rule.level === null
-              ? `deny ${rule.path}`
-              : `${rule.level} ${rule.path}`,
-          })
-        ),
+        policy.warnings.map((w) => el("li", { text: w.message })),
       ),
-      el("td", {
-        class: r.memberCount === 0 ? "muted" : "",
-        text: r.memberCount === 0 ? "未割り当て" : `${r.memberCount} 人`,
-      }),
-    )
+    ),
   );
 
   const versionRows = versions.map((v) =>
@@ -485,54 +821,32 @@ async function renderRoles(target) {
         "td",
         { class: "actions" },
         v.current ? null : el("button", {
-          text: "この版を読み込む",
+          text: "この版に戻す",
           onclick: () =>
             guard(async () => {
               const record = await api.get(
                 `/console/api/policy/versions/${v.version}`,
               );
-              editor.value = record.text;
-              report.replaceChildren(
-                el("p", {
-                  class: "ok",
-                  text:
-                    `版 ${v.version} を編集欄に読み込みました。保存すると新しい版になります。`,
-                }),
-              );
+              if (!confirm(`版 ${v.version} の内容で保存し直します。`)) return;
+              await saveDocument(record.text, `版 ${v.version} に戻しました`);
             }),
         }),
       ),
     )
   );
 
-  void assignments;
-
   target.replaceChildren(
     ...heading(
       "ロール",
-      "アクセス制御ポリシー。ロールは「何を与えるか」で名付ける (projects-editor は良い名前、sales-department は悪い名前)。",
+      "ロールは「何を与えるか」で名付けます (projects-editor は良い名前、sales-department は悪い名前)。1 人だけの例外も専用ロールを 1 人に割り当てる形で表します。",
     ),
-    el(
-      "div",
-      { class: "card" },
-      el("p", {
-        class: "hint",
-        text:
-          "role <名前> { allow read|write|admin <パス> / deny <パス> } と、" +
-          "test <名前> { readable|writable|visible|invisible|admin <パス> }。" +
-          "行順は結果に影響しません。ルールが無いパスは不可視です。",
-      }),
-      editor,
-      actions,
-      report,
-    ),
+    toolbar,
+    report,
+    newRoleSlot,
+    warnings,
     dangling,
-    el(
-      "div",
-      { class: "card" },
-      el("h3", { text: "ロール一覧" }),
-      table(["ロール", "ルール", "割り当て"], roleRows),
-    ),
+    ...policy.roles.map((r) => roleCard(r, false)),
+    rawCard,
     el(
       "div",
       { class: "card" },

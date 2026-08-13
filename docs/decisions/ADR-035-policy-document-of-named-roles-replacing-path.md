@@ -238,6 +238,7 @@ The five questions this ADR left open were answered when it was built. They are 
 Two additions were made during implementation and are part of the design:
 
 - **`visible` is a fifth test adjective.** Derived visibility is the subtlest rule in the model, and without an adjective for it a role unit test cannot assert it at all. The ladder is `invisible < visible < readable < writable < admin`.
+- **The console edits per role, but saves the whole document.** "One document" is a statement about storage, review and validation, not about the editing surface — and a raw textarea makes the common case (add a role, add a rule) harder than the row editor it replaced. Each role's form composes that role's block and splices it over the block's line range, which the parser now reports; splicing rather than regenerating the document preserves hand-written comments and role ordering. What stays forbidden is a **per-rule endpoint**, because that is what would let the document stop being the unit of validation and audit. Role renaming is not offered: assignments key on the name, so a rename would silently orphan them.
 - **A `deny` defeated only by a role granting `admin /` produces no warning.** Administrators reach everything by definition, so the warning would fire on every `deny` ever written and bury the cross-role collisions that actually matter.
 
 ### Open questions

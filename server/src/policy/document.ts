@@ -35,7 +35,10 @@ export interface PolicyRule {
 export interface PolicyRole {
   readonly name: string;
   readonly rules: readonly PolicyRule[];
+  /** `role X {` の行。 */
   readonly line: number;
+  /** 閉じ `}` の行。コンソールがブロック単位で差し替えるのに使う。 */
+  readonly endLine: number;
 }
 
 /**
@@ -71,6 +74,7 @@ export interface PolicyTest {
   readonly role: string;
   readonly cases: readonly PolicyTestCase[];
   readonly line: number;
+  readonly endLine: number;
 }
 
 export interface PolicyDocument {
@@ -136,9 +140,19 @@ export function parsePolicy(text: string): ParseResult {
         continue;
       }
       if (open.kind === "role") {
-        roles.push({ name: open.name, rules: open.rules, line: open.line });
+        roles.push({
+          name: open.name,
+          rules: open.rules,
+          line: open.line,
+          endLine: lineNo,
+        });
       } else {
-        tests.push({ role: open.name, cases: open.cases, line: open.line });
+        tests.push({
+          role: open.name,
+          cases: open.cases,
+          line: open.line,
+          endLine: lineNo,
+        });
       }
       open = null;
       seenPaths = new Map();
