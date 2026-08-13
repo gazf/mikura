@@ -1071,3 +1071,66 @@ Deno.test("GET /admin/diagnostics/who: そのパスに届くユーザーだけ�
     assertEquals(secret.users.map((u: { userId: number }) => u.userId), [1]);
   });
 });
+
+Deno.test("PUT /admin/roles/:name: 壊れたパスは理由の分かる 400 を返す", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    const cases: Array<[string, string]> = [
+      ["projects", "/ で始めて"],
+      ["/projects/", "末尾の /"],
+      ["/a" + String.fromCharCode(10) + "role evil {", "制御文字"],
+      ["/a/../b", ". / .."],
+    ];
+    for (const [path, fragment] of cases) {
+      const res = await app.fetch(
+        req("PUT", "/admin/roles/viewers", adminToken, ADMIN_DEVICE, {
+          rules: [{ path, level: "read" }],
+        }),
+      );
+      assertEquals(res.status, 400, `${path} が 400 になっていない`);
+      const message = (await res.json()).message;
+      assert(
+        message.includes(fragment),
+        `${path}: 理由が伝わらない (${message})`,
+      );
+    }
+    // 1 件も保存されていない
+    const list = await (await app.fetch(
+      req("GET", "/admin/roles", adminToken, ADMIN_DEVICE),
+    )).json();
+    assertEquals(
+      list.roles.some((r: { name: string }) => r.name === "viewers"),
+      false,
+    );
+  });
+});
+
+Deno.test("PUT /admin/roles/:name: 警告は保存したロールの分だけ返す", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    // 未割当のロールを 2 つ作る。2 つ目の保存で 1 つ目の警告まで並ばないこと。
+    await app.fetch(
+      req("PUT", "/admin/roles/first", adminToken, ADMIN_DEVICE, {
+        rules: [{ path: "/a", level: "read" }],
+      }),
+    );
+    const res = await app.fetch(
+      req("PUT", "/admin/roles/second", adminToken, ADMIN_DEVICE, {
+        rules: [{ path: "/b", level: "read" }],
+      }),
+    );
+    const body = await res.json();
+    assertEquals(body.warnings.map((w: { role: string }) => w.role), [
+      "second",
+    ]);
+
+    // 一覧側は全部見せる
+    const list = await (await app.fetch(
+      req("GET", "/admin/roles", adminToken, ADMIN_DEVICE),
+    )).json();
+    assertEquals(
+      list.warnings.map((w: { role: string }) => w.role).sort(),
+      ["first", "second"],
+    );
+  });
+});

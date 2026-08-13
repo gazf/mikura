@@ -91,6 +91,11 @@ export interface PolicyIssue {
   /** 1 始まり。0 は文書全体に対する指摘。 */
   readonly line: number;
   readonly message: string;
+  /**
+   * どのロールについての指摘か。1 ロールだけを保存したときに、無関係な
+   * ロールの警告まで並べないためのフィルタ用。文書全体に対する指摘では未設定。
+   */
+  readonly role?: string;
 }
 
 export interface ParseResult {

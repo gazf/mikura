@@ -27,7 +27,13 @@ export function foldAscii(s: string): string {
 export function validatePolicyPath(path: string): string | null {
   if (path.length === 0) return "パスが空です";
   if (!path.startsWith("/")) return "パスは / で始めてください";
-  if (path.includes("\0")) return "パスに NUL を含められません";
+  // 改行を通すと、レコード → テキスト → パース の往復でパスが別の行として
+  // 解釈され、ポリシーに任意のロールを注入できてしまう。制御文字はまとめて弾く。
+  for (const ch of path) {
+    if (ch.codePointAt(0)! < 0x20 || ch === "\u007f") {
+      return "パスに制御文字を含められません";
+    }
+  }
   if (path.includes("\\")) return "パス区切りは / です (\\ は使えません)";
   if (path.includes("//")) return "パスに空のセグメント (//) を含められません";
   if (path !== "/" && path.endsWith("/")) {

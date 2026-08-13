@@ -371,8 +371,22 @@ function issueList(title, items, cls) {
   );
 }
 
-/** 保存結果の却下理由をまとめて描く。 */
+/**
+ * 保存結果の却下理由をまとめて描く。
+ *
+ * 却下は 2 系統ある: 構造化された 422 (検証・テスト・アサーション・admin 不在) と、
+ * 素の `{message}` を返す 400 (入力の形が違う)。後者を落とすと画面が空のまま
+ * 「保存できませんでした」だけになり、原因が一切分からない。
+ */
 function saveReport(result) {
+  if (result.ok === undefined) {
+    return [
+      issueList("エラー", [{
+        line: 0,
+        message: result.message ?? "原因不明のエラーです",
+      }], "bad"),
+    ].filter(Boolean);
+  }
   return [
     issueList("入力エラー", result.errors, "bad"),
     issueList("テスト失敗", result.testFailures, "bad"),
@@ -438,7 +452,11 @@ async function renderRoles(target) {
                 { enabled: !r.enabled },
               ).catch((e) => e.body ?? Promise.reject(e));
               if (!result.ok) {
-                toast(result.rejection ?? "切り替えられませんでした", true);
+                toast(
+                  result.rejection ?? result.message ??
+                    "切り替えられませんでした",
+                  true,
+                );
                 return;
               }
               toast(`${r.name} を${r.enabled ? "無効" : "有効"}にしました`);
@@ -651,7 +669,10 @@ async function renderRoleEditor(target, name) {
         : []),
       ...saveReport(result),
     );
-    if (!result.ok) toast("保存できませんでした", true);
+    if (!result.ok) {
+      toast(result.message ?? "保存できませんでした", true);
+      report.scrollIntoView({ block: "nearest" });
+    }
   }
 
   const generations = isNew ? null : el(
@@ -692,7 +713,7 @@ async function renderRoleEditor(target, name) {
                   ).catch((e) => e.body ?? Promise.reject(e));
                   if (!result.ok) {
                     report.replaceChildren(...saveReport(result));
-                    toast("切り替えられませんでした", true);
+                    toast(result.message ?? "切り替えられませんでした", true);
                     return;
                   }
                   toast(`第 ${g.generation} 世代に切り替えました`);
@@ -804,7 +825,7 @@ async function renderRoleEditor(target, name) {
               ).catch((e) => e.body ?? Promise.reject(e));
               if (!result.ok) {
                 report.replaceChildren(...saveReport(result));
-                toast("削除できませんでした", true);
+                toast(result.message ?? "削除できませんでした", true);
                 return;
               }
               toast(`${detail.name} を削除しました`);

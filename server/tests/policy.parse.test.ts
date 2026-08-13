@@ -8,6 +8,7 @@
 
 import { assert, assertEquals } from "@std/assert";
 import { parsePolicy } from "../src/policy/document.ts";
+import { validatePolicyPath } from "../src/policy/paths.ts";
 
 Deno.test("parsePolicy: ADR の例をそのまま読める", () => {
   const { document, errors } = parsePolicy(`
@@ -180,4 +181,16 @@ test a {
   assertEquals(errors, []);
   assertEquals([document.roles[0].line, document.roles[0].endLine], [3, 5]);
   assertEquals([document.tests[0].line, document.tests[0].endLine], [7, 9]);
+});
+
+Deno.test("validatePolicyPath: 制御文字を弾く (往復でのロール注入を防ぐ)", () => {
+  // 改行を通すと、レコード → テキスト → パース の往復でパスが別の行として
+  // 解釈され、ポリシーに任意のロールを注入できてしまう。
+  const injected = "/a" + String.fromCharCode(10) + "role evil {";
+  assert(validatePolicyPath(injected)?.includes("制御文字"));
+  assert(
+    validatePolicyPath("/a" + String.fromCharCode(9))?.includes("制御文字"),
+  );
+  // 空白は正当なパス文字なので通す
+  assertEquals(validatePolicyPath("/Shared Documents/Q1"), null);
 });

@@ -499,7 +499,7 @@ const ROLE_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
  */
 async function validateCandidate(
   candidate: readonly RenderableRole[],
-  opts: { skipGuards?: boolean } = {},
+  opts: { skipGuards?: boolean; focusRole?: string } = {},
 ): Promise<
   Omit<RoleSaveResult, "generation"> & { compiled: CompiledPolicy | null }
 > {
@@ -511,10 +511,19 @@ async function validateCandidate(
 
   const text = renderPolicy(candidate);
   const validation = validatePolicy(text, { assignedRoleNames });
+  // 1 ロールを保存したときに、無関係なロールの警告まで並べない。
+  // (一覧画面は全部を見せるので、そちらは絞らない)
+  const warnings = opts.focusRole === undefined
+    ? validation.warnings
+    : validation.warnings.filter(
+      (w) =>
+        w.role === undefined ||
+        foldAscii(w.role) === foldAscii(opts.focusRole!),
+    );
   const base = {
     errors: validation.errors,
     testFailures: validation.testFailures,
-    warnings: validation.warnings,
+    warnings,
   };
   if (!validation.ok) {
     return { ok: false, ...base, assertionFailures: [], compiled: null };
@@ -601,7 +610,7 @@ export async function saveRole(
     rules: input.definition.rules,
     tests: input.definition.tests,
   });
-  const result = await validateCandidate(candidate);
+  const result = await validateCandidate(candidate, { focusRole: input.name });
   const { compiled, ...report } = result;
   if (!result.ok || !compiled) return report;
   if (opts.dryRun) return report;
@@ -684,7 +693,7 @@ export async function setRoleEnabled(
     rules: view.rules,
     tests: view.tests,
   });
-  const result = await validateCandidate(candidate);
+  const result = await validateCandidate(candidate, { focusRole: view.name });
   const { compiled, ...report } = result;
   if (!result.ok || !compiled) return report;
 
@@ -739,7 +748,7 @@ export async function activateGeneration(
     rules: gen.value.rules,
     tests: gen.value.tests,
   });
-  const result = await validateCandidate(candidate);
+  const result = await validateCandidate(candidate, { focusRole: view.name });
   const { compiled, ...report } = result;
   if (!result.ok || !compiled) return report;
 

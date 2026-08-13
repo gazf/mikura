@@ -108,6 +108,7 @@ export function validatePolicy(
       if (!assigned.has(foldAscii(role.name))) {
         warnings.push({
           line: role.line,
+          role: role.name,
           message: `ロール ${role.name} は誰にも割り当てられていません`,
         });
       }
@@ -179,6 +180,7 @@ function collectDenyWarnings(
     if (!covered) {
       warnings.push({
         line: deny.line,
+        role: role.name,
         message:
           `deny ${deny.path} は同じロール内に上位の allow が無いため何も削っていません`,
       });
@@ -188,6 +190,7 @@ function collectDenyWarnings(
   if (!testedRoles.has(foldAscii(role.name))) {
     warnings.push({
       line: role.line,
+      role: role.name,
       message: `deny を持つロール ${role.name} に test がありません`,
     });
   }
@@ -214,6 +217,7 @@ function collectCrossRoleDenyWarnings(
       if (level !== null && level !== "visible" && level !== "admin") {
         warnings.push({
           line: deny.line,
+          role: role.name,
           message:
             `deny ${deny.path} は他のロールの allow (${level}) に打ち消されます。` +
             `両方を持つユーザーからは見えます`,

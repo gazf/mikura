@@ -56,6 +56,7 @@ import {
   hasAccess,
 } from "../policy/evaluate.ts";
 import { findDanglingRules, validatePolicy } from "../policy/validate.ts";
+import { validatePolicyPath } from "../policy/paths.ts";
 import { getTree } from "../services/file.service.ts";
 import { getKv } from "../kv/store.ts";
 import { Keys } from "../kv/keys.ts";
@@ -151,19 +152,27 @@ function roleNameParam(
   return raw;
 }
 
-/** ルール配列の検証。壊れた形は文字列 (エラーメッセージ) で返す。 */
+/**
+ * ルール配列の検証。壊れた形は文字列 (エラーメッセージ) で返す。
+ *
+ * パスの中身は `validatePolicyPath` に委ねる — ここで独自に判定すると、
+ * 同じ「パスが変」を 400 と 422 の 2 経路で、しかも別の文言で返すことになる。
+ * 利用者に見えるメッセージは 1 か所から出す。
+ */
 function parseRules(v: unknown): RoleRule[] | string {
   if (v === undefined) return [];
-  if (!Array.isArray(v)) return "rules must be an array";
+  if (!Array.isArray(v)) return "rules は配列である必要があります";
   const out: RoleRule[] = [];
   for (const item of v) {
     if (typeof item !== "object" || item === null) {
-      return "rule must be an object";
+      return "rules の要素はオブジェクトである必要があります";
     }
     const r = item as { path?: unknown; level?: unknown };
-    if (!isValidPath(r.path)) return "rule.path must be an absolute path";
+    if (typeof r.path !== "string") return "ルールのパスを入力してください";
+    const pathError = validatePolicyPath(r.path);
+    if (pathError) return `ルール「${r.path}」: ${pathError}`;
     if (r.level !== null && !isValidAccessLevel(r.level)) {
-      return "rule.level must be read / write / admin, or null for deny";
+      return "ルールのレベルは read / write / admin、遮断なら null です";
     }
     out.push({ path: r.path, level: r.level as AccessLevel | null });
   }
@@ -172,16 +181,18 @@ function parseRules(v: unknown): RoleRule[] | string {
 
 function parseTests(v: unknown): RoleTestCase[] | string {
   if (v === undefined) return [];
-  if (!Array.isArray(v)) return "tests must be an array";
+  if (!Array.isArray(v)) return "tests は配列である必要があります";
   const out: RoleTestCase[] = [];
   for (const item of v) {
     if (typeof item !== "object" || item === null) {
-      return "test must be an object";
+      return "tests の要素はオブジェクトである必要があります";
     }
     const t = item as { path?: unknown; expect?: unknown };
-    if (!isValidPath(t.path)) return "test.path must be an absolute path";
+    if (typeof t.path !== "string") return "テストのパスを入力してください";
+    const pathError = validatePolicyPath(t.path);
+    if (pathError) return `テスト「${t.path}」: ${pathError}`;
     if (!isTestExpectation(t.expect)) {
-      return `test.expect must be one of ${TEST_EXPECTATIONS.join(" / ")}`;
+      return `テストの期待値は ${TEST_EXPECTATIONS.join(" / ")} のいずれかです`;
     }
     out.push({ path: t.path, expect: t.expect });
   }
