@@ -116,9 +116,31 @@ async function loadFromKv(): Promise<{
   return { version, policy: validation.compiled };
 }
 
-/** 起動時に 1 度呼ぶ。壊れた文書ならここで throw して起動を止める。 */
-export async function loadActivePolicy(): Promise<void> {
-  await getActivePolicyWithVersion();
+/**
+ * 起動時に 1 度呼ぶ。壊れた文書ならここで throw して起動を止める。
+ *
+ * 戻り値は「今この瞬間、管理操作ができる人がいるか」。**いない状態でも起動は
+ * 止めない** — 初回起動 (seed 前) は正当にこの状態を通るため。ただし黙って
+ * 起動すると「全部見えない」だけが観測され、権限設定のバグに見えて誤診される
+ * ので、呼び出し側が目立つ警告を出せるように状況を返す。
+ */
+export async function loadActivePolicy(): Promise<
+  { version: number; hasAdmin: boolean }
+> {
+  const { version, policy } = await getActivePolicyWithVersion();
+  const assignments = await listAssignments();
+  return { version, hasAdmin: rootAdminExists(policy, assignments) };
+}
+
+/**
+ * 現在のポリシーで `admin /` を与えるロール名。復旧 CLI が「どのロールを
+ * 割り当てれば管理者になれるか」を自分で判断するために使う。
+ */
+export async function findAdminRoleNames(): Promise<string[]> {
+  const policy = await getActivePolicy();
+  return policy.document.roles
+    .map((r) => r.name)
+    .filter((name) => effectiveLevel(policy, [name], "/") === "admin");
 }
 
 export async function getActivePolicyWithVersion(): Promise<{

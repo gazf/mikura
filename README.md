@@ -106,6 +106,16 @@ test projects-editor {
 - 「診断」タブで「このユーザーは何ができるか」と「このパスに届くのは誰か」を
   両方向から確認できます。後者は監査で実際に問われる問いです。
 
+管理者から締め出された場合 (ポリシー未投入、割り当ての消失など) は、サーバーを
+止めて次を実行してください。HTTP 経由の復旧は admin 権限を要求するので、
+この 2 つだけが KV を直接触ります。
+
+```bash
+cd server
+deno task seed --grant-admin           # admin ユーザーに管理ロールを割り当て直す
+deno task seed --policy <file>         # ポリシー文書そのものを差し戻す
+```
+
 ロール名は「何を与えるか」で付けてください (`projects-editor` は良い名前、
 `sales-department` は悪い名前)。1 人だけの例外は `alice-docs-readonly` のような
 ロールを 1 人に割り当てる形で表します。

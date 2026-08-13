@@ -2,6 +2,8 @@ import { closeKv, getKv } from "./store.ts";
 import { Keys } from "./keys.ts";
 import {
   assignRole,
+  findAdminRoleNames,
+  getActivePolicyWithVersion,
   installBootstrapPolicy,
 } from "../services/policy.service.ts";
 import type { TokenData, User } from "../types.ts";
@@ -229,15 +231,78 @@ async function installPolicyFromFile(path: string): Promise<void> {
   console.log("  (割り当ては変更していません)");
 }
 
+/**
+ * 管理者を復旧する break-glass (ADR-035)。
+ *
+ * `--policy` はポリシー文書を戻すだけで、割り当てには触らない。だが
+ * `user_roles` が空だと誰も `admin /` を持たず、HTTP 経由の復旧経路は
+ * その admin 権限を要求するので堂々巡りになる — 文書を直せても管理画面に
+ * 入れない。ここは KV を直接触れる唯一の側なので、割り当てまで面倒を見る。
+ *
+ * 到達しうる経路は 3 つ: 旧スキーマからの移行、ポリシー投入前の起動、
+ * 最後の admin を持つユーザーを外部から消した場合。
+ */
+async function grantAdmin(kv: Deno.Kv, userName: string): Promise<void> {
+  const userIdEntry = await kv.get<number>(Keys.userByName(userName));
+  if (userIdEntry.value === null) {
+    console.error(`User not found: ${userName}`);
+    console.error(
+      "  `deno task seed` で初期化するか --user <name> を指定してください。",
+    );
+    Deno.exit(1);
+  }
+  const userId = userIdEntry.value;
+
+  // ポリシーがまだ無ければブートストラップを入れる。既にあるなら
+  // **上書きしない** — 運用中の文書を復旧コマンドが書き換えるのは筋が悪い。
+  const { version } = await getActivePolicyWithVersion();
+  if (version === 0) {
+    const installed = await installBootstrapPolicy(BOOTSTRAP_POLICY, userId);
+    console.log(`Bootstrap policy installed as version ${installed}.`);
+  }
+
+  const adminRoles = await findAdminRoleNames();
+  if (adminRoles.length === 0) {
+    console.error("現在のポリシーに admin / を与えるロールがありません。");
+    console.error("  `allow admin /` を持つロールを足してから、");
+    console.error("  `deno task seed --policy <file>` で投入してください。");
+    Deno.exit(1);
+  }
+  if (adminRoles.length > 1) {
+    console.error(
+      `admin / を与えるロールが複数あります: ${adminRoles.join(", ")}`,
+    );
+    console.error("  --role <name> でどれを割り当てるか指定してください。");
+    Deno.exit(1);
+  }
+
+  const role = adminRoles[0];
+  const res = await assignRole(userId, role);
+  if (!res.ok) {
+    console.error(`Failed to assign role: ${res.error}`);
+    Deno.exit(1);
+  }
+  console.log(`Granted: ${userName} (id=${userId}) → role ${role}`);
+  console.log("  server を再起動すると反映されます。");
+}
+
 // CLI 実行時のみ最後に close する。プロセス常駐の main.ts から呼ぶ時は close しない。
 // `deno task seed`                  : 未 seed なら seed、既 seed なら情報ダンプ
 // `deno task seed --renew`          : admin の token を全失効して新 raw token を発行
 // `deno task seed --policy <file>`  : ポリシーを直接書き戻す (起動できない時の復旧)
+// `deno task seed --grant-admin`    : 管理者を復旧する (割り当てまで面倒を見る)
 if (import.meta.main) {
   const renew = Deno.args.includes("--renew");
   const policyIdx = Deno.args.indexOf("--policy");
+  const grantAdminFlag = Deno.args.includes("--grant-admin");
+  const userIdx = Deno.args.indexOf("--user");
   const kv = await getKv();
-  if (policyIdx >= 0) {
+  if (grantAdminFlag) {
+    await grantAdmin(
+      kv,
+      userIdx >= 0 ? Deno.args[userIdx + 1] ?? "admin" : "admin",
+    );
+  } else if (policyIdx >= 0) {
     const file = Deno.args[policyIdx + 1];
     if (!file) {
       console.error("--policy requires a file path");

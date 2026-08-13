@@ -10,11 +10,13 @@ import { assert, assertEquals, assertRejects } from "@std/assert";
 import { Keys } from "../src/kv/keys.ts";
 import {
   assignRole,
+  findAdminRoleNames,
   getActivePolicy,
   getActivePolicyWithVersion,
   getUserRoles,
   installBootstrapPolicy,
   listPolicyVersions,
+  loadActivePolicy,
   PolicyLoadError,
   type PolicyVersion,
   savePolicy,
@@ -190,5 +192,38 @@ Deno.test("適用中の版が消えていたら読み込みで throw する", as
     _resetPolicyCachesForTesting();
 
     await assertRejects(() => getActivePolicy(), PolicyLoadError);
+  });
+});
+
+// ----- 復旧経路 (break-glass) -----
+
+Deno.test("loadActivePolicy: ポリシー未投入は起動を止めず hasAdmin=false を返す", async () => {
+  await withTestKv(async () => {
+    const state = await loadActivePolicy();
+    assertEquals(state.version, 0);
+    assertEquals(state.hasAdmin, false);
+  });
+});
+
+Deno.test("loadActivePolicy: 文書はあるが誰にも割り当てられていなければ hasAdmin=false", async () => {
+  await withTestKv(async () => {
+    // 旧スキーマからの移行や、割り当てだけ失われた状態がこれに当たる。
+    await installBootstrapPolicy(BASE, 1);
+    const state = await loadActivePolicy();
+    assertEquals(state.version, 1);
+    assertEquals(state.hasAdmin, false);
+
+    assert((await assignRole(1, "admins")).ok);
+    assertEquals((await loadActivePolicy()).hasAdmin, true);
+  });
+});
+
+Deno.test("findAdminRoleNames: admin / を与えるロールだけを返す", async () => {
+  await withTestKv(async () => {
+    await installBootstrapPolicy(
+      BASE + "\nrole viewers {\n  allow read /shared\n}\n",
+      1,
+    );
+    assertEquals(await findAdminRoleNames(), ["admins"]);
   });
 });
