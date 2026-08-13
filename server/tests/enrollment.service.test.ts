@@ -21,8 +21,6 @@ async function seed(kv: Deno.Kv): Promise<void> {
   await seedUser(kv, {
     userId: 1,
     userName: "alice",
-    groupId: 10,
-    groupName: "alice-g",
     permissions: [{ path: "/", accessLevel: "write" }],
   });
 }

@@ -2,6 +2,7 @@ import app from "./app.ts";
 import { initFileLogger } from "./util/fileLogger.ts";
 import { ensureDataRoot, getDataRoot } from "./services/file.service.ts";
 import { initializeStagingRoot } from "./services/upload.service.ts";
+import { loadActivePolicy } from "./services/policy.service.ts";
 
 initFileLogger();
 
@@ -13,6 +14,20 @@ const port = parseInt(Deno.env.get("MIKURA_PORT") ?? "8700", 10);
 // 揃えておく方が診断時に状態が読み取りやすい。
 await ensureDataRoot();
 await initializeStagingRoot();
+
+// ADR-035: 保存済みポリシーをここで 1 度パースする。壊れていたら **起動を止める**。
+// 全拒否のまま起動すると「誰も何も見えない」だけが観測され、権限設定のバグに
+// 見えて誤診される。保存時に検証しているので、ここに来るのは形式変更か KV 破損。
+try {
+  await loadActivePolicy();
+} catch (e) {
+  console.error(
+    `[FATAL] アクセス制御ポリシーを読み込めません。起動を中止します。\n${
+      e instanceof Error ? e.message : e
+    }`,
+  );
+  Deno.exit(1);
+}
 
 console.log(`mikura server starting on port ${port} (data=${getDataRoot()})`);
 

@@ -3,14 +3,14 @@ import {
   checkPermission,
   createAppToken,
   hashToken,
-  retainsRootAdmin,
   revokeToken,
   upsertDevice,
   validateToken,
 } from "../src/services/auth.service.ts";
 import { Keys } from "../src/kv/keys.ts";
 import type { DeviceData, TokenData } from "../src/types.ts";
-import { seedUser, withTestKv } from "./_helpers.ts";
+import { assignRole } from "../src/services/policy.service.ts";
+import { seedRole, seedUser, withTestKv } from "./_helpers.ts";
 
 // ----- validateToken / createAppToken -----
 
@@ -19,8 +19,6 @@ Deno.test("createAppToken: stores token hash and forward index", async () => {
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-group",
     });
     const { raw, hash } = await createAppToken(1, "alice");
     assert(raw.length > 0);
@@ -38,8 +36,6 @@ Deno.test("validateToken: returns identity for valid token", async () => {
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-group",
     });
     const { raw } = await createAppToken(1, "alice");
     const identity = await validateToken(raw);
@@ -59,8 +55,6 @@ Deno.test("validateToken: returns null for expired token", async () => {
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-group",
     });
     const { raw, hash } = await createAppToken(1, "alice");
     // 期限切れに書き換え
@@ -81,8 +75,6 @@ Deno.test("validateToken: returns null when user record gone", async () => {
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-group",
     });
     const { raw } = await createAppToken(1, "alice");
     await kv.delete(Keys.user(1));
@@ -95,8 +87,6 @@ Deno.test("validateToken: cached hit still rejects expired tokenExpiresAt", asyn
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-group",
     });
     const { raw, hash } = await createAppToken(1, "alice");
     // 1 度目: KV を見て identity 取得 & キャッシュ
@@ -188,8 +178,6 @@ Deno.test("validateToken: bound token は同 deviceId なら通る", async () =>
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-g",
     });
     const deviceId = "dev-bound-alice-0001-zzzz";
     const { raw } = await makeBoundToken(kv, 1, deviceId);
@@ -205,8 +193,6 @@ Deno.test("validateToken: bound token は別 deviceId だと null", async () => 
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-g",
     });
     const { raw } = await makeBoundToken(kv, 1, "dev-real-pc-0000000001zz");
     const identity = await validateToken(raw, {
@@ -221,8 +207,6 @@ Deno.test("validateToken: bound token は deviceId 未指定だと null", async 
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-g",
     });
     const { raw } = await makeBoundToken(kv, 1, "dev-real-pc-0000000001zz");
     // opts 未指定 = deviceId undefined。bound 値 !== undefined なので null。
@@ -235,8 +219,6 @@ Deno.test("validateToken: cache hit 経路でも deviceId binding を enforce", 
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-g",
     });
     const realDevice = "dev-cache-alice-0001zzzzz";
     const { raw } = await makeBoundToken(kv, 1, realDevice);
@@ -258,8 +240,6 @@ Deno.test("validateToken: unbound (boundDeviceId 未設定) は deviceId 不問�
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-g",
     });
     // createAppToken は boundDeviceId を設定しない (= 旧 seed 由来 token と等価)
     const { raw } = await createAppToken(1, "alice");
@@ -278,8 +258,6 @@ Deno.test("revokeToken: 既存 token を消去 + cache invalidate", async () => 
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-g",
     });
     const { raw, hash } = await createAppToken(1, "alice");
     // warm cache
@@ -306,7 +284,7 @@ Deno.test("revokeToken: 存在しない hash は false", async () => {
 
 // ----- checkPermission -----
 
-Deno.test("checkPermission: returns false for user with no group", async () => {
+Deno.test("checkPermission: ロールが 1 つも無いユーザーは全部拒否", async () => {
   await withTestKv(async () => {
     assertFalse(await checkPermission(999, "/foo", "read"));
   });
@@ -317,8 +295,6 @@ Deno.test("checkPermission: exact path read permission", async () => {
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-group",
       permissions: [{ path: "/foo", accessLevel: "read" }],
     });
     assert(await checkPermission(1, "/foo", "read"));
@@ -331,8 +307,6 @@ Deno.test("checkPermission: write permission allows read", async () => {
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-group",
       permissions: [{ path: "/foo", accessLevel: "write" }],
     });
     assert(await checkPermission(1, "/foo", "read"));
@@ -340,17 +314,16 @@ Deno.test("checkPermission: write permission allows read", async () => {
   });
 });
 
-Deno.test("checkPermission: admin grants both read and write", async () => {
+Deno.test("checkPermission: admin は read と write を兼ねる (admin は / のみ)", async () => {
   await withTestKv(async (kv) => {
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-group",
-      permissions: [{ path: "/foo", accessLevel: "admin" }],
+      permissions: [{ path: "/", accessLevel: "admin" }],
     });
     assert(await checkPermission(1, "/foo", "read"));
     assert(await checkPermission(1, "/foo", "write"));
+    assert(await checkPermission(1, "/", "admin"));
   });
 });
 
@@ -359,8 +332,6 @@ Deno.test("checkPermission: walks up the path hierarchy", async () => {
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-group",
       permissions: [{ path: "/projects", accessLevel: "write" }],
     });
     assert(await checkPermission(1, "/projects/sub/file.txt", "write"));
@@ -373,8 +344,6 @@ Deno.test("checkPermission: most specific permission wins (deny by closer ancest
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-group",
       permissions: [
         { path: "/", accessLevel: "write" },
         { path: "/secret", accessLevel: "read" },
@@ -418,121 +387,34 @@ Deno.test("upsertDevice: existing device keeps firstSeenAt, updates lastSeenAt",
   });
 });
 
-// ----- retainsRootAdmin (自己締め出しガードの判定器) -----
-//
-// 責務: checkPermission の path="/" と**同じ順序依存**で「変更後も admin か」を
-// 答えること。first-match-wins を再現できていないと、ガードは通ったのに実際は
-// 締め出される (= 最悪の失敗) が起きる。
+// ----- ADR-035: 派生可視性と deny -----
 
-Deno.test("retainsRootAdmin: 変更なしなら現状の判定と一致する", async () => {
-  await withTestKv(async (kv) => {
-    await seedUser(kv, {
-      userId: 1,
-      userName: "admin",
-      groupId: 1,
-      groupName: "admins",
-      permissions: [{ path: "/", accessLevel: "admin" }],
-    });
-    assert(await retainsRootAdmin(1, {}));
-    assertEquals(await checkPermission(1, "/", "admin"), true);
-  });
-});
-
-Deno.test("retainsRootAdmin: 唯一の admin group を外すと false", async () => {
-  await withTestKv(async (kv) => {
-    await seedUser(kv, {
-      userId: 1,
-      userName: "admin",
-      groupId: 1,
-      groupName: "admins",
-      permissions: [{ path: "/", accessLevel: "admin" }],
-    });
-    assertFalse(await retainsRootAdmin(1, { droppedGroupIds: [1] }));
-  });
-});
-
-Deno.test("retainsRootAdmin: root を read に落とす override は false", async () => {
-  await withTestKv(async (kv) => {
-    await seedUser(kv, {
-      userId: 1,
-      userName: "admin",
-      groupId: 1,
-      groupName: "admins",
-      permissions: [{ path: "/", accessLevel: "admin" }],
-    });
-    assertFalse(
-      await retainsRootAdmin(1, {
-        rootOverride: { groupId: 1, accessLevel: "read" },
-      }),
-    );
-  });
-});
-
-Deno.test("retainsRootAdmin: 他 group を触る override は影響しない", async () => {
-  await withTestKv(async (kv) => {
-    await seedUser(kv, {
-      userId: 1,
-      userName: "admin",
-      groupId: 1,
-      groupName: "admins",
-      permissions: [{ path: "/", accessLevel: "admin" }],
-    });
-    assert(
-      await retainsRootAdmin(1, {
-        rootOverride: { groupId: 99, accessLevel: "read" },
-      }),
-    );
-  });
-});
-
-Deno.test("retainsRootAdmin: first-match-wins — 先に並ぶ group の read が admin を隠す", async () => {
-  await withTestKv(async (kv) => {
-    // group 1 = read, group 2 = admin。checkPermission は最初に permission を
-    // 持つ group で打ち切るので、この user は admin ではない。
-    // 「より緩い方が勝つ」と誤って実装していると true を返してしまう。
-    await seedUser(kv, {
-      userId: 1,
-      userName: "alice",
-      groupId: 1,
-      groupName: "everyone",
-      permissions: [{ path: "/", accessLevel: "read" }],
-    });
-    await kv.set(Keys.group(2), { id: 2, name: "admins" });
-    await kv.set(Keys.userGroup(1, 2), true);
-    await kv.set(Keys.permission("/", 2), { accessLevel: "admin" });
-
-    assertEquals(await checkPermission(1, "/", "admin"), false);
-    assertFalse(await retainsRootAdmin(1, {}));
-
-    // 先に並ぶ read の group を外すと、初めて admin が見える
-    assert(await retainsRootAdmin(1, { droppedGroupIds: [1] }));
-  });
-});
-
-Deno.test("retainsRootAdmin: root の permission 削除で後続 group に判定が移る", async () => {
+Deno.test("checkPermission: grant した path の祖先は visible で通り read では通らない", async () => {
   await withTestKv(async (kv) => {
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 1,
-      groupName: "everyone",
-      permissions: [{ path: "/", accessLevel: "read" }],
+      permissions: [{ path: "/alice/docs", accessLevel: "read" }],
     });
-    await kv.set(Keys.group(2), { id: 2, name: "admins" });
-    await kv.set(Keys.userGroup(1, 2), true);
-    await kv.set(Keys.permission("/", 2), { accessLevel: "admin" });
-
-    // group 1 の root permission を消せば、次に当たる group 2 の admin が効く
-    assert(
-      await retainsRootAdmin(1, {
-        rootOverride: { groupId: 1, accessLevel: null },
-      }),
-    );
+    assert(await checkPermission(1, "/alice", "visible"));
+    assertFalse(await checkPermission(1, "/alice", "read"));
+    assert(await checkPermission(1, "/alice/docs/a.txt", "read"));
+    assertFalse(await checkPermission(1, "/bob", "visible"));
   });
 });
 
-Deno.test("retainsRootAdmin: どの group にも所属していなければ false", async () => {
-  await withTestKv(async () => {
-    assertFalse(await retainsRootAdmin(999, {}));
+Deno.test("checkPermission: ロールを足すと必ず増える方向にしか動かない", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "alice",
+      permissions: [{ path: "/projects", accessLevel: "write" }],
+    });
+    // 旧モデルはここで「より緩いグループが先に並ぶと admin が隠れる」順序依存が
+    // あった。ロールは max で合成するので、弱いロールを足しても下がらない。
+    await seedRole("weak", [{ path: "/projects", accessLevel: "read" }]);
+    const assigned = await assignRole(1, "weak");
+    assert(assigned.ok);
+    assert(await checkPermission(1, "/projects/a.txt", "write"));
   });
 });

@@ -25,15 +25,11 @@ async function setup(kv: Deno.Kv): Promise<Ctx> {
   await seedUser(kv, {
     userId: 1,
     userName: "alice",
-    groupId: 10,
-    groupName: "alice-g",
     permissions: [{ path: "/", accessLevel: "write" }],
   });
   await seedUser(kv, {
     userId: 2,
     userName: "bob",
-    groupId: 20,
-    groupName: "bob-g",
     permissions: [{ path: "/", accessLevel: "write" }],
   });
   const a = await createAppToken(1, "alice-token");
@@ -85,8 +81,6 @@ Deno.test("POST /locks/*: forbidden when user lacks write permission", async () 
     await seedUser(kv, {
       userId: 3,
       userName: "charlie",
-      groupId: 30,
-      groupName: "charlie-g",
       permissions: [{ path: "/", accessLevel: "read" }],
     });
     const { raw } = await createAppToken(3, "c-token");

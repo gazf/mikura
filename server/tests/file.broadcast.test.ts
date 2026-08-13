@@ -46,15 +46,11 @@ async function setupListener(kv: Deno.Kv): Promise<FakeSocket> {
   await seedUser(kv, {
     userId: 100,
     userName: "listener",
-    groupId: 100,
-    groupName: "listener-g",
     permissions: [{ path: "/", accessLevel: "read" }],
   });
   await seedUser(kv, {
     userId: 1,
     userName: "alice",
-    groupId: 10,
-    groupName: "alice-g",
     permissions: [{ path: "/", accessLevel: "write" }],
   });
   const sock = new FakeSocket();
@@ -188,15 +184,11 @@ Deno.test("originator 端末は自身の操作 broadcast を受け取らない (
     await seedUser(kv, {
       userId: 100,
       userName: "listener",
-      groupId: 100,
-      groupName: "listener-g",
       permissions: [{ path: "/", accessLevel: "read" }],
     });
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-g",
       permissions: [{ path: "/", accessLevel: "write" }],
     });
     const listenerSock = new FakeSocket();

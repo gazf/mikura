@@ -14,14 +14,39 @@ import {
 } from "../services/file.service.ts";
 import { checkPermission } from "../services/auth.service.ts";
 import { getAllLocks, isLockedByOther } from "../services/lock.service.ts";
-import type { AuthUser, PermissionContext } from "../services/auth.service.ts";
+import type { AuthUser } from "../services/auth.service.ts";
+import { getActivePolicy } from "../services/policy.service.ts";
+import { isPinnedPath, rulesAnchoredAt } from "../policy/evaluate.ts";
 
 type Env = {
   Variables: {
     user: AuthUser;
-    permCtx: PermissionContext;
   };
 };
+
+/**
+ * ADR-035: ルールが名前を挙げているパスは rename / delete を拒否する。
+ * 中身は対象外で通常の権限に従う。禁じるのは「ルールが宙に浮く」変更だけ。
+ *
+ * これはシステム内で唯一の **構造的な制約** であって権限ではない。したがって
+ * 付与レベルと矛盾しうる (`allow write /shared` は削除を含むのに `/shared`
+ * 自体は消せない)。この種の制約を 1 つに保つことが「なぜか動かないし誰にも
+ * 分からない」体験を避ける条件になっている。
+ *
+ * 拒否理由は 409 の message に載せるが、WinFsp は NTSTATUS しか返せないので
+ * Explorer にはアクセス拒否としてしか届かない。コンソールの 📌 表示と、
+ * 将来のトレイ通知が本来の伝達経路。
+ */
+async function describePin(path: string): Promise<string | null> {
+  const policy = await getActivePolicy();
+  if (!isPinnedPath(policy, path)) return null;
+  const anchored = rulesAnchoredAt(policy, path);
+  const detail = anchored.length > 0
+    ? `${anchored.map((a) => a.role).join(", ")} のルールが参照しています`
+    : "配下のルールが参照しています";
+  return `${path} はアクセス制御ルールに使われているため変更できません ` +
+    `(${detail})。管理コンソールでルールを移動または削除してください。`;
+}
 
 /**
  * `/files/*`, `/folders/*`, `/content/*` の wildcard route から、mount prefix を
@@ -68,18 +93,17 @@ export function registerFileRoutes(app: Hono<Env>) {
   // GET /tree — recursive full tree listing (read 権限のあるノードのみ返す)
   app.get("/tree", async (c) => {
     const user = c.get("user");
-    const permCtx = c.get("permCtx");
     // const t0 = performance.now();
     try {
       const tree = await getTree();
       const locks = await getAllLocks();
-      // 各ノードを read 権限でフィルタ + ADR-019 isReadOnly 合成 (他 device がロック中)。
-      // permCtx は request スコープの cache。entry 間で parent path の lookup
-      // が大量重複するため、これを共有すると /tree の KV op が劇的に減る。
+      // ADR-035: 名前だけ見えるノード (grant した path の祖先) も返す。これが
+      // 無いと /alice/docs への grant は /alice が不可視で到達できず死ぬ。
+      // 併せて ADR-019 isReadOnly を合成する (他 device がロック中)。
       const checks = await Promise.all(
         tree.map(async (n) => {
           if (
-            !(await checkPermission(user.id, n.path, "read", permCtx))
+            !(await checkPermission(user.id, n.path, "visible"))
           ) {
             return null;
           }
@@ -106,10 +130,12 @@ export function registerFileRoutes(app: Hono<Env>) {
   app.get("/files/*", async (c) => {
     const filePath = wildcardPath(c.req.path, "/files");
     const user = c.get("user");
-    const permCtx = c.get("permCtx");
     // const t0 = performance.now();
 
-    if (!(await checkPermission(user.id, filePath, "read", permCtx))) {
+    // ADR-035: 名前だけ見えるディレクトリ (grant した path の祖先) は開ける。
+    // 中身は 1 件ずつ可視性で絞るので、名前が漏れるのはその grant が既に
+    // 含意している祖先だけ。ファイルは read が要る。
+    if (!(await checkPermission(user.id, filePath, "visible"))) {
       return c.json({ message: "Forbidden" }, 403);
     }
 
@@ -117,8 +143,19 @@ export function registerFileRoutes(app: Hono<Env>) {
       const info = await getFileInfo(filePath);
       if (info.type === "directory") {
         const entries = await listDirectory(filePath);
+        const base = filePath === "/" ? "" : filePath.replace(/\/$/, "");
+        const visible = await Promise.all(
+          entries.map(async (e) =>
+            await checkPermission(user.id, `${base}/${e.name}`, "visible")
+              ? e
+              : null
+          ),
+        );
         // console.log(`[diag] GET /files dev=${user.deviceId} ${filePath} dir entries=${entries.length} ${(performance.now() - t0).toFixed(1)}ms`);
-        return c.json(entries);
+        return c.json(visible.filter((e) => e !== null));
+      }
+      if (!(await checkPermission(user.id, filePath, "read"))) {
+        return c.json({ message: "Forbidden" }, 403);
       }
       // console.log(`[diag] GET /files dev=${user.deviceId} ${filePath} stat ${(performance.now() - t0).toFixed(1)}ms`);
       return c.json(info);
@@ -138,11 +175,11 @@ export function registerFileRoutes(app: Hono<Env>) {
     if (filePath === "/" || filePath === "") {
       return c.json({ message: "Refusing to delete storage root" }, 400);
     }
-
-    const permCtx = c.get("permCtx");
-    if (!(await checkPermission(user.id, filePath, "write", permCtx))) {
+    if (!(await checkPermission(user.id, filePath, "write"))) {
       return c.json({ message: "Forbidden" }, 403);
     }
+    const pinned = await describePin(filePath);
+    if (pinned) return c.json({ message: pinned }, 409);
 
     try {
       await deleteFile(filePath, user.deviceId);
@@ -163,9 +200,7 @@ export function registerFileRoutes(app: Hono<Env>) {
     if (filePath === "/" || filePath === "") {
       return c.json({ message: "Refusing to create root" }, 400);
     }
-
-    const permCtx = c.get("permCtx");
-    if (!(await checkPermission(user.id, filePath, "write", permCtx))) {
+    if (!(await checkPermission(user.id, filePath, "write"))) {
       return c.json({ message: "Forbidden" }, 403);
     }
 
@@ -201,13 +236,14 @@ export function registerFileRoutes(app: Hono<Env>) {
     }
 
     // 移動元/移動先の両方に write 権限が必要
-    const permCtx = c.get("permCtx");
     if (
-      !(await checkPermission(user.id, oldPath, "write", permCtx)) ||
-      !(await checkPermission(user.id, newPath, "write", permCtx))
+      !(await checkPermission(user.id, oldPath, "write")) ||
+      !(await checkPermission(user.id, newPath, "write"))
     ) {
       return c.json({ message: "Forbidden" }, 403);
     }
+    const pinned = await describePin(oldPath);
+    if (pinned) return c.json({ message: pinned }, 409);
 
     try {
       await renameEntry(oldPath, newPath, user.deviceId);
@@ -224,10 +260,9 @@ export function registerFileRoutes(app: Hono<Env>) {
   app.get("/content/*", async (c) => {
     const filePath = wildcardPath(c.req.path, "/content");
     const user = c.get("user");
-    const permCtx = c.get("permCtx");
     // const t0 = performance.now();
 
-    if (!(await checkPermission(user.id, filePath, "read", permCtx))) {
+    if (!(await checkPermission(user.id, filePath, "read"))) {
       return c.json({ message: "Forbidden" }, 403);
     }
 
@@ -287,9 +322,8 @@ export function registerFileRoutes(app: Hono<Env>) {
   app.put("/content/*", async (c) => {
     const filePath = wildcardPath(c.req.path, "/content");
     const user = c.get("user");
-    const permCtx = c.get("permCtx");
 
-    if (!(await checkPermission(user.id, filePath, "write", permCtx))) {
+    if (!(await checkPermission(user.id, filePath, "write"))) {
       return c.json({ message: "Forbidden" }, 403);
     }
 

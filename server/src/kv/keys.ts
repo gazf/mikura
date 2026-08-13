@@ -3,9 +3,11 @@
  *
  * ["users", id]                      → User
  * ["users_by_name", name]            → id (セカンダリインデックス)
- * ["groups", id]                     → Group
- * ["user_groups", userId, groupId]   → true
- * ["permissions", path, groupId]     → { accessLevel }
+ * ["policy_current"]                 → number (適用中の版番号) (ADR-035)
+ * ["policy_versions", version]       → PolicyVersion (原文 + 誰がいつ)
+ * ["user_roles", userId, roleName]   → true
+ * ["role_users", roleName, userId]   → true (「誰がこのロールを持つか」の逆引き)
+ * ["assertions", id]                 → AccessAssertion (割り当て層の主張)
  * ["tokens", tokenHash]              → TokenData
  * ["tokens_by_user", userId, tokenHash] → true
  * ["audit", timestamp, id]           → AuditEntry
@@ -23,21 +25,28 @@
 export const Keys = {
   user: (id: number): Deno.KvKey => ["users", id],
   userByName: (name: string): Deno.KvKey => ["users_by_name", name],
-  group: (id: number): Deno.KvKey => ["groups", id],
-  userGroup: (userId: number, groupId: number): Deno.KvKey => [
-    "user_groups",
+  // ----- ADR-035: ポリシー文書とロール割り当て -----
+  /** 適用中の版番号。差し替えは atomic に版の set と一緒に行う。 */
+  policyCurrent: (): Deno.KvKey => ["policy_current"],
+  policyVersion: (version: number): Deno.KvKey => ["policy_versions", version],
+  /** 版の一覧 (diff / rollback 用)。 */
+  policyVersionsPrefix: (): Deno.KvKey => ["policy_versions"],
+  userRole: (userId: number, roleName: string): Deno.KvKey => [
+    "user_roles",
     userId,
-    groupId,
+    roleName,
   ],
-  userGroupsPrefix: (userId: number): Deno.KvKey => ["user_groups", userId],
-  permission: (path: string, groupId: number): Deno.KvKey => [
-    "permissions",
-    path,
-    groupId,
+  userRolesPrefix: (userId: number): Deno.KvKey => ["user_roles", userId],
+  /** 全ユーザー分の割り当てを舐める (admin 不在検査 / 逆引き診断)。 */
+  userRolesAllPrefix: (): Deno.KvKey => ["user_roles"],
+  roleUser: (roleName: string, userId: number): Deno.KvKey => [
+    "role_users",
+    roleName,
+    userId,
   ],
-  permissionsPrefix: (path: string): Deno.KvKey => ["permissions", path],
-  /** 全 path 分の permission を舐める (admin console の権限マトリクス用)。 */
-  permissionsAllPrefix: (): Deno.KvKey => ["permissions"],
+  roleUsersPrefix: (roleName: string): Deno.KvKey => ["role_users", roleName],
+  assertion: (id: number): Deno.KvKey => ["assertions", id],
+  assertionsPrefix: (): Deno.KvKey => ["assertions"],
   token: (tokenHash: string): Deno.KvKey => ["tokens", tokenHash],
   tokenByUser: (userId: number, tokenHash: string): Deno.KvKey => [
     "tokens_by_user",

@@ -34,15 +34,11 @@ async function setupUsers(kv: Deno.Kv): Promise<Tokens> {
   await seedUser(kv, {
     userId: 1,
     userName: "alice",
-    groupId: 10,
-    groupName: "alice-g",
     permissions: [{ path: "/", accessLevel: "write" }],
   });
   await seedUser(kv, {
     userId: 2,
     userName: "bob",
-    groupId: 20,
-    groupName: "bob-g",
     permissions: [{ path: "/", accessLevel: "write" }],
   });
   const a = await createAppToken(1, "alice");

@@ -1,6 +1,35 @@
 import { closeKv, getKv } from "./store.ts";
 import { Keys } from "./keys.ts";
-import type { Group, Permission, TokenData, User } from "../types.ts";
+import {
+  assignRole,
+  installBootstrapPolicy,
+} from "../services/policy.service.ts";
+import type { TokenData, User } from "../types.ts";
+
+/**
+ * ADR-035 のブートストラップポリシー。空のポリシーは既定 deny なので、
+ * 管理操作を含めて何もできない状態になる。最初の 1 本はここが書く。
+ *
+ * `admins` は「何を与えるか」で名付けられていないただ 1 つのロールだが、
+ * admin `/` の意味そのものなので例外扱いでよい。ユーザーが増えたら
+ * `projects-editor` のような purpose 名で足していく。
+ */
+const BOOTSTRAP_POLICY = `# mikura のアクセス制御ポリシー (ADR-035)
+#
+# role <名前> { allow <read|write|admin> <パス> / deny <パス> }
+# test <名前> { readable|writable|invisible|visible|admin <パス> }
+#
+# ルールは書いた順に関係なく、パスの具体度で決まる。ロールを足すと必ず
+# 増える方向にしか動かない。何も割り当てられていないパスは不可視。
+
+role admins {
+  allow admin /
+}
+
+test admins {
+  admin /
+}
+`;
 
 async function hashPassword(password: string): Promise<string> {
   const encoder = new TextEncoder();
@@ -45,22 +74,12 @@ export async function seedIfEmpty(rawToken?: string): Promise<void> {
   }
 
   const adminId = await nextId(kv, "users");
-  const groupId = await nextId(kv, "groups");
 
   const adminUser: User = {
     id: adminId,
     name: "admin",
     passwordHash: await hashPassword("admin"),
     createdAt: new Date().toISOString(),
-  };
-
-  const adminsGroup: Group = {
-    id: groupId,
-    name: "admins",
-  };
-
-  const rootPermission: Permission = {
-    accessLevel: "admin",
   };
 
   const token = rawToken ?? crypto.randomUUID();
@@ -76,15 +95,19 @@ export async function seedIfEmpty(rawToken?: string): Promise<void> {
     .atomic()
     .set(Keys.user(adminId), adminUser)
     .set(Keys.userByName("admin"), adminId)
-    .set(Keys.group(groupId), adminsGroup)
-    .set(Keys.userGroup(adminId, groupId), true)
-    .set(Keys.permission("/", groupId), rootPermission)
     .set(Keys.token(tokenHash), tokenData)
     .set(Keys.tokenByUser(adminId, tokenHash), true)
     .commit();
 
   if (!result.ok) {
     throw new Error("Failed to seed database");
+  }
+
+  // ポリシー投入 → 割り当ての順。逆にすると「未定義のロール」で弾かれる。
+  await installBootstrapPolicy(BOOTSTRAP_POLICY, adminId);
+  const assigned = await assignRole(adminId, "admins");
+  if (!assigned.ok) {
+    throw new Error(`Failed to assign bootstrap role: ${assigned.error}`);
   }
 
   console.log("Database seeded.");
@@ -191,13 +214,37 @@ async function printExistingSeed(kv: Deno.Kv, adminId: number): Promise<void> {
   );
 }
 
+/**
+ * ポリシーを KV に直接書き戻す break-glass (ADR-035)。
+ *
+ * 保存済みポリシーが解釈できないと server は起動しないので、HTTP 経由の
+ * `deno task admin set-policy` では復旧できない。token を失った時に
+ * `--renew` で救うのと同じ位置づけで、KV を直接触る経路を 1 本だけ残す。
+ * 検証は通すので、壊れた文書で上書きすることはできない。
+ */
+async function installPolicyFromFile(path: string): Promise<void> {
+  const text = await Deno.readTextFile(path);
+  const version = await installBootstrapPolicy(text, 0);
+  console.log(`Policy installed as version ${version}.`);
+  console.log("  (割り当ては変更していません)");
+}
+
 // CLI 実行時のみ最後に close する。プロセス常駐の main.ts から呼ぶ時は close しない。
-// `deno task seed`         : 未 seed なら seed、既 seed なら情報ダンプ
-// `deno task seed --renew` : admin の token を全失効して新 raw token を発行
+// `deno task seed`                  : 未 seed なら seed、既 seed なら情報ダンプ
+// `deno task seed --renew`          : admin の token を全失効して新 raw token を発行
+// `deno task seed --policy <file>`  : ポリシーを直接書き戻す (起動できない時の復旧)
 if (import.meta.main) {
   const renew = Deno.args.includes("--renew");
+  const policyIdx = Deno.args.indexOf("--policy");
   const kv = await getKv();
-  if (renew) {
+  if (policyIdx >= 0) {
+    const file = Deno.args[policyIdx + 1];
+    if (!file) {
+      console.error("--policy requires a file path");
+      Deno.exit(1);
+    }
+    await installPolicyFromFile(file);
+  } else if (renew) {
     await renewAdminToken(kv);
   } else {
     const existing = await kv.get<number>(Keys.userByName("admin"));

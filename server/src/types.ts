@@ -5,16 +5,11 @@ export interface User {
   createdAt: string;
 }
 
-export interface Group {
-  id: number;
-  name: string;
-}
-
+/**
+ * ADR-035 のレベル梯子。`read < write < admin`。旧モデルからそのまま引き継ぐ
+ * ので、移行で既存の付与が読み替えられることはない。
+ */
 export type AccessLevel = "read" | "write" | "admin";
-
-export interface Permission {
-  accessLevel: AccessLevel;
-}
 
 export interface TokenData {
   userId: number;

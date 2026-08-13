@@ -41,8 +41,6 @@ Deno.test("register/unregister: peers are tracked individually", async () => {
     await seedUser(kv, {
       userId: 2,
       userName: "bob",
-      groupId: 20,
-      groupName: "g",
       permissions: [{ path: "/", accessLevel: "read" }],
     });
     const a = { socket: fakeSocket(), userId: 1, deviceId: "dev-aaaaaaaa" };
@@ -68,15 +66,11 @@ Deno.test("broadcast: peers without read permission do not receive", async () =>
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-g",
       permissions: [{ path: "/public", accessLevel: "read" }],
     });
     await seedUser(kv, {
       userId: 2,
       userName: "bob",
-      groupId: 20,
-      groupName: "bob-g",
       permissions: [{ path: "/private", accessLevel: "read" }],
     });
 
@@ -102,8 +96,6 @@ Deno.test("broadcast: closed sockets are skipped without error", async () => {
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "g",
       permissions: [{ path: "/", accessLevel: "read" }],
     });
 
@@ -139,8 +131,6 @@ Deno.test("broadcast: payload contains event/path/holder with resolved name", as
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "g",
       permissions: [{ path: "/", accessLevel: "read" }],
     });
     // ホルダー (userId=99) のユーザー名を解決させるため User レコードを置く
@@ -181,8 +171,6 @@ Deno.test("broadcast: unknown user falls back to user#<id>", async () => {
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "g",
       permissions: [{ path: "/", accessLevel: "read" }],
     });
     // ホルダーは KV に記録なし
@@ -221,8 +209,6 @@ Deno.test("broadcastLockEvent: holder.deviceId と一致する peer は除外さ
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "g",
       permissions: [{ path: "/", accessLevel: "read" }],
     });
 
@@ -257,8 +243,6 @@ Deno.test("broadcastFileEvent: originatorDeviceId と一致する peer は除外
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "g",
       permissions: [{ path: "/", accessLevel: "read" }],
     });
 
@@ -295,8 +279,6 @@ Deno.test("broadcastFileEvent: originatorDeviceId 未指定時 (watcher 経由�
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "g",
       permissions: [{ path: "/", accessLevel: "read" }],
     });
 

@@ -8,13 +8,12 @@ import {
   writeChunksMultipart,
 } from "../services/upload.service.ts";
 import { checkPermission } from "../services/auth.service.ts";
-import type { AuthUser, PermissionContext } from "../services/auth.service.ts";
+import type { AuthUser } from "../services/auth.service.ts";
 import { extractBoundary } from "../util/multipartRanges.ts";
 
 type Env = {
   Variables: {
     user: AuthUser;
-    permCtx: PermissionContext;
   };
 };
 
@@ -45,9 +44,7 @@ export function registerUploadRoutes(app: Hono<Env>) {
     if (typeof filePath !== "string" || !filePath.startsWith("/")) {
       return c.json({ message: "path required (absolute, leading /)" }, 400);
     }
-
-    const permCtx = c.get("permCtx");
-    if (!(await checkPermission(user.id, filePath, "write", permCtx))) {
+    if (!(await checkPermission(user.id, filePath, "write"))) {
       return c.json({ message: "Forbidden" }, 403);
     }
 

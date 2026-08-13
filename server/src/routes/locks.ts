@@ -1,12 +1,11 @@
 import { Hono } from "hono";
 import { acquireLock, getLock, releaseLock } from "../services/lock.service.ts";
 import { checkPermission } from "../services/auth.service.ts";
-import type { AuthUser, PermissionContext } from "../services/auth.service.ts";
+import type { AuthUser } from "../services/auth.service.ts";
 
 type Env = {
   Variables: {
     user: AuthUser;
-    permCtx: PermissionContext;
   };
 };
 
@@ -22,9 +21,7 @@ export function registerLockRoutes(app: Hono<Env>) {
     const wildcard = c.req.path.replace(LOCKS_PREFIX_RE, "");
     const filePath = "/" + wildcard;
     const user = c.get("user");
-
-    const permCtx = c.get("permCtx");
-    if (!(await checkPermission(user.id, filePath, "write", permCtx))) {
+    if (!(await checkPermission(user.id, filePath, "write"))) {
       return c.json({ message: "Forbidden" }, 403);
     }
 

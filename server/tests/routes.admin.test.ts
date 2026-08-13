@@ -1,14 +1,16 @@
 /**
  * /admin/* ルーティングの責務 (end-to-end):
- *   - 全 endpoint で root に admin permission を持つ user のみ通る (= 403 fallback)
- *   - User / Group / UserGroup / Permission / Enrollment / Token の CRUD が KV state を正しく更新
- *   - cascade delete (user, group) が関連 entry を巻き取る
+ *   - 全 endpoint で root に admin 権限を持つ user のみ通る (= 403 fallback)
+ *   - User / Policy / Assignment / Assertion / Enrollment / Token が KV state を正しく更新
+ *   - cascade delete (user) が関連 entry を巻き取る
+ *   - ポリシー保存は 検証 → 割り当て層の拒否権 → admin 不在検査 の順に落ちる
  *   - revoke-token, list-tokens 系は metadata のみ返し raw を漏らさない
  */
 
 import { assert, assertEquals } from "@std/assert";
 import app from "../src/app.ts";
 import {
+  checkPermission,
   createAppToken,
   hashToken,
   upsertDevice,
@@ -16,8 +18,8 @@ import {
 import { createEnrollmentSecret } from "../src/services/enrollment.service.ts";
 import { logAudit } from "../src/services/audit.service.ts";
 import { Keys } from "../src/kv/keys.ts";
-import type { Group, Permission, TokenData, User } from "../src/types.ts";
-import { seedUser, withTestKv } from "./_helpers.ts";
+import type { TokenData, User } from "../src/types.ts";
+import { seedRole, seedUser, withTestKv } from "./_helpers.ts";
 
 const ADMIN_DEVICE = "dev-admin-0000000000000001";
 const NON_ADMIN_DEVICE = "dev-user-00000000000000001";
@@ -53,16 +55,14 @@ async function setup(kv: Deno.Kv): Promise<Ctx> {
   await seedUser(kv, {
     userId: 1,
     userName: "admin",
-    groupId: 1,
-    groupName: "admins",
+    roleName: "admins",
     permissions: [{ path: "/", accessLevel: "admin" }],
   });
   await seedUser(kv, {
     userId: 2,
     userName: "carol",
-    groupId: 2,
-    groupName: "users",
-    permissions: [{ path: "/", accessLevel: "write" }],
+    roleName: "users",
+    permissions: [{ path: "/shared", accessLevel: "write" }],
   });
   const a = await createAppToken(1, "admin-test");
   const b = await createAppToken(2, "carol-test");
@@ -126,7 +126,7 @@ Deno.test("GET /admin/users: 全 user を列挙", async () => {
   });
 });
 
-Deno.test("DELETE /admin/users/:id: cascade で tokens / user_groups を削除", async () => {
+Deno.test("DELETE /admin/users/:id: cascade で tokens / ロール割り当てを削除", async () => {
   await withTestKv(async (kv) => {
     const { adminToken } = await setup(kv);
     const res = await app.fetch(
@@ -137,14 +137,13 @@ Deno.test("DELETE /admin/users/:id: cascade で tokens / user_groups を削除",
     // user / userByName 消滅
     assertEquals((await kv.get<User>(Keys.user(2))).value, null);
     assertEquals((await kv.get<number>(Keys.userByName("carol"))).value, null);
-    // user_groups 消滅
-    let groupCount = 0;
-    for await (
-      const _ of kv.list<true>({ prefix: Keys.userGroupsPrefix(2) })
-    ) {
-      groupCount++;
+    // ロール割り当て消滅 (逆引きも)
+    let roleCount = 0;
+    for await (const _ of kv.list<true>({ prefix: Keys.userRolesPrefix(2) })) {
+      roleCount++;
     }
-    assertEquals(groupCount, 0);
+    assertEquals(roleCount, 0);
+    assertEquals((await kv.get<true>(Keys.roleUser("users", 2))).value, null);
     // tokens (forward index) も消滅
     let tokenCount = 0;
     for await (
@@ -163,76 +162,6 @@ Deno.test("DELETE /admin/users/:id: 自分自身は削除不可 (400)", async ()
       req("DELETE", "/admin/users/1", adminToken, ADMIN_DEVICE),
     );
     assertEquals(res.status, 400);
-  });
-});
-
-// ---- Groups & User-Groups ----
-
-Deno.test("POST /admin/groups + user-groups: group 作成 + メンバー追加", async () => {
-  await withTestKv(async (kv) => {
-    const { adminToken } = await setup(kv);
-    const gRes = await app.fetch(
-      req("POST", "/admin/groups", adminToken, ADMIN_DEVICE, {
-        name: "devs",
-      }),
-    );
-    assertEquals(gRes.status, 201);
-    const group = (await gRes.json()) as Group;
-
-    const ugRes = await app.fetch(
-      req("POST", "/admin/user-groups", adminToken, ADMIN_DEVICE, {
-        userId: 2,
-        groupId: group.id,
-      }),
-    );
-    assertEquals(ugRes.status, 201);
-
-    const ug = await kv.get<true>(Keys.userGroup(2, group.id));
-    assertEquals(ug.value, true);
-  });
-});
-
-// ---- Permissions ----
-
-Deno.test("PUT /admin/permissions: 設定 + KV 反映", async () => {
-  await withTestKv(async (kv) => {
-    const { adminToken } = await setup(kv);
-    const res = await app.fetch(
-      req("PUT", "/admin/permissions", adminToken, ADMIN_DEVICE, {
-        path: "/shared",
-        groupId: 2,
-        accessLevel: "read",
-      }),
-    );
-    assertEquals(res.status, 200);
-    const stored = await kv.get<Permission>(Keys.permission("/shared", 2));
-    assertEquals(stored.value?.accessLevel, "read");
-  });
-});
-
-Deno.test("PUT /admin/permissions: path traversal は 400", async () => {
-  await withTestKv(async (kv) => {
-    const { adminToken } = await setup(kv);
-    const res = await app.fetch(
-      req("PUT", "/admin/permissions", adminToken, ADMIN_DEVICE, {
-        path: "/foo/../bar",
-        groupId: 2,
-        accessLevel: "read",
-      }),
-    );
-    assertEquals(res.status, 400);
-  });
-});
-
-Deno.test("DELETE /admin/permissions: 削除", async () => {
-  await withTestKv(async (kv) => {
-    const { adminToken } = await setup(kv);
-    await kv.set(Keys.permission("/foo", 2), { accessLevel: "read" });
-    const url = "/admin/permissions?path=" + encodeURIComponent("/foo") +
-      "&groupId=2";
-    const res = await app.fetch(req("DELETE", url, adminToken, ADMIN_DEVICE));
-    assertEquals(res.status, 200);
-    assertEquals((await kv.get(Keys.permission("/foo", 2))).value, null);
   });
 });
 
@@ -350,83 +279,6 @@ Deno.test("DELETE /admin/tokens/:hash: 64-char 以外は 400", async () => {
 // 以下は admin console がマトリクス / 一覧画面を組み立てるために追加した
 // 読み出し専用 endpoint 群。責務は「絞り込みの有無で同じ endpoint が両方を
 // 賄えること」と「絞り込み指定の typo が静かに全件へ倒れないこと」。
-
-Deno.test("GET /admin/user-groups/:userId: 所属 group を name 付きで返す", async () => {
-  await withTestKv(async (kv) => {
-    const { adminToken } = await setup(kv);
-    // carol (id=2) を admins(1) にも所属させる
-    await kv.set(Keys.userGroup(2, 1), true);
-
-    const res = await app.fetch(
-      req("GET", "/admin/user-groups/2", adminToken, ADMIN_DEVICE),
-    );
-    assertEquals(res.status, 200);
-    const body = (await res.json()) as Array<
-      { groupId: number; groupName: string | null }
-    >;
-    const byId = new Map(body.map((m) => [m.groupId, m.groupName]));
-    assertEquals(byId.get(1), "admins");
-    assertEquals(byId.get(2), "users");
-  });
-});
-
-Deno.test("GET /admin/user-groups/:userId: group が消えていても membership は返す (name=null)", async () => {
-  await withTestKv(async (kv) => {
-    const { adminToken } = await setup(kv);
-    // membership だけ残して group 本体を消す (cascade 漏れ相当の状態)
-    await kv.set(Keys.userGroup(2, 99), true);
-
-    const res = await app.fetch(
-      req("GET", "/admin/user-groups/2", adminToken, ADMIN_DEVICE),
-    );
-    assertEquals(res.status, 200);
-    const body = (await res.json()) as Array<
-      { groupId: number; groupName: string | null }
-    >;
-    const orphan = body.find((m) => m.groupId === 99);
-    assert(orphan, "orphan membership が落ちている");
-    assertEquals(orphan.groupName, null);
-  });
-});
-
-Deno.test("GET /admin/permissions: path 省略で全件、指定で絞り込み", async () => {
-  await withTestKv(async (kv) => {
-    const { adminToken } = await setup(kv);
-    await kv.set(Keys.permission("/shared", 2), { accessLevel: "read" });
-
-    const all = await app.fetch(
-      req("GET", "/admin/permissions", adminToken, ADMIN_DEVICE),
-    );
-    assertEquals(all.status, 200);
-    const allBody = (await all.json()) as Array<
-      { path: string; groupId: number; accessLevel: string }
-    >;
-    // setup が張る "/" 2 件 + 追加の /shared 1 件
-    assertEquals(allBody.length, 3);
-
-    const scoped = await app.fetch(
-      req("GET", "/admin/permissions?path=/shared", adminToken, ADMIN_DEVICE),
-    );
-    const scopedBody = (await scoped.json()) as Array<
-      { path: string; groupId: number; accessLevel: string }
-    >;
-    assertEquals(scopedBody, [{
-      path: "/shared",
-      groupId: 2,
-      accessLevel: "read",
-    }]);
-  });
-});
-
-Deno.test("GET /admin/permissions: 不正 path は 400 (全件へ倒さない)", async () => {
-  await withTestKv(async (kv) => {
-    const { adminToken } = await setup(kv);
-    const res = await app.fetch(
-      req("GET", "/admin/permissions?path=../etc", adminToken, ADMIN_DEVICE),
-    );
-    assertEquals(res.status, 400);
-  });
-});
 
 Deno.test("GET /admin/enrollments: userId 省略で全 user 分", async () => {
   await withTestKv(async (kv) => {
@@ -574,8 +426,10 @@ Deno.test("console 向け読み出し endpoint も非 admin は 403", async () =
   await withTestKv(async (kv) => {
     const { nonAdminToken } = await setup(kv);
     const paths = [
-      "/admin/user-groups/2",
-      "/admin/permissions",
+      "/admin/policy",
+      "/admin/assignments",
+      "/admin/assertions",
+      "/admin/diagnostics/who?path=/",
       "/admin/devices",
       "/admin/audit",
     ];
@@ -684,140 +538,400 @@ Deno.test("GET /admin/whoami: 無効な token は 401", async () => {
   });
 });
 
-// ---- 自己締め出しガード ----
-//
-// console の権限エディタは「自分に admin を与えている設定」そのものを編集できる。
-// 適用してしまうと以後どの admin API も 403 になり、KV を直接書き換える以外に
-// 復旧手段が無くなる。全経路で事前に弾けていることを固定する。
+// ---- Policy document (ADR-035) ----
 
-Deno.test("PUT /admin/permissions: root の自分の admin を降格させる操作は 409", async () => {
+const VALID_POLICY = `role admins {
+  allow admin /
+}
+
+test admins {
+  admin /
+}
+
+role projects-editor {
+  allow write /projects
+  deny /projects/secret
+}
+
+test projects-editor {
+  writable /projects/a.txt
+  invisible /projects/secret/inner.txt
+}
+`;
+
+Deno.test("GET /admin/policy: 原文 + ロール一覧 + メンバー数を返す", async () => {
   await withTestKv(async (kv) => {
     const { adminToken } = await setup(kv);
     const res = await app.fetch(
-      req("PUT", "/admin/permissions", adminToken, ADMIN_DEVICE, {
-        path: "/",
-        groupId: 1, // admin 自身が所属する admins
-        accessLevel: "read",
+      req("GET", "/admin/policy", adminToken, ADMIN_DEVICE),
+    );
+    assertEquals(res.status, 200);
+    const body = await res.json();
+    assert(body.version > 0);
+    assert(body.text.includes("role admins"));
+    const admins = body.roles.find((r: { name: string }) =>
+      r.name === "admins"
+    );
+    assertEquals(admins.memberCount, 1);
+  });
+});
+
+Deno.test("PUT /admin/policy: 保存すると版が上がり判定に効く", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    const before = await (await app.fetch(
+      req("GET", "/admin/policy", adminToken, ADMIN_DEVICE),
+    )).json();
+
+    const res = await app.fetch(
+      req("PUT", "/admin/policy", adminToken, ADMIN_DEVICE, {
+        text: VALID_POLICY,
+        expectedVersion: before.version,
       }),
     );
-    assertEquals(res.status, 409);
-    // KV は変更されていない
-    const stored = await kv.get<Permission>(Keys.permission("/", 1));
-    assertEquals(stored.value?.accessLevel, "admin");
+    assertEquals(res.status, 200);
+    const saved = await res.json();
+    assertEquals(saved.ok, true);
+    assertEquals(saved.version, before.version + 1);
+
+    // carol の users ロールは新版に無いので、判定に効かなくなる
+    assertEquals(await checkPermission(2, "/projects/a.txt", "write"), false);
+    assertEquals(await checkPermission(1, "/projects/a.txt", "write"), true);
   });
 });
 
-Deno.test("PUT /admin/permissions: 他 group の root 権限は下げられる", async () => {
+Deno.test("PUT /admin/policy: 構文エラーは 422 で全部の行を返す", async () => {
   await withTestKv(async (kv) => {
     const { adminToken } = await setup(kv);
     const res = await app.fetch(
-      req("PUT", "/admin/permissions", adminToken, ADMIN_DEVICE, {
-        path: "/",
-        groupId: 2, // carol の group。admin は所属していない
-        accessLevel: "read",
+      req("PUT", "/admin/policy", adminToken, ADMIN_DEVICE, {
+        text: "role r {\n  grant read /a\n  allow read b\n}\n",
+      }),
+    );
+    assertEquals(res.status, 422);
+    const body = await res.json();
+    assertEquals(body.ok, false);
+    assertEquals(body.errors.length, 2);
+  });
+});
+
+Deno.test("PUT /admin/policy: ロール単体テストが落ちれば保存されない", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    const res = await app.fetch(
+      req("PUT", "/admin/policy", adminToken, ADMIN_DEVICE, {
+        text: "role admins {\n  allow admin /\n}\n" +
+          "test admins {\n  invisible /\n}\n",
+      }),
+    );
+    assertEquals(res.status, 422);
+    const body = await res.json();
+    assertEquals(body.testFailures.length, 1);
+    assertEquals(body.testFailures[0].expected, "invisible");
+  });
+});
+
+Deno.test("PUT /admin/policy: admin が 1 人もいなくなる版は却下される", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    const res = await app.fetch(
+      req("PUT", "/admin/policy", adminToken, ADMIN_DEVICE, {
+        // admins ロールは残るが admin を与えなくなる
+        text: "role admins {\n  allow read /\n}\n",
+      }),
+    );
+    assertEquals(res.status, 422);
+    const body = await res.json();
+    assert(body.rejection.includes("admin"));
+    // 旧版のまま
+    assert(await checkPermission(1, "/", "admin"));
+  });
+});
+
+Deno.test("PUT /admin/policy: dryRun は KV を変えない", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    const before = await (await app.fetch(
+      req("GET", "/admin/policy", adminToken, ADMIN_DEVICE),
+    )).json();
+    const res = await app.fetch(
+      req("PUT", "/admin/policy", adminToken, ADMIN_DEVICE, {
+        text: VALID_POLICY,
+        dryRun: true,
+      }),
+    );
+    assertEquals(res.status, 200);
+    assertEquals((await res.json()).ok, true);
+    const after = await (await app.fetch(
+      req("GET", "/admin/policy", adminToken, ADMIN_DEVICE),
+    )).json();
+    assertEquals(after.version, before.version);
+    assertEquals(after.text, before.text);
+  });
+});
+
+Deno.test("PUT /admin/policy: expectedVersion がずれていれば拒否 (楽観的並行制御)", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    const res = await app.fetch(
+      req("PUT", "/admin/policy", adminToken, ADMIN_DEVICE, {
+        text: VALID_POLICY,
+        expectedVersion: 999,
+      }),
+    );
+    assertEquals(res.status, 422);
+    assert((await res.json()).rejection.includes("999") === false);
+  });
+});
+
+Deno.test("GET /admin/policy/versions: 版一覧と現行フラグ", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    await app.fetch(
+      req("PUT", "/admin/policy", adminToken, ADMIN_DEVICE, {
+        text: VALID_POLICY,
+      }),
+    );
+    const res = await app.fetch(
+      req("GET", "/admin/policy/versions", adminToken, ADMIN_DEVICE),
+    );
+    const list = await res.json();
+    assert(list.length >= 2);
+    assertEquals(list.filter((v: { current: boolean }) => v.current).length, 1);
+    // 本文は含めない (一覧に原文を載せない)
+    assertEquals(list[0].text, undefined);
+  });
+});
+
+// ---- Assignments ----
+
+Deno.test("POST /admin/assignments: 未定義ロールは 404", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    const res = await app.fetch(
+      req("POST", "/admin/assignments", adminToken, ADMIN_DEVICE, {
+        userId: 2,
+        role: "ghost",
+      }),
+    );
+    assertEquals(res.status, 404);
+  });
+});
+
+Deno.test("POST /admin/assignments: 割り当てると即座に判定へ反映される", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    await seedRole("projects-editor", [
+      { path: "/projects", accessLevel: "write" },
+    ]);
+    assertEquals(await checkPermission(2, "/projects/a.txt", "write"), false);
+
+    const res = await app.fetch(
+      req("POST", "/admin/assignments", adminToken, ADMIN_DEVICE, {
+        userId: 2,
+        role: "projects-editor",
+      }),
+    );
+    assertEquals(res.status, 201);
+    assertEquals(await checkPermission(2, "/projects/a.txt", "write"), true);
+  });
+});
+
+Deno.test("DELETE /admin/assignments: 最後の admin を外す操作は 409", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    const res = await app.fetch(
+      req("DELETE", "/admin/assignments/1/admins", adminToken, ADMIN_DEVICE),
+    );
+    assertEquals(res.status, 409);
+    assert(await checkPermission(1, "/", "admin"));
+  });
+});
+
+Deno.test("DELETE /admin/assignments: 別の admin がいれば自分の分は外せる", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    const assigned = await app.fetch(
+      req("POST", "/admin/assignments", adminToken, ADMIN_DEVICE, {
+        userId: 2,
+        role: "admins",
+      }),
+    );
+    assertEquals(assigned.status, 201);
+
+    const res = await app.fetch(
+      req("DELETE", "/admin/assignments/1/admins", adminToken, ADMIN_DEVICE),
+    );
+    assertEquals(res.status, 200);
+    assertEquals(await checkPermission(1, "/", "admin"), false);
+    assert(await checkPermission(2, "/", "admin"));
+  });
+});
+
+Deno.test("DELETE /admin/users/:id: 最後の admin は削除できない (409)", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    // carol を admin にしてから admin(1) を消す → 通る
+    await app.fetch(
+      req("POST", "/admin/assignments", adminToken, ADMIN_DEVICE, {
+        userId: 2,
+        role: "admins",
+      }),
+    );
+    // 逆に carol を消すのは admin(1) が残るので通るはず
+    const ok = await app.fetch(
+      req("DELETE", "/admin/users/2", adminToken, ADMIN_DEVICE),
+    );
+    assertEquals(ok.status, 200);
+    assert(await checkPermission(1, "/", "admin"));
+  });
+});
+
+// ---- Assertions (割り当て層の拒否権) ----
+
+Deno.test("POST /admin/assertions: 現状で成立しない主張は 422", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    const res = await app.fetch(
+      req("POST", "/admin/assertions", adminToken, ADMIN_DEVICE, {
+        userId: 2,
+        path: "/nowhere",
+        expect: "writable",
+      }),
+    );
+    assertEquals(res.status, 422);
+  });
+});
+
+Deno.test("アサーションを壊すポリシー保存は拒否される (consumer-driven contract)", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    // carol は users ロールで / に write を持つ。それを凍結する。
+    const created = await app.fetch(
+      req("POST", "/admin/assertions", adminToken, ADMIN_DEVICE, {
+        userId: 2,
+        path: "/shared/a.txt",
+        expect: "writable",
+        note: "carol の共有フォルダ書き込み",
+      }),
+    );
+    assertEquals(created.status, 201);
+
+    // users ロールを read に落とす版は、文書としては正しいが却下される
+    const res = await app.fetch(
+      req("PUT", "/admin/policy", adminToken, ADMIN_DEVICE, {
+        text: "role admins {\n  allow admin /\n}\n" +
+          "role users {\n  allow read /\n}\n",
+      }),
+    );
+    assertEquals(res.status, 422);
+    const body = await res.json();
+    assertEquals(body.errors.length, 0);
+    assertEquals(body.assertionFailures.length, 1);
+    assertEquals(body.assertionFailures[0].expected, "writable");
+    assertEquals(body.assertionFailures[0].actual, "read");
+  });
+});
+
+Deno.test("DELETE /admin/assertions/:id: 消せば保存が通るようになる", async () => {
+  await withTestKv(async (kv) => {
+    const { adminToken } = await setup(kv);
+    const created = await (await app.fetch(
+      req("POST", "/admin/assertions", adminToken, ADMIN_DEVICE, {
+        userId: 2,
+        path: "/shared/a.txt",
+        expect: "writable",
+      }),
+    )).json();
+
+    const removed = await app.fetch(
+      req(
+        "DELETE",
+        `/admin/assertions/${created.id}`,
+        adminToken,
+        ADMIN_DEVICE,
+      ),
+    );
+    assertEquals(removed.status, 200);
+
+    const res = await app.fetch(
+      req("PUT", "/admin/policy", adminToken, ADMIN_DEVICE, {
+        text: "role admins {\n  allow admin /\n}\n" +
+          "role users {\n  allow read /\n}\n",
       }),
     );
     assertEquals(res.status, 200);
   });
 });
 
-Deno.test("PUT /admin/permissions: root 以外なら自 group でも下げられる", async () => {
+// ---- Diagnostics ----
+
+Deno.test("GET /admin/diagnostics/effective: ロールごとの決め手を返す", async () => {
   await withTestKv(async (kv) => {
     const { adminToken } = await setup(kv);
-    // requireAdmin が見るのは "/" だけなので、配下パスの変更は締め出さない
-    const res = await app.fetch(
-      req("PUT", "/admin/permissions", adminToken, ADMIN_DEVICE, {
-        path: "/shared",
-        groupId: 1,
-        accessLevel: "read",
+    await app.fetch(
+      req("PUT", "/admin/policy", adminToken, ADMIN_DEVICE, {
+        text: VALID_POLICY,
       }),
     );
-    assertEquals(res.status, 200);
-  });
-});
-
-Deno.test("DELETE /admin/permissions: root の自分の admin 権限は消せない", async () => {
-  await withTestKv(async (kv) => {
-    const { adminToken } = await setup(kv);
-    const url = "/admin/permissions?path=" + encodeURIComponent("/") +
-      "&groupId=1";
-    const res = await app.fetch(req("DELETE", url, adminToken, ADMIN_DEVICE));
-    assertEquals(res.status, 409);
-    assert((await kv.get<Permission>(Keys.permission("/", 1))).value);
-  });
-});
-
-Deno.test("DELETE /admin/user-groups: 自分を admin グループから外せない", async () => {
-  await withTestKv(async (kv) => {
-    const { adminToken } = await setup(kv);
-    const res = await app.fetch(
-      req("DELETE", "/admin/user-groups/1/1", adminToken, ADMIN_DEVICE),
+    await app.fetch(
+      req("POST", "/admin/assignments", adminToken, ADMIN_DEVICE, {
+        userId: 2,
+        role: "projects-editor",
+      }),
     );
-    assertEquals(res.status, 409);
-    assertEquals((await kv.get<true>(Keys.userGroup(1, 1))).value, true);
-  });
-});
-
-Deno.test("DELETE /admin/user-groups: 他人の membership は外せる", async () => {
-  await withTestKv(async (kv) => {
-    const { adminToken } = await setup(kv);
-    const res = await app.fetch(
-      req("DELETE", "/admin/user-groups/2/2", adminToken, ADMIN_DEVICE),
-    );
-    assertEquals(res.status, 200);
-    assertEquals((await kv.get<true>(Keys.userGroup(2, 2))).value, null);
-  });
-});
-
-Deno.test("DELETE /admin/groups: 自分に admin を与えている group は消せない", async () => {
-  await withTestKv(async (kv) => {
-    const { adminToken } = await setup(kv);
-    const res = await app.fetch(
-      req("DELETE", "/admin/groups/1", adminToken, ADMIN_DEVICE),
-    );
-    assertEquals(res.status, 409);
-    assert((await kv.get<Group>(Keys.group(1))).value);
-  });
-});
-
-Deno.test("DELETE /admin/groups: 無関係な group は消せる", async () => {
-  await withTestKv(async (kv) => {
-    const { adminToken } = await setup(kv);
-    const res = await app.fetch(
-      req("DELETE", "/admin/groups/2", adminToken, ADMIN_DEVICE),
-    );
-    assertEquals(res.status, 200);
-  });
-});
-
-Deno.test("二重に admin を持っていれば片方は外せる", async () => {
-  await withTestKv(async (kv) => {
-    const { adminToken } = await setup(kv);
-    // admin を 2 つ目の admin group にも所属させ、そちらにも root admin を張る。
-    // checkPermission は first-match-wins なので、group 1 を外しても group 3 が
-    // admin を持っていれば締め出されない。
-    await kv.set(Keys.group(3), { id: 3, name: "admins2" });
-    await kv.set(Keys.userGroup(1, 3), true);
-    await kv.set(Keys.permission("/", 3), { accessLevel: "admin" });
 
     const res = await app.fetch(
-      req("DELETE", "/admin/user-groups/1/1", adminToken, ADMIN_DEVICE),
+      req(
+        "GET",
+        "/admin/diagnostics/effective?userId=2&path=/projects/secret/x.txt",
+        adminToken,
+        ADMIN_DEVICE,
+      ),
     );
-    assertEquals(res.status, 200);
+    const body = await res.json();
+    assertEquals(body.effective, "invisible");
+    assertEquals(body.perRole[0].role, "projects-editor");
+    assertEquals(body.perRole[0].decidedBy, "/projects/secret");
+    assertEquals(body.perRole[0].level, null);
   });
 });
 
-Deno.test("後続 group が read しか持たないなら admin group は外せない", async () => {
+Deno.test("GET /admin/diagnostics/who: そのパスに届くユーザーだけを返す", async () => {
   await withTestKv(async (kv) => {
     const { adminToken } = await setup(kv);
-    // admin を group 2 (root=write) にも所属させる。group 1 を外すと、次に
-    // 当たるのは group 2 の write なので admin ではなくなる。
-    await kv.set(Keys.userGroup(1, 2), true);
+    await app.fetch(
+      req("PUT", "/admin/policy", adminToken, ADMIN_DEVICE, {
+        text: VALID_POLICY,
+      }),
+    );
+    await app.fetch(
+      req("POST", "/admin/assignments", adminToken, ADMIN_DEVICE, {
+        userId: 2,
+        role: "projects-editor",
+      }),
+    );
 
     const res = await app.fetch(
-      req("DELETE", "/admin/user-groups/1/1", adminToken, ADMIN_DEVICE),
+      req(
+        "GET",
+        "/admin/diagnostics/who?path=/projects&level=write",
+        adminToken,
+        ADMIN_DEVICE,
+      ),
     );
-    assertEquals(res.status, 409);
-    assertEquals((await kv.get<true>(Keys.userGroup(1, 1))).value, true);
+    const body = await res.json();
+    assertEquals(body.users.map((u: { userId: number }) => u.userId), [1, 2]);
+
+    // deny で切られた先は admin だけが届く
+    const secret = await (await app.fetch(
+      req(
+        "GET",
+        "/admin/diagnostics/who?path=/projects/secret&level=read",
+        adminToken,
+        ADMIN_DEVICE,
+      ),
+    )).json();
+    assertEquals(secret.users.map((u: { userId: number }) => u.userId), [1]);
   });
 });

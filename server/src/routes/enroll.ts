@@ -29,7 +29,7 @@ const DEVICE_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
 
 /**
  * `Env` 型を緩い指定にしているのは、`/enroll` 自体は auth middleware 外で
- * 動作するため `user` / `permCtx` を必要としないから。`app.ts` 側で
+ * 動作するため `user` を必要としないから。`app.ts` 側で
  * `Hono<Env>` を渡してもこの relax された型は assignable。
  */
 // deno-lint-ignore no-explicit-any

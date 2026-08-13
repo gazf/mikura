@@ -8,12 +8,11 @@ import { registerUploadRoutes } from "./routes/uploads.ts";
 import { registerEnrollRoutes } from "./routes/enroll.ts";
 import { registerAdminRoutes } from "./routes/admin.ts";
 import { auditLogger } from "./middleware/logger.ts";
-import type { AuthUser, PermissionContext } from "./services/auth.service.ts";
+import type { AuthUser } from "./services/auth.service.ts";
 
 type Env = {
   Variables: {
     user: AuthUser;
-    permCtx: PermissionContext;
   };
 };
 

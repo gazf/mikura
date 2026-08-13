@@ -34,16 +34,12 @@ async function setupListener(kv: Deno.Kv): Promise<FakeSocket> {
   await seedUser(kv, {
     userId: 100,
     userName: "listener",
-    groupId: 100,
-    groupName: "listener-g",
     permissions: [{ path: "/", accessLevel: "read" }],
   });
   // ホルダーの user 名解決用 (ADR-019 holder.name)
   await seedUser(kv, {
     userId: 1,
     userName: "alice",
-    groupId: 10,
-    groupName: "alice-g",
     permissions: [{ path: "/", accessLevel: "write" }],
   });
 
@@ -112,8 +108,6 @@ Deno.test("lock.service: rejected acquire (different user) does NOT emit", async
     await seedUser(kv, {
       userId: 2,
       userName: "bob",
-      groupId: 20,
-      groupName: "bob-g",
     });
     const result = await acquireLock("/foo.txt", 2, "dev-bob");
     await flush();
@@ -144,8 +138,6 @@ Deno.test("lock.service: failed release (different user) does NOT emit", async (
     await seedUser(kv, {
       userId: 2,
       userName: "bob",
-      groupId: 20,
-      groupName: "bob-g",
     });
     await acquireLock("/foo.txt", 1, "dev-alice");
     await flush();

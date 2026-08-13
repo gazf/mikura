@@ -2,13 +2,13 @@ import { crypto as stdCrypto } from "@std/crypto";
 import { encodeHex } from "@std/encoding/hex";
 import { getKv } from "../kv/store.ts";
 import { Keys } from "../kv/keys.ts";
-import type {
-  AccessLevel,
-  DeviceData,
-  Permission,
-  TokenData,
-  User,
-} from "../types.ts";
+import {
+  type EffectiveLevel,
+  effectiveLevel,
+  hasAccess,
+} from "../policy/evaluate.ts";
+import { getActivePolicy, getUserRoles } from "./policy.service.ts";
+import type { AccessLevel, DeviceData, TokenData, User } from "../types.ts";
 
 // TextEncoder は stateless なので module-level で 1 個を共有 (validateToken は
 // 全 request の hot path で sha256 を経由する)。
@@ -377,165 +377,31 @@ export async function createAppToken(
   return { raw, hash };
 }
 
-async function fetchUserGroupIds(userId: number): Promise<number[]> {
-  const kv = await getKv();
-  const groupIds: number[] = [];
-  const iter = kv.list<boolean>({ prefix: Keys.userGroupsPrefix(userId) });
-  for await (const entry of iter) {
-    // Key is ["user_groups", userId, groupId]
-    const groupId = entry.key[2] as number;
-    groupIds.push(groupId);
-  }
-  return groupIds;
-}
-
-async function fetchPermission(
-  path: string,
-  groupId: number,
-): Promise<Permission | null> {
-  const kv = await getKv();
-  const got = await kv.get<Permission>(Keys.permission(path, groupId));
-  return got.value ?? null;
-}
-
 /**
- * request スコープの permission 走査 cache。
+ * ADR-035: 実効水準の判定。
  *
- * 課題: checkPermission は 1 request 内で何度も呼ばれる
- *   - GET /tree: entry 数 × (group 数 × depth) KV read = 数千 op / 1 req になりうる
- *   - WSS broadcast: peer 数 × (同上)
- *   - PATCH /files: src + dst で 2 回
- *
- * 共有可能性:
- *   - groupIds(userId): 1 request 内では同じ userId 何度叩いても 1 fetch で十分
- *   - permission(path, groupId): tree 走査で **parent path が大量に重複** する
- *     (例: /a/b/c と /a/b/d は /, /a, /a/b の lookup を共有)
- *
- * Promise を cache に格納することで Promise.all による concurrent walk でも
- * 1 (userId, path, groupId) 当たり 1 fetch に収束する (in-flight 共有)。
- *
- * ライフタイム: 1 request 中だけ生存。middleware が new し、req 終了で参照が
- * 切れて GC される (in-memory のみ、KV 書込みなし)。
+ * 旧実装は 1 判定ごとに (階層の深さ × 所属 group 数) の KV read を撃っていて、
+ * `GET /tree` では entry 数を掛けた数千 op になりえた。request スコープの
+ * `PermissionContext` はその重複を潰すためだけに存在していたが、コンパイル済み
+ * ポリシーがメモリに乗った今、判定は純粋な計算になったので不要になった。
+ * KV に触るのは「userId → ロール名」の初回解決だけで、それもモジュール
+ * レベルで cache される (policy.service.ts)。
  */
-export class PermissionContext {
-  private _groupIds = new Map<number, Promise<number[]>>();
-  private _perm = new Map<string, Promise<Permission | null>>();
-
-  groupIds(userId: number): Promise<number[]> {
-    let p = this._groupIds.get(userId);
-    if (!p) {
-      p = fetchUserGroupIds(userId);
-      this._groupIds.set(userId, p);
-    }
-    return p;
-  }
-
-  permission(path: string, groupId: number): Promise<Permission | null> {
-    // key separator に null byte を使うのは、path validation で null byte を
-    // 既に弾いているため衝突が起こりえないから。
-    const key = `${path}\0${groupId}`;
-    let p = this._perm.get(key);
-    if (!p) {
-      p = fetchPermission(path, groupId);
-      this._perm.set(key, p);
-    }
-    return p;
-  }
+export async function effectiveAccess(
+  userId: number,
+  path: string,
+): Promise<EffectiveLevel> {
+  const [policy, roles] = await Promise.all([
+    getActivePolicy(),
+    getUserRoles(userId),
+  ]);
+  return effectiveLevel(policy, roles, path);
 }
 
 export async function checkPermission(
   userId: number,
   path: string,
-  requiredLevel: "read" | "write" | "admin",
-  ctx?: PermissionContext,
+  requiredLevel: AccessLevel | "visible",
 ): Promise<boolean> {
-  // ctx 無しの呼び出しは「1 回限りの check」として one-shot context を生成する
-  // (test や CLI から呼ぶケース、または middleware を通らない経路)。
-  const context = ctx ?? new PermissionContext();
-
-  const groupIds = await context.groupIds(userId);
-  if (groupIds.length === 0) return false;
-
-  // Walk up the path hierarchy to find the most specific permission
-  const pathParts = path.split("/").filter(Boolean);
-  const pathsToCheck = ["/"];
-  let current = "";
-  for (const part of pathParts) {
-    current += "/" + part;
-    pathsToCheck.push(current);
-  }
-
-  // Check from most specific to least specific
-  for (let i = pathsToCheck.length - 1; i >= 0; i--) {
-    const checkPath = pathsToCheck[i];
-    for (const groupId of groupIds) {
-      const perm = await context.permission(checkPath, groupId);
-      if (perm) {
-        return hasAccess(perm.accessLevel, requiredLevel);
-      }
-    }
-  }
-
-  return false;
-}
-
-/**
- * 「まだ適用していない変更」の記述。<see cref="retainsRootAdmin"/> 用。
- */
-export interface PendingPermissionChange {
-  /** 所属から外れる group (membership 解除 / group 自体の削除)。 */
-  droppedGroupIds?: readonly number[];
-  /** root ("/") の permission 差し替え。`accessLevel: null` は削除を表す。 */
-  rootOverride?: { groupId: number; accessLevel: AccessLevel | null };
-}
-
-/**
- * 「この変更を適用した後も、当該 user は root の admin 権限を保つか」。
- *
- * admin console の権限エディタは、自分に admin を与えている設定そのものを
- * 編集できてしまう — root の permission を read に落とす、admins グループから
- * 自分を外す、admins グループごと削除する。適用してしまうと以後どの admin API
- * も 403 になり、KV を直接書き換える以外に復旧手段が無くなる。事前に弾く。
- *
- * 判定は `checkPermission` の path="/" における挙動を厳密になぞる。とくに
- * **最初に permission を持つ group で結果が決まる** (= より緩い group が
- * 先に並んでいると、後続 group の admin は参照されない) という順序依存を
- * 再現している。ここがずれると「ガードは通ったのに実際には締め出される」
- * という最悪の失敗をする。
- */
-export async function retainsRootAdmin(
-  userId: number,
-  change: PendingPermissionChange,
-): Promise<boolean> {
-  // 呼び出しごとに新しい context を作る。middleware が持ち回っている context を
-  // 使い回すと、同一リクエスト内で既に読んだ古い値を見てしまう。
-  const ctx = new PermissionContext();
-
-  const dropped = change.droppedGroupIds;
-  const groupIds = (await ctx.groupIds(userId))
-    .filter((id) => !dropped?.includes(id));
-
-  for (const groupId of groupIds) {
-    let perm: Permission | null;
-    if (change.rootOverride?.groupId === groupId) {
-      const level = change.rootOverride.accessLevel;
-      perm = level === null ? null : { accessLevel: level };
-    } else {
-      perm = await ctx.permission("/", groupId);
-    }
-    // checkPermission と同じ first-match-wins。
-    if (perm) return hasAccess(perm.accessLevel, "admin");
-  }
-  return false;
-}
-
-function hasAccess(
-  granted: AccessLevel,
-  required: "read" | "write" | "admin",
-): boolean {
-  if (required === "admin") return granted === "admin";
-  if (granted === "admin") return true;
-  if (granted === "write") return true;
-  if (granted === "read" && required === "read") return true;
-  return false;
+  return hasAccess(await effectiveAccess(userId, path), requiredLevel);
 }
