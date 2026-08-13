@@ -298,3 +298,64 @@ code, .mono {
   border-color: var(--danger);
   color: var(--danger);
 }
+
+/* ---- ポリシーエディタ (ADR-035) ---- */
+
+textarea.policy {
+  width: 100%;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  tab-size: 2;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--code-bg);
+  color: var(--text);
+  resize: vertical;
+}
+
+.report {
+  display: grid;
+  gap: 10px;
+}
+
+.report:empty {
+  display: none;
+}
+
+.issues {
+  border-left: 3px solid var(--border);
+  padding: 6px 0 6px 12px;
+}
+
+.issues h4 {
+  margin: 0 0 4px;
+  font-size: 13px;
+}
+
+.issues ul {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.issues.bad {
+  border-left-color: var(--danger);
+}
+
+.issues.warn {
+  border-left-color: #b7791f;
+}
+
+p.ok {
+  color: var(--ok);
+  font-size: 13px;
+  margin: 0;
+}
+
+.pill.deny {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+}

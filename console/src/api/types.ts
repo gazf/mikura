@@ -17,23 +17,111 @@ export interface ApiUser {
   createdAt: string;
 }
 
-export interface ApiGroup {
-  id: number;
-  name: string;
-}
-
 export type ApiAccessLevel = "read" | "write" | "admin";
 
-export interface ApiMembership {
-  groupId: number;
-  /** group 本体が消えている membership では null。 */
-  groupName: string | null;
+/** テストとアサーションの期待水準 (ADR-035)。 */
+export type ApiExpectation =
+  | "invisible"
+  | "visible"
+  | "readable"
+  | "writable"
+  | "admin";
+
+export interface ApiPolicyIssue {
+  /** 1 始まり。0 は文書全体に対する指摘。 */
+  line: number;
+  message: string;
 }
 
-export interface ApiPermission {
+export interface ApiPolicyTestFailure extends ApiPolicyIssue {
+  role: string;
   path: string;
-  groupId: number;
-  accessLevel: ApiAccessLevel;
+  expected: string;
+  actual: string;
+}
+
+export interface ApiAssertionFailure {
+  id: number;
+  userId: number;
+  path: string;
+  expected: string;
+  actual: string;
+  message: string;
+}
+
+/** `GET /admin/policy` — 原文 + 静的な健康診断。 */
+export interface ApiPolicy {
+  version: number;
+  text: string;
+  createdAt: string | null;
+  createdBy: number | null;
+  roles: Array<{
+    name: string;
+    line: number;
+    rules: Array<{ path: string; level: ApiAccessLevel | null }>;
+    memberCount: number;
+  }>;
+  warnings: ApiPolicyIssue[];
+  /** 実在しないパスを指しているルール。 */
+  dangling: Array<{ role: string; path: string; line: number }>;
+}
+
+/** `PUT /admin/policy` — 却下時も同じ形で理由が返る。 */
+export interface ApiPolicySaveResult {
+  ok: boolean;
+  version?: number;
+  errors: ApiPolicyIssue[];
+  testFailures: ApiPolicyTestFailure[];
+  warnings: ApiPolicyIssue[];
+  assertionFailures: ApiAssertionFailure[];
+  /** admin 不在・版競合など、文書の外側の理由。 */
+  rejection?: string;
+}
+
+export interface ApiPolicyVersion {
+  version: number;
+  createdAt: string;
+  createdBy: number;
+  bytes: number;
+  current: boolean;
+}
+
+export interface ApiAssignment {
+  userId: number;
+  roles: string[];
+}
+
+export interface ApiAssertion {
+  id: number;
+  userId: number;
+  path: string;
+  expect: ApiExpectation;
+  note?: string;
+}
+
+/** `GET /admin/diagnostics/effective` — なぜその結果になったか。 */
+export interface ApiEffectiveDiagnostic {
+  userId: number;
+  path: string;
+  effective: string;
+  perRole: Array<{
+    role: string;
+    decidedBy: string | null;
+    level: ApiAccessLevel | null;
+    derivedVisible: boolean;
+  }>;
+}
+
+/** `GET /admin/diagnostics/who` — そのパスに届くのは誰か。 */
+export interface ApiWhoDiagnostic {
+  path: string;
+  level: string;
+  users: Array<{
+    userId: number;
+    name: string | null;
+    effective: string;
+    roles: string[];
+  }>;
 }
 
 export interface ApiEnrollment {

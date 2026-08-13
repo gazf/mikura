@@ -199,7 +199,9 @@ function collectCrossRoleDenyWarnings(
       const others = roles.filter((r) => r !== role).map((r) => r.name);
       if (others.length === 0) continue;
       const level = effectiveLevel(policy, others, deny.path);
-      if (level !== null && level !== "visible") {
+      // admin は定義上どこにでも届くので、これを指摘すると deny を書くたびに
+      // 管理者ロールとの衝突が出て、本当に見るべき警告が埋もれる。
+      if (level !== null && level !== "visible" && level !== "admin") {
         warnings.push({
           line: deny.line,
           message:

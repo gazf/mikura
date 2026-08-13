@@ -117,6 +117,25 @@ role lead {
   assert(v.ok);
 });
 
+Deno.test("validatePolicy: admin ロールとの衝突は警告しない (毎回出て埋もれる)", () => {
+  const v = validatePolicy(`
+role admins {
+  allow admin /
+}
+test admins {
+  admin /
+}
+role blocked {
+  allow write /projects
+  deny /projects/secret
+}
+test blocked {
+  invisible /projects/secret
+}
+`);
+  assertEquals(v.warnings, []);
+});
+
 Deno.test("validatePolicy: deny を持つのに test が無いロールを警告する", () => {
   const v = validatePolicy(`
 role r {
