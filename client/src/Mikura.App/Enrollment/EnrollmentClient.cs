@@ -68,7 +68,12 @@ public sealed class EnrollmentClient
         var profile = new Profile(
             Name: name,
             ServerUrl: invitation.ServerUrl,
-            MountLetter: mountLetter ?? DriveLetters.PickFree(),
+            // 既存 profile が確保しているレターを必ず除外する。ここを渡さないと、
+            // inits/*.init.json を 2 つ投入した時 (= headless で複数ホストを
+            // 一括登録する経路) に、まだどちらもマウントされていないので
+            // OS からは両方空きに見え、同じレターが 2 回割り当てられる。
+            MountLetter: mountLetter ?? DriveLetters.PickFree(
+                _store.LoadProfiles().Select(p => p.MountLetter)),
             EnrolledAt: DateTime.UtcNow);
 
         _store.SaveProfile(profile);

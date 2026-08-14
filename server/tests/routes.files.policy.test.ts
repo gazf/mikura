@@ -4,6 +4,7 @@
  *     無いと /alice/docs への grant は /alice が不可視で到達できず死ぬ
  *   - 権限の無い兄弟は名前ごと消える (= Access-Based Enumeration)
  *   - ルールが名前を挙げているパスは rename / delete を拒否する (409)
+ *   - read だけのロールでは書き込み系が全経路で 403 になる
  *
  * 注意: DATA_ROOT は file.service.ts の import 時に固定されるため、既定の
  * `<cwd>/data/` 配下に実ファイルを一時生成して動かす。
@@ -203,6 +204,63 @@ Deno.test("PATCH /files: ルール保持パスの rename は 409 (削除して�
         }),
       );
       assertEquals(ancestor.status, 409);
+    });
+  } finally {
+    await cleanup();
+  }
+});
+
+Deno.test("read だけのロールでは書き込み系が全経路で 403", async () => {
+  const cleanup = await setupFixture();
+  try {
+    await withTestKv(async (kv) => {
+      await seedUser(kv, {
+        userId: 1,
+        userName: "alice",
+        permissions: [{ path: `/${FIXTURE}`, accessLevel: "read" }],
+      });
+      const token = (await createAppToken(1, "alice")).raw;
+
+      // 読めることは先に確かめる (403 が「見えないから」ではないと分かるように)
+      const read = await app.fetch(
+        authReq(
+          "GET",
+          `http://localhost/content/${FIXTURE}/docs/note.txt`,
+          token,
+        ),
+      );
+      assertEquals(read.status, 200);
+      // 本文を読み切らないとファイルハンドルが開いたまま残る。
+      assertEquals(await read.text(), "note");
+
+      const writes: Array<[string, string, unknown]> = [
+        ["PUT", `http://localhost/content/${FIXTURE}/docs/note.txt`, undefined],
+        ["POST", `http://localhost/folders/${FIXTURE}/newdir`, undefined],
+        [
+          "DELETE",
+          `http://localhost/files/${FIXTURE}/docs/note.txt`,
+          undefined,
+        ],
+        ["PATCH", `http://localhost/files/${FIXTURE}/docs/note.txt`, {
+          newPath: `/${FIXTURE}/docs/renamed.txt`,
+        }],
+        ["POST", "http://localhost/uploads", {
+          path: `/${FIXTURE}/docs/note.txt`,
+        }],
+        ["POST", `http://localhost/locks/${FIXTURE}/docs/note.txt`, undefined],
+      ];
+      for (const [method, url, body] of writes) {
+        const res = await app.fetch(authReq(method, url, token, body));
+        assertEquals(res.status, 403, `${method} ${url} が 403 になっていない`);
+      }
+
+      // 実ファイルが無傷であること (403 を返しつつ副作用が残っていたら意味がない)
+      const still = await app.fetch(
+        authReq("GET", `http://localhost/files/${FIXTURE}/docs`, token),
+      );
+      const names = ((await still.json()) as Array<{ name: string }>)
+        .map((e) => e.name);
+      assertEquals(names, ["note.txt"]);
     });
   } finally {
     await cleanup();
