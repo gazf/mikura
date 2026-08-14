@@ -189,13 +189,15 @@ function heading(title, sub) {
 // -- users --
 
 async function renderUsers(target) {
-  const [users, policy, assignments] = await Promise.all([
+  const [users, roleList, assignments] = await Promise.all([
     api.get("/console/api/users"),
-    api.get("/console/api/policy"),
+    api.get("/console/api/roles"),
     api.get("/console/api/assignments"),
   ]);
   const rolesOf = (id) => assignments.find((a) => a.userId === id)?.roles ?? [];
-  const allRoles = policy.roles.map((r) => r.name);
+  // 無効なロールも割り当て自体はできる (権限を与えないだけ)。ただし黙って
+  // 効かないと事故になるので、選択肢でも割り当て済みの表示でも状態を出す。
+  const roleByName = new Map(roleList.roles.map((r) => [r.name, r]));
 
   const nameInput = el("input", {
     type: "text",
@@ -229,9 +231,14 @@ async function renderUsers(target) {
       "select",
       null,
       el("option", { value: "", text: "ロールを選択…" }),
-      allRoles
-        .filter((r) => !mine.includes(r))
-        .map((r) => el("option", { value: r, text: r })),
+      roleList.roles
+        .filter((r) => !mine.includes(r.name))
+        .map((r) =>
+          el("option", {
+            value: r.name,
+            text: r.enabled ? r.name : `${r.name} (無効)`,
+          })
+        ),
     );
     return el(
       "tr",
@@ -253,8 +260,12 @@ async function renderUsers(target) {
               "span",
               { class: "row", style: "display:inline-flex;margin-right:8px" },
               el("span", {
-                class: allRoles.includes(role) ? "pill" : "pill deny",
-                text: allRoles.includes(role) ? role : `${role} (未定義)`,
+                class: roleByName.get(role)?.enabled ? "pill" : "pill deny",
+                text: !roleByName.has(role)
+                  ? `${role} (未定義)`
+                  : roleByName.get(role).enabled
+                  ? role
+                  : `${role} (無効)`,
               }),
               el("button", {
                 text: "×",
@@ -372,6 +383,24 @@ function issueList(title, items, cls) {
 }
 
 /**
+ * 却下理由を 1 行にまとめる (toast 用)。
+ *
+ * 却下の理由は 5 つの入れ物に分かれて返る。どれが埋まるかは却下の種類で
+ * 変わるので、拾い漏れると「失敗しました」しか出ない画面になる。
+ * 一覧のトグルのように詳細を描く場所が無いところでは、ここで先頭 1 件を出す。
+ */
+function rejectReason(result, fallback) {
+  if (result.rejection) return result.rejection;
+  if (result.errors?.length) return result.errors[0].message;
+  if (result.testFailures?.length) return result.testFailures[0].message;
+  if (result.assertionFailures?.length) {
+    return result.assertionFailures[0].message;
+  }
+  if (result.message) return result.message;
+  return fallback;
+}
+
+/**
  * 保存結果の却下理由をまとめて描く。
  *
  * 却下は 2 系統ある: 構造化された 422 (検証・テスト・アサーション・admin 不在) と、
@@ -452,11 +481,7 @@ async function renderRoles(target) {
                 { enabled: !r.enabled },
               ).catch((e) => e.body ?? Promise.reject(e));
               if (!result.ok) {
-                toast(
-                  result.rejection ?? result.message ??
-                    "切り替えられませんでした",
-                  true,
-                );
+                toast(rejectReason(result, "切り替えられませんでした"), true);
                 return;
               }
               toast(`${r.name} を${r.enabled ? "無効" : "有効"}にしました`);
@@ -670,7 +695,7 @@ async function renderRoleEditor(target, name) {
       ...saveReport(result),
     );
     if (!result.ok) {
-      toast(result.message ?? "保存できませんでした", true);
+      toast(rejectReason(result, "保存できませんでした"), true);
       report.scrollIntoView({ block: "nearest" });
     }
   }
@@ -713,7 +738,10 @@ async function renderRoleEditor(target, name) {
                   ).catch((e) => e.body ?? Promise.reject(e));
                   if (!result.ok) {
                     report.replaceChildren(...saveReport(result));
-                    toast(result.message ?? "切り替えられませんでした", true);
+                    toast(
+                      rejectReason(result, "切り替えられませんでした"),
+                      true,
+                    );
                     return;
                   }
                   toast(`第 ${g.generation} 世代に切り替えました`);
@@ -825,7 +853,7 @@ async function renderRoleEditor(target, name) {
               ).catch((e) => e.body ?? Promise.reject(e));
               if (!result.ok) {
                 report.replaceChildren(...saveReport(result));
-                toast(result.message ?? "削除できませんでした", true);
+                toast(rejectReason(result, "削除できませんでした"), true);
                 return;
               }
               toast(`${detail.name} を削除しました`);
