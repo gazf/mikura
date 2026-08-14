@@ -399,3 +399,9 @@ table.form td.grow input {
 .toolbar {
   margin-bottom: 12px;
 }
+
+/* 置き換えが要る招待リンクの雛形。そのまま配れないことを見た目で示す。 */
+code.template {
+  border: 1px dashed var(--danger);
+  background: color-mix(in srgb, var(--danger) 6%, var(--code-bg));
+}

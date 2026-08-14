@@ -444,7 +444,7 @@ Deno.test("console 向け読み出し endpoint も非 admin は 403", async () =
 
 // ---- enrollUrl (ADR-034) ----
 
-Deno.test("POST /admin/enrollments: MIKURA_PUBLIC_URL があれば enrollUrl を返す", async () => {
+Deno.test("POST /admin/enrollments: MIKURA_PUBLIC_URL があれば enrollUrl を返し、雛形は出さない", async () => {
   await withTestKv(async (kv) => {
     const { adminToken } = await setup(kv);
     const prev = Deno.env.get("MIKURA_PUBLIC_URL");
@@ -459,8 +459,11 @@ Deno.test("POST /admin/enrollments: MIKURA_PUBLIC_URL があれば enrollUrl を
       const body = (await res.json()) as {
         secret: string;
         enrollUrl: string | null;
+        enrollUrlTemplate: string | null;
       };
       assert(body.enrollUrl, "enrollUrl が null");
+      // 配れるリンクがあるなら雛形は出さない (取り違えさせない)
+      assertEquals(body.enrollUrlTemplate, null);
       const url = new URL(body.enrollUrl);
       assertEquals(url.protocol, "mikura:");
       // 末尾 slash は落ちる
@@ -476,7 +479,7 @@ Deno.test("POST /admin/enrollments: MIKURA_PUBLIC_URL があれば enrollUrl を
   });
 });
 
-Deno.test("POST /admin/enrollments: MIKURA_PUBLIC_URL 未設定なら enrollUrl は null (推測しない)", async () => {
+Deno.test("POST /admin/enrollments: 未設定なら enrollUrl は null で、代わりに雛形が返る", async () => {
   await withTestKv(async (kv) => {
     const { adminToken } = await setup(kv);
     const prev = Deno.env.get("MIKURA_PUBLIC_URL");
@@ -491,8 +494,16 @@ Deno.test("POST /admin/enrollments: MIKURA_PUBLIC_URL 未設定なら enrollUrl 
       const body = (await res.json()) as {
         secret: string;
         enrollUrl: string | null;
+        enrollUrlTemplate: string | null;
       };
       assertEquals(body.enrollUrl, null);
+      // 代わりに host だけを差し込み語にした雛形が返る。admin が手で直せば
+      // そのまま配れるので、シークレットから URI を組み立て直さずに済む。
+      assert(body.enrollUrlTemplate !== null);
+      const template = new URL(body.enrollUrlTemplate!);
+      assertEquals(template.protocol, "mikura:");
+      assertEquals(template.searchParams.get("u"), "http://HOST:8700");
+      assertEquals(template.searchParams.get("s"), body.secret);
       // raw secret 自体は従来通り返る (CLI / init.json 経路の互換)
       assert(body.secret.length > 0);
     } finally {

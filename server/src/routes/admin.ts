@@ -60,7 +60,11 @@ import { validatePolicyPath } from "../policy/paths.ts";
 import { getTree } from "../services/file.service.ts";
 import { getKv } from "../kv/store.ts";
 import { Keys } from "../kv/keys.ts";
-import { buildEnrollUrl, getPublicBaseUrl } from "../util/enrollUrl.ts";
+import {
+  buildEnrollUrl,
+  buildEnrollUrlTemplate,
+  getPublicBaseUrl,
+} from "../util/enrollUrl.ts";
 import type {
   AccessLevel,
   AuditEntry,
@@ -856,6 +860,10 @@ export function registerAdminRoutes(app: Hono<Env>) {
         // ADR-034: 配布物を 1 本の URI にする。MIKURA_PUBLIC_URL 未設定時は
         // null (= 推測した URL を配るくらいなら console 側で気付かせる)。
         enrollUrl: buildEnrollUrl(getPublicBaseUrl(), result.raw),
+        // 未設定時はホストだけを差し込み語にした雛形を返す。形が見えていれば
+        // admin が手で直して配れるし、シークレットを手で組み立てずに済む。
+        // enrollUrl と同時に非 null になることはない。
+        enrollUrlTemplate: buildEnrollUrlTemplate(result.raw),
       }, 201);
     } catch (e) {
       if (e instanceof Error && e.message === "user_not_found") {

@@ -146,8 +146,17 @@ deno task seed --policy <file>         # ポリシー文書そのものを差し
 | `MIKURA_CONSOLE_SESSION_MAX_HOURS` | `8` | セッションの絶対寿命 |
 
 招待リンクを発行するには、**API サーバ側**に `MIKURA_PUBLIC_URL`
-(クライアントから到達できる URL) を設定してください。未設定の場合はシークレット
-のみ表示され、そのまま配れるリンクは作られません (ADR-034)。
+(クライアントから到達できる URL) を設定してください。
+
+```bash
+cd server
+MIKURA_PUBLIC_URL=http://localhost:8700 deno task dev
+```
+
+未設定でも招待は発行できますが、リンクのホスト名を組み立てられないため
+`mikura://enroll?u=http%3A%2F%2FHOST%3A8700&s=...` という**雛形**が表示されます。
+`HOST` をクライアントから到達できるホスト名か IP に置き換えてから渡してください。
+置き換え忘れたリンクはクライアント側で弾かれます (ADR-034)。
 
 ### クライアント (Windows)
 

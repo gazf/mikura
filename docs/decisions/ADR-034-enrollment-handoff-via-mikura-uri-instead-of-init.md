@@ -35,6 +35,12 @@ Everything else that `init.json` carried is dropped or derived:
 
 When `MIKURA_PUBLIC_URL` is not configured, `enrollUrl` is `null` rather than a guess. A wrong URL in an invitation fails at the user's machine, long after the administrator has stopped watching; a `null` fails in the console, where it can be explained. Making it a hard startup requirement was rejected because it would break existing deployments that only use the CLI, which does not need the field at all.
 
+Alongside the `null`, the server returns `enrollUrlTemplate` — the same URI with the host replaced by the literal `HOST`, e.g. `mikura://enroll?u=http%3A%2F%2FHOST%3A8700&s=…`. This is not a retreat from "do not guess": the two are distinguished by whether the result can be mistaken for a working link. A plausible host (`localhost`, or one derived from the `Host` header) gets distributed unexamined and fails opaquely at the recipient; `HOST` cannot be. The administrator edits one word instead of hand-assembling a URI around a raw secret, and the two fields are never both non-null so "ready to send" and "needs editing" stay distinguishable.
+
+The port is taken from the server's actual listen port rather than left as a placeholder. Reachability is a guess; which port the process is bound to is not.
+
+The client rejects a URL whose host is exactly `HOST`, case-insensitively, with a message naming the placeholder. Without that, forgetting to edit produces a DNS failure whose cause is invisible to the person who received the link. The comparison ignores case because DNS does, which means a machine genuinely named `host` cannot be addressed by that bare name — an acceptable trade, since an FQDN or IP works and the opposite error is silent.
+
 ### The secret is not shortened
 
 A shorter, hand-typeable code (roughly 12 base32 characters) was considered so that the invitation could be dictated verbally. It is rejected for now:

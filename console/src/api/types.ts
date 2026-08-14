@@ -169,6 +169,12 @@ export interface ApiIssuedEnrollment {
   expiresAt: string;
   /** MIKURA_PUBLIC_URL 未設定時は null (ADR-034)。 */
   enrollUrl: string | null;
+  /**
+   * MIKURA_PUBLIC_URL 未設定時の雛形。host だけが差し込み語 (`HOST`) になった、
+   * 形は正しいがそのままでは繋がらない URI。`enrollUrl` と同時に非 null に
+   * なることはない。
+   */
+  enrollUrlTemplate: string | null;
 }
 
 export interface ApiToken {

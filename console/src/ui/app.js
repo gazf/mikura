@@ -1189,17 +1189,17 @@ async function renderInvitations(target) {
 }
 
 function renderIssued(issued) {
-  if (!issued.enrollUrl) {
+  // 配れるリンクと、手直しが要る雛形。サーバは両方を同時には返さない。
+  const isTemplate = !issued.enrollUrl;
+  const url = issued.enrollUrl ?? issued.enrollUrlTemplate;
+
+  if (!url) {
+    // 雛形すら組めないのは想定外 (サーバが古い等)。シークレットだけ出す。
     return el(
       "div",
       { class: "invite" },
       el("strong", {
         text: "招待を発行しましたが、リンクを組み立てられませんでした",
-      }),
-      el("p", {
-        class: "hint",
-        text:
-          "サーバ側に MIKURA_PUBLIC_URL が設定されていません。設定すると、そのまま配れる招待リンクを表示できます。",
       }),
       el(
         "div",
@@ -1213,13 +1213,25 @@ function renderIssued(issued) {
       }),
     );
   }
-  const link = el("code", { text: issued.enrollUrl });
+
+  const link = el("code", { class: isTemplate ? "template" : "", text: url });
   return el(
     "div",
     { class: "invite" },
     el("strong", {
-      text: "招待リンク (この画面を離れると二度と表示できません)",
+      text: isTemplate
+        ? "招待リンクの雛形 (この画面を離れると二度と表示できません)"
+        : "招待リンク (この画面を離れると二度と表示できません)",
     }),
+    isTemplate
+      ? el("p", {
+        class: "hint",
+        text:
+          "サーバ側に MIKURA_PUBLIC_URL が設定されていないため、ホスト名を組み立てられませんでした。" +
+          "上の HOST を、クライアントから到達できるホスト名か IP に置き換えてから渡してください " +
+          "(置き換え忘れたリンクはクライアント側で弾かれます)。",
+      })
+      : null,
     link,
     el(
       "div",
@@ -1229,7 +1241,7 @@ function renderIssued(issued) {
         text: "コピー",
         onclick: async () => {
           try {
-            await navigator.clipboard.writeText(issued.enrollUrl);
+            await navigator.clipboard.writeText(url);
             toast("コピーしました");
           } catch {
             toast("コピーできませんでした。手動で選択してください", true);

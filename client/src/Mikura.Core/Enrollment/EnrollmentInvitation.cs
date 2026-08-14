@@ -136,6 +136,12 @@ public sealed record EnrollmentInvitation(
     /// server URL を http/https に限定し、末尾 slash を落として正規化する。
     /// 末尾 slash を残すと `/enroll` を連結したときに二重 slash になる。
     /// </summary>
+    /// <summary>
+    /// サーバーが <c>MIKURA_PUBLIC_URL</c> 未設定時に host の位置へ置く差し込み語
+    /// (ADR-034)。server 側の <c>HOST_PLACEHOLDER</c> と対でなければならない。
+    /// </summary>
+    private const string HostPlaceholder = "HOST";
+
     private static bool TryNormalizeServerUrl(
         string raw,
         out string? normalized,
@@ -148,6 +154,21 @@ public sealed record EnrollmentInvitation(
             (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
         {
             error = $"サーバー URL が http/https ではありません ({raw})。";
+            return false;
+        }
+
+        // サーバー側が MIKURA_PUBLIC_URL 未設定のとき、host を差し込み語にした
+        // 雛形を発行する (ADR-034)。置き換え忘れをここで止めないと、DNS 解決
+        // 失敗という原因の分からないエラーになって利用者が詰まる。
+        // DNS 名は大小文字を区別しないので、比較も区別しない (Uri.Host は
+        // 小文字に正規化されるため Ordinal では素通りする)。副作用として
+        // 実際に "host" という名前のマシンは直接指定できないが、その場合は
+        // FQDN か IP を使えばよく、置き換え忘れを見逃す方が高くつく。
+        if (string.Equals(uri.Host, HostPlaceholder, StringComparison.OrdinalIgnoreCase))
+        {
+            error =
+                $"招待リンクの {HostPlaceholder} が実際のサーバー名のまま置き換えられていません。" +
+                "発行した管理者に、置き換え済みのリンクを聞いてください。";
             return false;
         }
 

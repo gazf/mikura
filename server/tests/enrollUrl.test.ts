@@ -6,7 +6,11 @@
  */
 
 import { assert, assertEquals } from "@std/assert";
-import { buildEnrollUrl, getPublicBaseUrl } from "../src/util/enrollUrl.ts";
+import {
+  buildEnrollUrl,
+  buildEnrollUrlTemplate,
+  getPublicBaseUrl,
+} from "../src/util/enrollUrl.ts";
 
 /** env を退避して fn を実行し、必ず元に戻す。 */
 async function withPublicUrl(
@@ -82,4 +86,59 @@ Deno.test("buildEnrollUrl: URL は percent-encode されて query 境界を壊�
   // 生の & が載っていたら s の値が途中で切れる
   assert(!url.includes("a&b=c"));
   assertEquals(new URL(url).searchParams.get("s"), "a&b=c");
+});
+
+// ----- 未設定時の雛形 (ADR-034) -----
+
+/** MIKURA_PORT を退避して fn を実行し、必ず元に戻す。 */
+async function withPort(
+  value: string | undefined,
+  fn: () => void | Promise<void>,
+): Promise<void> {
+  const prev = Deno.env.get("MIKURA_PORT");
+  if (value === undefined) Deno.env.delete("MIKURA_PORT");
+  else Deno.env.set("MIKURA_PORT", value);
+  try {
+    await fn();
+  } finally {
+    if (prev === undefined) Deno.env.delete("MIKURA_PORT");
+    else Deno.env.set("MIKURA_PORT", prev);
+  }
+}
+
+Deno.test("buildEnrollUrlTemplate: 未設定なら host だけが差し込み語の雛形を返す", async () => {
+  await withPublicUrl(undefined, async () => {
+    await withPort(undefined, () => {
+      const url = buildEnrollUrlTemplate("s3cret");
+      assert(url !== null);
+      const parsed = new URL(url!);
+      assertEquals(parsed.searchParams.get("u"), "http://HOST:8700");
+      assertEquals(parsed.searchParams.get("s"), "s3cret");
+    });
+  });
+});
+
+Deno.test("buildEnrollUrlTemplate: ポートは実際の待ち受け値を使う (そこは推測ではない)", async () => {
+  await withPublicUrl(undefined, async () => {
+    await withPort("9999", () => {
+      const url = buildEnrollUrlTemplate("s3cret");
+      assertEquals(new URL(url!).searchParams.get("u"), "http://HOST:9999");
+    });
+  });
+});
+
+Deno.test("buildEnrollUrlTemplate: 設定済みなら null (配れるリンクと取り違えさせない)", async () => {
+  await withPublicUrl("https://files.example.com", () => {
+    assertEquals(buildEnrollUrlTemplate("s3cret"), null);
+  });
+});
+
+Deno.test("設定済みと未設定で、enrollUrl と雛形が同時に非 null にならない", async () => {
+  for (const configured of [undefined, "https://files.example.com"]) {
+    await withPublicUrl(configured, () => {
+      const real = buildEnrollUrl(getPublicBaseUrl(), "s3cret");
+      const template = buildEnrollUrlTemplate("s3cret");
+      assertEquals(real === null, template !== null);
+    });
+  }
 });

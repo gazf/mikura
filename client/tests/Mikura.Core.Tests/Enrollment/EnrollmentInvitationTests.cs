@@ -176,4 +176,32 @@ public class EnrollmentInvitationTests
         Assert.False(ok);
         Assert.False(string.IsNullOrEmpty(error));
     }
+
+    [Fact]
+    public void TryParse_HOST_置き換え忘れの雛形を弾く()
+    {
+        // サーバーが MIKURA_PUBLIC_URL 未設定のとき、host を差し込み語にした
+        // 雛形を発行する (ADR-034)。ここで止めないと、置き換え忘れが DNS 解決
+        // 失敗という原因の分からないエラーになって利用者が詰まる。
+        var text = $"mikura://enroll?u=http%3A%2F%2FHOST%3A8700&s={Secret}";
+
+        var ok = EnrollmentInvitation.TryParse(text, out var invitation, out var error);
+
+        Assert.False(ok);
+        Assert.Null(invitation);
+        Assert.Contains("HOST", error);
+    }
+
+    [Fact]
+    public void TryParse_HOST_を含むだけのホスト名は通す()
+    {
+        // 完全一致でのみ弾く。"myhost" や "HOSTING" のような実在しうる名前を
+        // 巻き込むと、正当な招待が使えなくなる。
+        var text = $"mikura://enroll?u=http%3A%2F%2FHOSTING.example.com%3A8700&s={Secret}";
+
+        var ok = EnrollmentInvitation.TryParse(text, out var invitation, out var error);
+
+        Assert.True(ok, error);
+        Assert.Equal("http://hosting.example.com:8700", invitation!.ServerUrl);
+    }
 }
