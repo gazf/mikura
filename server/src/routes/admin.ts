@@ -17,7 +17,7 @@
  *     secret は POST 直後の response にしか出さない (= 後から取得する経路は無い)。
  */
 
-import { Hono } from "hono";
+import { Hono } from "@hono/hono";
 import {
   type AuthUser,
   checkPermission,

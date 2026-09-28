@@ -1,4 +1,4 @@
-import { Hono } from "hono";
+import { Hono } from "@hono/hono";
 import { authMiddleware } from "./middleware/auth.ts";
 import { errorHandler } from "./middleware/errors.ts";
 import { pathGuard } from "./middleware/pathGuard.ts";

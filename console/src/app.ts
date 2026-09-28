@@ -10,7 +10,7 @@
  * 行う。
  */
 
-import { Hono } from "hono";
+import { Hono } from "@hono/hono";
 import { getCookie } from "@hono/hono/cookie";
 import { createMiddleware } from "@hono/hono/factory";
 import type { ApiClient } from "./api/client.ts";

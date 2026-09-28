@@ -1,4 +1,4 @@
-import { Hono } from "hono";
+import { Hono } from "@hono/hono";
 import { acquireLock, getLock, releaseLock } from "../services/lock.service.ts";
 import { checkPermission } from "../services/auth.service.ts";
 import type { AuthUser } from "../services/auth.service.ts";

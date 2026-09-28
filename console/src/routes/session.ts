@@ -8,7 +8,7 @@
  * disk にも env にも残らない。
  */
 
-import type { Hono } from "hono";
+import type { Hono } from "@hono/hono";
 import { getCookie, setCookie } from "@hono/hono/cookie";
 import { SESSION_COOKIE } from "../session/store.ts";
 import type { ConsoleEnv } from "../app.ts";

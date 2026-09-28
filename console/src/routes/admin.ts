@@ -11,7 +11,7 @@
  * 文字列をパスに流し込む前に必ず形式を検証する。
  */
 
-import type { Context, Hono } from "hono";
+import type { Context, Hono } from "@hono/hono";
 import type { ConsoleEnv } from "../app.ts";
 import type { ApiResponse } from "../api/client.ts";
 

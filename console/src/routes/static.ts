@@ -10,7 +10,7 @@
  * `deno task dev` 一発で立ち上がる単純さの方が価値がある。
  */
 
-import type { Hono } from "hono";
+import type { Hono } from "@hono/hono";
 import type { ConsoleEnv } from "../app.ts";
 
 export interface UiAssets {

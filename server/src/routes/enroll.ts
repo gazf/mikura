@@ -18,7 +18,7 @@
  *   - 500: KV 障害等
  */
 
-import { Hono } from "hono";
+import { Hono } from "@hono/hono";
 import {
   consumeEnrollment,
   EnrollmentError,
