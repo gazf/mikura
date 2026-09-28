@@ -173,6 +173,9 @@ public sealed class InMemoryFileSystemBackend : IFileSystemBackend
         return Task.FromResult(node.Path != "/");
     }
 
+    /// <summary>メモリ上のツリーなので永続化待ちは無い。</summary>
+    public Task FlushAsync(IFileHandle handle, CancellationToken ct = default) => Task.CompletedTask;
+
     public Task CleanupAsync(IFileHandle handle, CleanupFlags flags, CancellationToken ct = default)
     {
         if ((flags & CleanupFlags.Delete) != 0)

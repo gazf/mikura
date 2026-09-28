@@ -95,12 +95,15 @@ export async function releaseLock(
   const result = await tx.commit();
 
   if (result.ok) {
-    broadcastLockEvent("lock_released", filePath, {
-      userId,
-      deviceId: existing.value.deviceId,
-    }).catch((err) =>
-      console.error("broadcastLockEvent released failed:", err)
-    );
+    // holder (ロックを持っていた端末) と originator (解除した端末) は別物に
+    // なりうる。同一ユーザーの別端末が解除した場合、holder で配信除外すると
+    // **当人にだけ通知が届かない**ので、originator を明示して渡す。
+    broadcastLockEvent(
+      "lock_released",
+      filePath,
+      { userId, deviceId: existing.value.deviceId },
+      deviceId,
+    ).catch((err) => console.error("broadcastLockEvent released failed:", err));
   }
 
   return result.ok;
