@@ -157,7 +157,30 @@ public sealed class TrayAppContext : ApplicationContext
 
     private void OnSessionAdded(ProfileSession session)
     {
-        session.StatusChanged += _ => UpdateAggregateStatus();
+        // StatusChanged は ProfileSession の内部から発火する — WSS reconnect の
+        // スレッド、StartAsync の継続スレッド等で、UI スレッドではない。
+        // ハンドラの中身が UI コントロールを触っても安全なように、**ハンドラ全体**を
+        // UI スレッドへ乗せる (SetStatus 1 つだけを守る作法だと、後から
+        // RefreshProfilesMenu のような menu item を生やす処理を足した瞬間に
+        // クロススレッド例外になる)。
+        session.StatusChanged += _ => RunOnUi(UpdateAggregateStatus);
+    }
+
+    /// <summary>
+    /// UI スレッドで action を走らせる。既に UI スレッドなら直接呼ぶ。
+    /// 非同期 post (BeginInvoke) にしてあるのは、呼び出し元が reconnect ループや
+    /// session の継続スレッドで、UI スレッドの完了を待つ理由が無いため。
+    /// </summary>
+    private void RunOnUi(Action action)
+    {
+        var owner = _statusItem.Owner;
+        if (owner is null || !owner.InvokeRequired)
+        {
+            action();
+            return;
+        }
+        try { owner.BeginInvoke(action); }
+        catch (Exception ex) { Trace.WriteLine($"[Tray] UI post dropped: {ex.Message}"); }
     }
 
     /// <summary>
@@ -327,25 +350,30 @@ public sealed class TrayAppContext : ApplicationContext
         }
     }
 
+    /// <remarks>
+    /// 呼び出し元は戻り値を捨てる (<c>_ = ShowAddProfileAsync(...)</c>) ので、
+    /// ここから例外を出すと誰にも観測されないまま消える。**本体全体**を try で
+    /// 囲んで、profile 読み出しや dialog の失敗も balloon に出す。
+    /// </remarks>
     private async Task ShowAddProfileAsync(string? prefill)
     {
         if (_manager is null) return;
 
-        var reserved = _store.LoadProfiles().Select(p => p.MountLetter).ToArray();
-        EnrollmentInvitation invitation;
-        string? mountLetter;
-        using (var dialog = new AddProfileForm(reserved, prefill))
-        {
-            if (dialog.ShowDialog() != DialogResult.OK || dialog.Invitation is null)
-            {
-                return;
-            }
-            invitation = dialog.Invitation;
-            mountLetter = dialog.MountLetter;
-        }
-
         try
         {
+            var reserved = _store.LoadProfiles().Select(p => p.MountLetter).ToArray();
+            EnrollmentInvitation invitation;
+            string? mountLetter;
+            using (var dialog = new AddProfileForm(reserved, prefill))
+            {
+                if (dialog.ShowDialog() != DialogResult.OK || dialog.Invitation is null)
+                {
+                    return;
+                }
+                invitation = dialog.Invitation;
+                mountLetter = dialog.MountLetter;
+            }
+
             using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
             var client = new EnrollmentClient(_store, http);
             var profile = await client
@@ -382,13 +410,7 @@ public sealed class TrayAppContext : ApplicationContext
         if (first is not null) OpenProfile(first);
     }
 
-    private void SetStatus(string text)
-    {
-        if (_statusItem.Owner?.InvokeRequired == true)
-            _statusItem.Owner.Invoke(() => _statusItem.Text = text);
-        else
-            _statusItem.Text = text;
-    }
+    private void SetStatus(string text) => RunOnUi(() => _statusItem.Text = text);
 
     private void ShowBalloon(string title, string text, ToolTipIcon icon = ToolTipIcon.Info)
     {

@@ -41,6 +41,17 @@ public sealed class ProfileSession : IAsyncDisposable
 
     private readonly string _token;
 
+    /// <summary>
+    /// Start / Stop / Restart / Dispose を直列化する。
+    /// <para>これらは <c>_http</c> / <c>_fsHost</c> / <c>_eventStream</c> / <c>_server</c>
+    /// を素で読み書きする一方、WSS reconnect ループが 5 秒間隔で自動的に走っている。
+    /// Tray の Remount (= Stop+Start) の最中に reconnect ループが Dispose 済みの
+    /// <c>_http</c> / <c>_eventStream</c> を触る窓があり、UI 操作と自動ループの
+    /// 組み合わせなので連打しなくても起きうる。</para>
+    /// </summary>
+    private readonly SemaphoreSlim _lifecycleGate = new(1, 1);
+    private bool _disposed;
+
     private HttpClient? _http;
     private HttpServerApi? _server;
     private FileSystemBackend? _backend;
@@ -66,6 +77,14 @@ public sealed class ProfileSession : IAsyncDisposable
     /// </summary>
     public async Task StartAsync(CancellationToken ct = default)
     {
+        await _lifecycleGate.WaitAsync(ct).ConfigureAwait(false);
+        try { await StartCoreAsync(ct).ConfigureAwait(false); }
+        finally { _lifecycleGate.Release(); }
+    }
+
+    private async Task StartCoreAsync(CancellationToken ct)
+    {
+        if (_disposed) return;
         SetStatus(ProfileSessionStatus.Connecting, "Connecting...");
         try
         {
@@ -106,9 +125,10 @@ public sealed class ProfileSession : IAsyncDisposable
         catch (Exception ex)
         {
             Log($"[ERROR] StartAsync failed: {ex}");
+            // 部分構築された resources をここで畳む。放置すると Failed のまま
+            // session が残り、HttpClient (接続プールと WSS の TCP) を握り続ける。
+            await StopCoreAsync().ConfigureAwait(false);
             SetStatus(ProfileSessionStatus.Failed, ex.Message);
-            // 部分構築 resources の clean-up は DisposeAsync 経路に任せる
-            // (= TrayAppContext がまとめて Dispose する規律)。
         }
     }
 
@@ -134,12 +154,26 @@ public sealed class ProfileSession : IAsyncDisposable
     /// </summary>
     public async Task RestartAsync(CancellationToken ct = default)
     {
-        await StopAsync().ConfigureAwait(false);
-        await StartAsync(ct).ConfigureAwait(false);
+        // Stop と Start を 1 つの critical section にまとめる。間で gate を手放すと
+        // 「unmount 済みで未 mount」の状態を他の操作に見せてしまう。
+        await _lifecycleGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await StopCoreAsync().ConfigureAwait(false);
+            await StartCoreAsync(ct).ConfigureAwait(false);
+        }
+        finally { _lifecycleGate.Release(); }
     }
 
     /// <summary>WSS reconnect ループを止め、mount を unmount する。</summary>
     public async Task StopAsync()
+    {
+        await _lifecycleGate.WaitAsync().ConfigureAwait(false);
+        try { await StopCoreAsync().ConfigureAwait(false); }
+        finally { _lifecycleGate.Release(); }
+    }
+
+    private async Task StopCoreAsync()
     {
         try
         {
@@ -176,11 +210,20 @@ public sealed class ProfileSession : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        await StopAsync();
+        await _lifecycleGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (_disposed) return;
+            _disposed = true;
+            await StopCoreAsync().ConfigureAwait(false);
+        }
+        finally { _lifecycleGate.Release(); }
+        _lifecycleGate.Dispose();
     }
 
     private async Task RunEventLoopWithReconnectAsync(CancellationToken ct)
     {
+        var firstConnect = true;
         while (!ct.IsCancellationRequested)
         {
             using var heartbeatCts =
@@ -190,7 +233,31 @@ public sealed class ProfileSession : IAsyncDisposable
                 var stream = await HttpEventStream.ConnectAsync(
                     Profile.ServerUrl, _token, DeviceId, ct);
                 _eventStream = stream;
+
+                // 切断していた間にサーバ側の lock が生きている保証は無い
+                // (TTL 30 秒 に対し再接続は 5 秒間隔 × 失敗回数)。切れたら全部
+                // 失ったとみなすのが SMB の session-lost に忠実で、これを入れないと
+                // HasLock=true のまま復帰した handle が黙って書き続け、finalize で
+                // 初めて弾かれる。gate を開ける **前**に落とすのが要点。
+                var lost = _backend!.InvalidateAllServerLocks();
+                if (lost > 0) Log($"session lost: invalidated {lost} lock(s)");
+
                 OnlineGate.Set(true);
+
+                // 切断中の broadcast は取りこぼしている (created/modified/deleted/lock)。
+                // 再接続後にツリーを取り直さないと、次の手動 Sync か Remount まで
+                // stale が残る。失敗しても接続そのものは続ける。
+                if (firstConnect)
+                {
+                    // 起動直後は StartAsync の InitializeAsync が済んだ直後なので不要。
+                    firstConnect = false;
+                }
+                else
+                {
+                    try { await _syncEngine!.FullSyncAsync(ct).ConfigureAwait(false); }
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception ex) { Log($"resync after reconnect failed: {ex.Message}"); }
+                }
 
                 await using (stream)
                 {
