@@ -159,3 +159,96 @@ Deno.test("GET /locks/*: returns locked=false when none, locked=true with lock w
     assertEquals(body.lock.deviceId, "dev-alice-pc");
   });
 });
+
+// ───────── マルチアカウント分離: ロックの所有は (userId, deviceId) ─────────
+//
+// deviceId は enrollment 時にクライアントが名乗るもので、一意性の検査が無い。
+// したがって「deviceId だけを所有の鍵にする」設計は、他人の deviceId を名乗る
+// だけで他人のロックとアップロードを操作できることを意味する。
+// 所有の判定には必ず userId を併用する。
+
+Deno.test("GET /locks/*: 権限の無いパスの保持者は漏らさない", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "alice",
+      permissions: [{ path: "/vault", accessLevel: "write" }],
+    });
+    await seedUser(kv, {
+      userId: 2,
+      userName: "mallory",
+      // ロールはあるが /vault には一切届かない
+      permissions: [{ path: "/elsewhere", accessLevel: "read" }],
+    });
+    const alice = (await createAppToken(1, "alice")).raw;
+    const mallory = (await createAppToken(2, "mallory")).raw;
+
+    assertEquals(
+      (await app.fetch(
+        lockReq("POST", "/vault/secret.txt", alice, "dev-alice"),
+      ))
+        .status,
+      200,
+    );
+
+    // 見えないパスの存在も保持者の身元 (userId / deviceId) も返さない。
+    const res = await app.fetch(
+      lockReq("GET", "/vault/secret.txt", mallory, "dev-mallory"),
+    );
+    assertEquals(res.status, 403);
+    const body = await res.text();
+    assert(!body.includes("dev-alice"), "holder deviceId must not leak");
+  });
+});
+
+Deno.test("GET /locks/*: 権限があれば従来どおり保持者を返す", async () => {
+  await withTestKv(async (kv) => {
+    const { aliceToken, bobToken } = await setup(kv);
+    await app.fetch(lockReq("POST", "/shared.txt", aliceToken, "dev-alice"));
+
+    const res = await app.fetch(
+      lockReq("GET", "/shared.txt", bobToken, "dev-bob-01"),
+    );
+    assertEquals(res.status, 200);
+    const body = await res.json() as { locked: boolean; lock: LockData };
+    assertEquals(body.locked, true);
+    assertEquals(body.lock.userId, 1);
+  });
+});
+
+Deno.test("WSS terminate: deviceId が同じでも他ユーザーのロックは解放しない", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "victim",
+      permissions: [{ path: "/", accessLevel: "write" }],
+    });
+    await seedUser(kv, {
+      userId: 2,
+      userName: "attacker",
+      permissions: [],
+    });
+    const victim = (await createAppToken(1, "victim")).raw;
+
+    // 両者が同じ deviceId を名乗っている状況 (enrollment に一意性検査が無い)。
+    const shared = "dev-collision";
+    assertEquals(
+      (await app.fetch(lockReq("POST", "/doc.txt", victim, shared))).status,
+      200,
+    );
+
+    // attacker の userId で device 単位の解放を叩く = WSS terminate 相当。
+    const { releaseDeviceLocks } = await import(
+      "../src/services/lock.service.ts"
+    );
+    assertEquals(await releaseDeviceLocks(shared, 2), 0);
+
+    // victim のロックは残っていること。
+    const still = await kv.get<LockData>(Keys.lock("/doc.txt"));
+    assertEquals(still.value?.userId, 1);
+
+    // 本人が叩けば解放される (機能自体は壊れていない)。
+    assertEquals(await releaseDeviceLocks(shared, 1), 1);
+    assertEquals((await kv.get<LockData>(Keys.lock("/doc.txt"))).value, null);
+  });
+});

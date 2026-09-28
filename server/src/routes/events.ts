@@ -98,7 +98,7 @@ export function registerEventRoutes(app: Hono<Env>) {
         console.log(
           `[wss] heartbeat from deviceId=${user.deviceId.slice(0, 8)}`,
         );
-        refreshDeviceLocks(user.deviceId).then((n) => {
+        refreshDeviceLocks(user.deviceId, user.id).then((n) => {
           if (n > 0) {
             console.log(
               `[wss] refreshed ${n} lock(s) for ${user.deviceId.slice(0, 8)}`,
@@ -108,7 +108,7 @@ export function registerEventRoutes(app: Hono<Env>) {
           console.error("refreshDeviceLocks failed:", err);
         });
         // ADR-025: upload session の TTL も lock と一緒に延長する。
-        refreshDeviceSessions(user.deviceId).then((n) => {
+        refreshDeviceSessions(user.deviceId, user.id).then((n) => {
           if (n > 0) {
             console.log(
               `[wss] refreshed ${n} upload session(s) for ${
@@ -123,7 +123,7 @@ export function registerEventRoutes(app: Hono<Env>) {
         console.log(
           `[wss] terminate from deviceId=${user.deviceId.slice(0, 8)}`,
         );
-        releaseDeviceLocks(user.deviceId).then((n) => {
+        releaseDeviceLocks(user.deviceId, user.id).then((n) => {
           console.log(
             `[wss] terminate released ${n} lock(s) for ${
               user.deviceId.slice(0, 8)
@@ -133,7 +133,7 @@ export function registerEventRoutes(app: Hono<Env>) {
           console.error("releaseDeviceLocks failed:", err);
         });
         // ADR-025: 終了に合わせて未 finalize の upload session も abort。
-        abortDeviceSessions(user.deviceId).then((n) => {
+        abortDeviceSessions(user.deviceId, user.id).then((n) => {
           if (n > 0) {
             console.log(
               `[wss] terminate aborted ${n} upload session(s) for ${

@@ -78,6 +78,20 @@ export function registerEnrollRoutes(app: Hono<any>) {
             deviceId.slice(0, 8)
           }`,
         );
+        // 409 (deviceId が別ユーザーに確保済み) だけは理由を返す。
+        // generic に畳む目的は secret の enumeration 防止だが、ここに到達する
+        // 相手は既に有効な招待を持っていて、しかも secret は消費していない
+        // (検査は commit の前)。別の端末 ID で再試行できることが伝わらないと、
+        // 正当な再セットアップが「招待が無効」に見えてしまう。
+        if (e.statusCode === 409) {
+          return c.json(
+            {
+              message:
+                "この端末 ID は別のユーザーに登録されています。管理者に端末の登録解除を依頼してください。",
+            },
+            409,
+          );
+        }
         return c.json(
           { message: "Enrollment secret invalid or already consumed" },
           e.statusCode as 410,

@@ -1282,6 +1282,34 @@ async function renderDevices(target) {
         el("td", { text: userName(d.userId) }),
         el("td", { class: "muted", text: fmtTime(d.lastSeenAt) }),
         el("td", { class: "muted", text: d.ipAddress ?? "—" }),
+        el(
+          "td",
+          { class: "actions" },
+          el("button", {
+            class: "danger",
+            text: "登録解除",
+            onclick: () =>
+              guard(async () => {
+                if (
+                  !confirm(
+                    `端末 ${shorten(d.deviceId, 20)} の登録を解除します。\n\n` +
+                      `この端末に固定されたトークンも失効し、すぐに接続できなく` +
+                      `なります。別のユーザーに渡す端末を再登録できるように` +
+                      `するための操作です。`,
+                  )
+                ) return;
+                const r = await api.del(
+                  `/console/api/devices/${encodeURIComponent(d.deviceId)}`,
+                );
+                toast(
+                  `端末を登録解除しました (トークン ${
+                    r?.revokedTokens ?? 0
+                  } 件を失効)`,
+                );
+                render();
+              }),
+          }),
+        ),
       )
     );
 
@@ -1334,7 +1362,7 @@ async function renderDevices(target) {
       "div",
       { class: "card" },
       el("h2", { text: "端末" }),
-      table(["端末 ID", "ユーザー", "最終接続", "IP"], deviceRows),
+      table(["端末 ID", "ユーザー", "最終接続", "IP", ""], deviceRows),
     ),
     el(
       "div",

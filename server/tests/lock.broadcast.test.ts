@@ -159,7 +159,7 @@ Deno.test("lock.service: releaseDeviceLocks emits one lock_released per file", a
     await flush();
     sock.sent.length = 0;
 
-    const released = await releaseDeviceLocks("dev-alice");
+    const released = await releaseDeviceLocks("dev-alice", 1);
     await flush();
     assertEquals(released, 3);
     assertEquals(sock.sent.length, 3);

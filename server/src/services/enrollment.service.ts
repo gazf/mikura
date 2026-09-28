@@ -19,7 +19,12 @@ import { encodeHex } from "@std/encoding/hex";
 import { crypto as stdCrypto } from "@std/crypto";
 import { getKv } from "../kv/store.ts";
 import { Keys } from "../kv/keys.ts";
-import type { EnrollmentSecret, TokenData, User } from "../types.ts";
+import type {
+  DeviceData,
+  EnrollmentSecret,
+  TokenData,
+  User,
+} from "../types.ts";
 
 // SHA256 を validate と同じ手段 (sync Wasm) で。auth.service.ts:sha256 は private
 // なので、本 service 側で再宣言する。stateless。
@@ -113,6 +118,36 @@ export async function consumeEnrollment(
     throw new EnrollmentError("user_not_found", 404);
   }
 
+  // 3.5) deviceId は 1 ユーザーに固定する。
+  //
+  // deviceId は client が名乗るだけで一意性の検査が無かったため、**被害者の
+  // deviceId を名乗って自分のアカウントを enroll する**ことができた。ロックと
+  // upload session の所有は (userId, deviceId) で見るようになったが、そもそも
+  // 別ユーザーの deviceId を名乗れること自体が device 単位の診断・監査
+  // (devices 一覧、mismatch ログ) を無意味にするので、入口で閉じる。
+  //
+  // 端末の持ち主が変わる場合 (貸与 PC の引き継ぎ等) は、admin が先に
+  // 該当 device レコードを削除する。黙って上書きするより明示的に倒す。
+  const existingDevice = await kv.get<DeviceData>(Keys.device(deviceId));
+  if (
+    existingDevice.value && existingDevice.value.userId !== enrollment.userId
+  ) {
+    throw new EnrollmentError("device_already_registered", 409);
+  }
+
+  // enrollment が deviceId を**確保する**。device レコードは従来、認証済み
+  // リクエストの upsertDevice でしか作られなかったので、enrollment 時点では
+  // 存在せず、上の検査が空振りしていた。
+  const nowIso = new Date().toISOString();
+  const device: DeviceData = existingDevice.value
+    ? { ...existingDevice.value, lastSeenAt: nowIso }
+    : {
+      deviceId,
+      userId: enrollment.userId,
+      firstSeenAt: nowIso,
+      lastSeenAt: nowIso,
+    };
+
   // 4) token を組み立て (新仕様: boundDeviceId 付き)
   const rawToken = crypto.randomUUID();
   const tokenHash = sha256(rawToken);
@@ -138,12 +173,20 @@ export async function consumeEnrollment(
       key: Keys.enrollment(secretHash),
       versionstamp: entry.versionstamp,
     })
+    // device の確保も同じ transaction に入れる。versionstamp を check して
+    // おくことで、同じ deviceId を狙う同時 enrollment は片方しか成立しない。
+    .check({
+      key: Keys.device(deviceId),
+      versionstamp: existingDevice.versionstamp,
+    })
     .set(Keys.enrollment(secretHash), consumed)
     .set(Keys.token(tokenHash), tokenData)
     .set(Keys.tokenByUser(enrollment.userId, tokenHash), true)
+    .set(Keys.device(deviceId), device)
+    .set(Keys.deviceByUser(enrollment.userId, deviceId), true)
     .commit();
   if (!res.ok) {
-    // 同時 consume の race で他方が先に成功した
+    // 同時 consume の race で他方が先に成功した (enrollment 側・device 側どちらも)
     throw new EnrollmentError("already_consumed", 410);
   }
 

@@ -1006,6 +1006,53 @@ export function registerAdminRoutes(app: Hono<Env>) {
     return c.json(devices);
   });
 
+  /**
+   * 端末の登録解除。
+   *
+   * deviceId は 1 ユーザーに確保される (enrollment が claim する) ので、
+   * 端末の持ち主が変わる場合 — 貸与 PC の引き継ぎ、device.json ごと作り直した
+   * 端末 — は、先にこれで確保を外す必要がある。これが無いと 409 の案内
+   * (「管理者に端末の登録解除を依頼してください」) が行き止まりになる。
+   *
+   * その端末に紐付いた token も一緒に revoke する。登録だけ外して token を
+   * 残すと、持ち主の変わった端末から前の持ち主の権限で繋がり続けられる。
+   */
+  app.delete("/admin/devices/:deviceId", async (c) => {
+    const user = c.get("user");
+    const auth = await requireAdmin(user);
+    if (!auth.ok) return c.json({ message: "Forbidden" }, auth.status);
+
+    const deviceId = c.req.param("deviceId");
+    const kv = await getKv();
+    const existing = await kv.get<DeviceData>(Keys.device(deviceId));
+    if (!existing.value) return c.json({ message: "Not found" }, 404);
+
+    const ownerId = existing.value.userId;
+    const tx = kv.atomic()
+      .delete(Keys.device(deviceId))
+      .delete(Keys.deviceByUser(ownerId, deviceId));
+
+    // この端末に bind された token を集めて一緒に落とす。
+    const revoked: string[] = [];
+    for await (
+      const e of kv.list<true>({ prefix: Keys.tokensByUserPrefix(ownerId) })
+    ) {
+      const hash = e.key[2] as string;
+      const token = await kv.get<TokenData>(Keys.token(hash));
+      if (token.value?.boundDeviceId !== deviceId) continue;
+      revoked.push(hash);
+      tx.delete(Keys.token(hash));
+      tx.delete(Keys.tokenByUser(ownerId, hash));
+    }
+
+    const res = await tx.commit();
+    if (!res.ok) return c.json({ message: "Race: try again" }, 409);
+    // KV から消すだけでは 60 秒のインメモリキャッシュが残る (cascade delete と同じ)。
+    for (const hash of revoked) invalidateToken(hash);
+
+    return c.json({ deleted: deviceId, revokedTokens: revoked.length }, 200);
+  });
+
   // ---- Audit ----
 
   /**

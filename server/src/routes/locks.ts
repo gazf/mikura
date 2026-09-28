@@ -60,9 +60,22 @@ export function registerLockRoutes(app: Hono<Env>) {
   });
 
   // GET /locks/*path — check lock status
+  //
+  // 認可が必要。ここだけ checkPermission を通していなかったため、**権限を 1 つも
+  // 持たないアカウントが任意のパスのロック保持者 (userId / deviceId) を読めた**。
+  // 不可視のはずのパスの存在が漏れるだけでなく、得られた deviceId は device 単位の
+  // 操作 (WSS terminate) を他人に向ける鍵そのものだった。
+  //
+  // 水準は read。ロックの有無と保持者は「中身を読める人」に見せる情報で、
+  // 名前だけ見える (visible) 相手に出すものではない。
   app.get("/locks/*", async (c) => {
     const wildcard = c.req.path.replace(LOCKS_PREFIX_RE, "");
     const filePath = "/" + wildcard;
+    const user = c.get("user");
+    if (!(await checkPermission(user.id, filePath, "read"))) {
+      return c.json({ message: "Forbidden" }, 403);
+    }
+
     const lock = await getLock(filePath);
 
     if (!lock) {

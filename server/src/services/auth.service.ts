@@ -153,6 +153,18 @@ export async function upsertDevice(
   const nowIso = new Date(now).toISOString();
   const existing = await kv.get<DeviceData>(Keys.device(deviceId));
 
+  // 既存レコードが別ユーザーのものなら、**持ち主を書き換えない**。
+  // deviceId は enrollment が 1 ユーザーに確保する。ここで黙って付け替えると
+  // その確保が無意味になり、device 単位の監査も追跡不能になる。
+  if (existing.value && existing.value.userId !== userId) {
+    console.warn(
+      `[auth] device owner mismatch deviceId=${
+        deviceId.slice(0, 8)
+      } owner=${existing.value.userId} got=${userId} (not reassigned)`,
+    );
+    return;
+  }
+
   const device: DeviceData = existing.value
     ? {
       ...existing.value,

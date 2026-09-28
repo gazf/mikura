@@ -153,7 +153,7 @@ Deno.test("refreshDeviceLocks: refreshes existing locks for the device", async (
     await acquireLock("/a.txt", USER_A, DEV_X);
     await acquireLock("/b.txt", USER_A, DEV_X);
 
-    const refreshed = await refreshDeviceLocks(DEV_X);
+    const refreshed = await refreshDeviceLocks(DEV_X, USER_A);
     assertEquals(refreshed, 2);
 
     // expiresAt が更新されていること (再 set 後の値が前と異なる or 30s 以内)
@@ -169,7 +169,7 @@ Deno.test("refreshDeviceLocks: cleans up stale device_locks reverse entries", as
     // メインを直接消して逆引きだけ残す状態を作る
     await kv.delete(Keys.lock(PATH));
 
-    const refreshed = await refreshDeviceLocks(DEV_X);
+    const refreshed = await refreshDeviceLocks(DEV_X, USER_A);
     assertEquals(refreshed, 0);
 
     const reverse = await kv.get(Keys.deviceLock(DEV_X, PATH));
@@ -183,7 +183,7 @@ Deno.test("refreshDeviceLocks: skips locks taken over by another device", async 
     await acquireLock(PATH, USER_A, DEV_Y); // 取り戻し
 
     // X の逆引きは acquireLock 内で削除済みのはず → refresh 対象 0
-    const refreshed = await refreshDeviceLocks(DEV_X);
+    const refreshed = await refreshDeviceLocks(DEV_X, USER_A);
     assertEquals(refreshed, 0);
 
     // Y のメインロックには影響なし
@@ -198,7 +198,7 @@ Deno.test("releaseDeviceLocks: bulk releases all locks held by device", async ()
     await acquireLock("/b.txt", USER_A, DEV_X);
     await acquireLock("/c.txt", USER_B, DEV_Y); // 別 device
 
-    const released = await releaseDeviceLocks(DEV_X);
+    const released = await releaseDeviceLocks(DEV_X, USER_A);
     assertEquals(released, 2);
 
     assertEquals((await kv.get(Keys.lock("/a.txt"))).versionstamp, null);
@@ -213,7 +213,7 @@ Deno.test("releaseDeviceLocks: cleans up stale reverse entries without main lock
     await acquireLock(PATH, USER_A, DEV_X);
     await kv.delete(Keys.lock(PATH)); // メインを直接消す
 
-    const released = await releaseDeviceLocks(DEV_X);
+    const released = await releaseDeviceLocks(DEV_X, USER_A);
     assertEquals(released, 0); // 解除済みカウントは 0
     // 逆引きは掃除される
     assertEquals(

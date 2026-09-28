@@ -16,6 +16,7 @@ import type { ConsoleEnv } from "../app.ts";
 import type { ApiResponse } from "../api/client.ts";
 
 /** SHA-256 hex。token hash をパスに載せる前の検証に使う。 */
+const DEVICE_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
 const HASH_RE = /^[a-f0-9]{64}$/;
 
 /** ロール名 (ADR-035)。上流のパスに載るので console 側でも形を固定する。 */
@@ -412,6 +413,25 @@ export function registerAdminRoutes(app: Hono<ConsoleEnv>) {
     return relay(
       c,
       await api.get(c.get("session").token, `/admin/devices${q}`),
+    );
+  });
+
+  /**
+   * 端末の登録解除。deviceId は 1 ユーザーに確保されるので、端末の持ち主が
+   * 変わるときはここで外してから再 enroll してもらう。
+   */
+  app.delete("/console/api/devices/:deviceId", async (c) => {
+    const { api } = c.get("deps");
+    const deviceId = c.req.param("deviceId");
+    if (!DEVICE_ID_RE.test(deviceId)) {
+      return c.json({ message: "Invalid deviceId" }, 400);
+    }
+    return relay(
+      c,
+      await api.delete(
+        c.get("session").token,
+        `/admin/devices/${encodeURIComponent(deviceId)}`,
+      ),
     );
   });
 

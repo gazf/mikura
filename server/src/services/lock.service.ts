@@ -110,10 +110,19 @@ export async function releaseLock(
 }
 
 /**
- * ADR-018 Step 3: terminate / 異常切断時に呼ぶ。当該 device が保持する全ロックを
- * 一括解除し、それぞれ lock_released を broadcast する。
+ * ADR-018 Step 3: terminate / 異常切断時に呼ぶ。当該 **ユーザーの** device が
+ * 保持する全ロックを一括解除し、それぞれ lock_released を broadcast する。
+ *
+ * `userId` は必須。deviceId は enrollment 時にクライアントが名乗るもので一意性の
+ * 検査が無いため、**deviceId だけを所有の鍵にすると、他人の deviceId を名乗る
+ * だけで他人のロックを解放できる**。実際に、権限を 1 つも持たない アカウントが
+ * 被害者の deviceId で WSS を張って `terminate` を送るだけで、被害者の編集中の
+ * ロックを外せた。所有の判定は必ず (userId, deviceId) の両方で行う。
  */
-export async function releaseDeviceLocks(deviceId: string): Promise<number> {
+export async function releaseDeviceLocks(
+  deviceId: string,
+  userId: number,
+): Promise<number> {
   const kv = await getEphemeralKv();
   let released = 0;
   const iter = kv.list({ prefix: Keys.deviceLocksPrefix(deviceId) });
@@ -127,6 +136,10 @@ export async function releaseDeviceLocks(deviceId: string): Promise<number> {
       await kv.delete(entry.key);
       continue;
     }
+
+    // deviceId は一致するが別ユーザーのロック = deviceId の衝突。相手の
+    // 正当なロックなので、**逆引きも含めて一切触らない**。
+    if (lockEntry.value.userId !== userId) continue;
 
     const tx = await kv
       .atomic()
@@ -185,7 +198,10 @@ export async function isLockedByOther(
  * 各ロックの TTL を再設定する (Deno KV の expireIn は set 時のみ反映されるので、
  * 同じ値で再 set することで TTL がリフレッシュされる)。
  */
-export async function refreshDeviceLocks(deviceId: string): Promise<number> {
+export async function refreshDeviceLocks(
+  deviceId: string,
+  userId: number,
+): Promise<number> {
   const kv = await getEphemeralKv();
   let refreshed = 0;
   const iter = kv.list({ prefix: Keys.deviceLocksPrefix(deviceId) });
@@ -205,6 +221,9 @@ export async function refreshDeviceLocks(deviceId: string): Promise<number> {
       await kv.delete(entry.key);
       continue;
     }
+
+    // deviceId 衝突時に他ユーザーのロックを延命しない (逆引きも触らない)。
+    if (lockEntry.value.userId !== userId) continue;
 
     // expiresAt も延長して整合性を保つ
     const refreshedLock: LockData = {

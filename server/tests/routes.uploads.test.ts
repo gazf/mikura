@@ -544,7 +544,7 @@ Deno.test("abortDeviceSessions: 当該 device の全 session が消える (termi
 
       assertEquals((await _listSessionsForTesting("dev-alice")).length, 2);
 
-      const aborted = await abortDeviceSessions("dev-alice");
+      const aborted = await abortDeviceSessions("dev-alice", 1);
       assertEquals(aborted, 2);
       assertEquals((await _listSessionsForTesting("dev-alice")).length, 0);
     } finally {
@@ -691,7 +691,7 @@ Deno.test("refreshDeviceSessions: alive marker の TTL を延長する (heartbea
         "alive marker should exist after startUpload",
       );
 
-      const refreshed = await refreshDeviceSessions("dev-alice");
+      const refreshed = await refreshDeviceSessions("dev-alice", 1);
       assertEquals(refreshed, 1);
 
       const after = await kv.get(aliveKey);

@@ -123,3 +123,55 @@ Deno.test("POST /enroll: auth middleware を skip する (Authorization 無し�
     assertEquals(res.status, 201);
   });
 });
+
+// ───────── deviceId は 1 ユーザーに固定する (マルチアカウント分離) ─────────
+//
+// deviceId は client が名乗るだけで、以前は一意性の検査が無かった。そのため
+// **被害者の deviceId を名乗って自分のアカウントを enroll** でき、device 単位の
+// 診断・監査 (devices 一覧、mismatch ログ) が成立しなくなっていた。
+// ロック / upload session の所有は (userId, deviceId) で見るようになったが、
+// 入口でも閉じる。
+
+Deno.test("POST /enroll: 他ユーザーが使っている deviceId は拒否する", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, { userId: 1, userName: "alice" });
+    await seedUser(kv, { userId: 2, userName: "mallory" });
+
+    const shared = "dev-collision-000000000001";
+
+    // alice が先にその deviceId で enroll
+    const a = await createEnrollmentSecret(1, 60_000);
+    assertEquals(
+      (await app.fetch(enrollReq({ secret: a.raw, deviceId: shared }))).status,
+      201,
+    );
+
+    // mallory が同じ deviceId を名乗る → 409
+    const m = await createEnrollmentSecret(2, 60_000);
+    const res = await app.fetch(enrollReq({ secret: m.raw, deviceId: shared }));
+    assertEquals(res.status, 409);
+    await res.body?.cancel();
+  });
+});
+
+Deno.test("POST /enroll: 同じユーザーの同じ端末は再 enroll できる", async () => {
+  // 端末の再セットアップやトークン再発行を壊さないこと。
+  await withTestKv(async (kv) => {
+    await seedUser(kv, { userId: 1, userName: "alice" });
+    const device = "dev-reenroll-00000000001";
+
+    const first = await createEnrollmentSecret(1, 60_000);
+    assertEquals(
+      (await app.fetch(enrollReq({ secret: first.raw, deviceId: device })))
+        .status,
+      201,
+    );
+
+    const second = await createEnrollmentSecret(1, 60_000);
+    const res = await app.fetch(
+      enrollReq({ secret: second.raw, deviceId: device }),
+    );
+    assertEquals(res.status, 201);
+    await res.body?.cancel();
+  });
+});
