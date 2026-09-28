@@ -2,6 +2,8 @@ import { assertEquals } from "@std/assert";
 import {
   broadcastFileEvent,
   broadcastLockEvent,
+  isRegisteredPeer,
+  type Peer,
   registerSocket,
   unregisterSocket,
 } from "../src/services/wsBroadcast.service.ts";
@@ -20,13 +22,15 @@ interface SentMsg {
 class FakeSocket {
   readyState = WebSocket.OPEN;
   sent: SentMsg[] = [];
+  closeCode: number | undefined;
 
   send(data: string): void {
     this.sent.push(JSON.parse(data));
   }
 
-  close(): void {
+  close(code?: number): void {
     this.readyState = WebSocket.CLOSED;
+    this.closeCode = code;
   }
 }
 
@@ -304,5 +308,105 @@ Deno.test("broadcastFileEvent: originatorDeviceId 未指定時 (watcher 経由�
     assertEquals(a.sent.length, 1);
     assertEquals(b.sent.length, 1);
     assertEquals(a.sent[0].originatorDeviceId, undefined);
+  });
+});
+
+// ----- 同一 deviceId の二重接続 (issue #13) -----
+//
+// heartbeat / terminate は deviceId 単位で lock と upload session を触るので、
+// 同じ deviceId で 2 本目が張られると「2 本目が閉じる・terminate を送る」だけで
+// 1 本目の作業を壊せる。正規クライアントは単一インスタンス mutex で 2 本張らない
+// ため、この状況そのものが token 複製の signal でもある。
+// 責務 = 「生きている 1 本目を守りつつ、正規の再接続は妨げない」。
+
+Deno.test("registerSocket: 生きている同一 deviceId の 2 本目を拒否し、1 本目を残す", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "alice",
+      permissions: [{ path: "/", accessLevel: "read" }],
+    });
+
+    const first: Peer = { socket: fakeSocket(), userId: 1, deviceId: "dev-1" };
+    const second: Peer = { socket: fakeSocket(), userId: 1, deviceId: "dev-1" };
+
+    assertEquals(registerSocket(first), { ok: true });
+    assertEquals(registerSocket(second), {
+      ok: false,
+      reason: "duplicate_device",
+    });
+
+    // 1 本目だけが登録されている = deviceId 単位の副作用を実行できるのは 1 本目のみ。
+    assertEquals(isRegisteredPeer(first), true);
+    assertEquals(isRegisteredPeer(second), false);
+
+    // 配信先としても 1 本目が生きていること。
+    await broadcastFileEvent("created", "/a.txt", {
+      type: "file",
+      size: 1,
+      lastModified: "2026-01-01T00:00:00.000Z",
+    });
+    assertEquals((first.socket as unknown as FakeSocket).sent.length, 1);
+  });
+});
+
+Deno.test("unregisterSocket: 拒否された 2 本目の close が 1 本目を道連れにしない", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "alice",
+      permissions: [{ path: "/", accessLevel: "read" }],
+    });
+
+    const first: Peer = { socket: fakeSocket(), userId: 1, deviceId: "dev-1" };
+    const second: Peer = { socket: fakeSocket(), userId: 1, deviceId: "dev-1" };
+    registerSocket(first);
+    registerSocket(second);
+
+    // 2 本目の socket が閉じたときの後始末。deviceId ではなく identity で
+    // 引き当てるので、1 本目の登録は残らなければならない (回帰テスト)。
+    unregisterSocket(second);
+
+    assertEquals(isRegisteredPeer(first), true);
+    await broadcastFileEvent("deleted", "/a.txt");
+    assertEquals((first.socket as unknown as FakeSocket).sent.length, 1);
+  });
+});
+
+Deno.test("registerSocket: heartbeat が途絶えた peer は置き換える (正規の再接続を妨げない)", async () => {
+  // half-open TCP では server 側の socket が OPEN のまま残る。無条件に 2 本目を
+  // 拒否すると、一瞬の回線切断が長時間の接続不能に化ける。
+  await withTestKv(() => {
+    const stale: Peer = { socket: fakeSocket(), userId: 1, deviceId: "dev-1" };
+    registerSocket(stale);
+    stale.lastSeenMs = Date.now() - 60_000;
+
+    const reconnected: Peer = {
+      socket: fakeSocket(),
+      userId: 1,
+      deviceId: "dev-1",
+    };
+    assertEquals(registerSocket(reconnected), { ok: true });
+
+    assertEquals(isRegisteredPeer(reconnected), true);
+    assertEquals(isRegisteredPeer(stale), false);
+    // 置き換えた側で古い socket を閉じる (放置すると fd が残る)。
+    assertEquals((stale.socket as unknown as FakeSocket).closeCode, 4409);
+  });
+});
+
+Deno.test("registerSocket: 既に閉じている peer は heartbeat が新しくても置き換える", async () => {
+  await withTestKv(() => {
+    const closed: Peer = { socket: fakeSocket(), userId: 1, deviceId: "dev-1" };
+    registerSocket(closed);
+    closed.socket.close();
+
+    const reconnected: Peer = {
+      socket: fakeSocket(),
+      userId: 1,
+      deviceId: "dev-1",
+    };
+    assertEquals(registerSocket(reconnected), { ok: true });
+    assertEquals(isRegisteredPeer(reconnected), true);
   });
 });

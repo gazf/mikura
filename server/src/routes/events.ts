@@ -8,9 +8,13 @@ import {
   refreshDeviceSessions,
 } from "../services/upload.service.ts";
 import {
+  isRegisteredPeer,
+  type Peer,
   registerSocket,
+  touchPeer,
   unregisterSocket,
 } from "../services/wsBroadcast.service.ts";
+import { logAudit } from "../services/audit.service.ts";
 import type { AuthUser } from "../services/auth.service.ts";
 
 type Env = {
@@ -24,6 +28,12 @@ interface IncomingMessage {
   deviceId?: string;
 }
 
+/** audit 用の直近 IP。判定には使わない付随情報 (auth ミドルウェアと同じ導出)。 */
+function clientIp(c: { req: { header(name: string): string | undefined } }) {
+  return c.req.header("X-Forwarded-For")?.split(",")[0]?.trim() ??
+    c.req.header("X-Real-IP") ?? "unknown";
+}
+
 export function registerEventRoutes(app: Hono<Env>) {
   app.get("/events", (c) => {
     // 接続ユーザーを auth ミドルウェアから取得。
@@ -34,14 +44,29 @@ export function registerEventRoutes(app: Hono<Env>) {
     const user = c.get("user");
     const { socket, response } = Deno.upgradeWebSocket(c.req.raw);
 
-    const peer = {
+    const peer: Peer = {
       socket,
       userId: user.id,
       deviceId: user.deviceId,
     };
 
     socket.onopen = () => {
-      registerSocket(peer);
+      const result = registerSocket(peer);
+      if (result.ok) return;
+
+      // 同じ deviceId の WSS が既に生きている。正規クライアントは単一
+      // インスタンス mutex で 2 本張らないので、これは token + deviceId が
+      // 複製された signal。1 本目は触らず 2 本目だけ閉じ、admin が revoke を
+      // 判断できるように監査ログへ残す (IP は付随情報。判定には使わない)。
+      logAudit(
+        user.id,
+        "wss_duplicate_device",
+        `device:${user.deviceId.slice(0, 8)}`,
+        clientIp(c),
+      ).catch((err) => console.error("logAudit failed:", err));
+      try {
+        socket.close(4409, "duplicate device");
+      } catch { /* 既に閉じている */ }
     };
 
     // ADR-018 Step 2/3: WSS heartbeat / terminate。deviceId は接続時に検証済みの
@@ -54,6 +79,11 @@ export function registerEventRoutes(app: Hono<Env>) {
         return;
       }
 
+      // deviceId 単位の副作用 (lock 延長 / 解放、session abort) を持つので、
+      // **登録済みの peer からのメッセージだけ**受理する。拒否された 2 本目や
+      // 置き換えられた zombie が、生きている 1 本目の lock を道連れにしない。
+      if (!isRegisteredPeer(peer)) return;
+
       if (msg.deviceId !== user.deviceId) {
         console.log(
           `[wss] message rejected (deviceId mismatch): expected=${
@@ -64,6 +94,7 @@ export function registerEventRoutes(app: Hono<Env>) {
       }
 
       if (msg.type === "heartbeat") {
+        touchPeer(peer);
         console.log(
           `[wss] heartbeat from deviceId=${user.deviceId.slice(0, 8)}`,
         );
