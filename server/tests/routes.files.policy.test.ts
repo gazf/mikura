@@ -385,3 +385,118 @@ Deno.test("`..` でポリシーを迂回できない (書き込み・削除・re
     await cleanup();
   }
 });
+
+// ──────── 大小文字の食い違いによるポリシー迂回 (path identity) ────────
+//
+// 認可のパス同一性は data root の FS のパス同一性と一致していなければならない。
+// 照合が ASCII を畳み、data root が case-sensitive だった間、`/pub` への grant が
+// `/PUB` という**別のディレクトリ**まで許可していた。
+
+Deno.test("大小文字だけ違うパスは別物として扱う (grant が染み出さない)", async () => {
+  const root = path.join(Deno.cwd(), "data", FIXTURE);
+  await Deno.mkdir(path.join(root, "pub"), { recursive: true });
+  await Deno.mkdir(path.join(root, "PUB"), { recursive: true });
+  await Deno.writeTextFile(path.join(root, "pub", "ok.txt"), "public");
+  await Deno.writeTextFile(path.join(root, "PUB", "secret.txt"), "secret");
+  try {
+    await withTestKv(async (kv) => {
+      await seedUser(kv, {
+        userId: 1,
+        userName: "alice",
+        permissions: [{ path: `/${FIXTURE}/pub`, accessLevel: "read" }],
+      });
+      const token = (await createAppToken(1, "alice")).raw;
+
+      const granted = await app.fetch(
+        authReq("GET", `http://localhost/content/${FIXTURE}/pub/ok.txt`, token),
+      );
+      assertEquals(granted.status, 200);
+      assertEquals(await granted.text(), "public");
+
+      // 大文字の別ディレクトリへは届かない
+      const bypass = await app.fetch(
+        authReq(
+          "GET",
+          `http://localhost/content/${FIXTURE}/PUB/secret.txt`,
+          token,
+        ),
+      );
+      assertEquals(bypass.status, 403);
+      await bypass.body?.cancel();
+
+      // 一覧にも現れない (不可視)
+      const listed = await app.fetch(
+        authReq("GET", `http://localhost/files/${FIXTURE}`, token),
+      );
+      const names = ((await listed.json()) as Array<{ name: string }>)
+        .map((e) => e.name);
+      assertEquals(names, ["pub"]);
+    });
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test("大小文字だけ違うパスは pin されない", async () => {
+  const root = path.join(Deno.cwd(), "data", FIXTURE);
+  await Deno.mkdir(path.join(root, "pub"), { recursive: true });
+  await Deno.mkdir(path.join(root, "PUB"), { recursive: true });
+  try {
+    await withTestKv(async (kv) => {
+      await seedUser(kv, {
+        userId: 1,
+        userName: "admin",
+        permissions: [
+          { path: "/", accessLevel: "admin" },
+          // ルールが名指すのは小文字の /pub だけ
+          { path: `/${FIXTURE}/pub`, accessLevel: "read" },
+        ],
+      });
+      const token = (await createAppToken(1, "admin")).raw;
+
+      // 名指されていない /PUB は pin されない (409 にならない)
+      const res = await app.fetch(
+        authReq("DELETE", `http://localhost/files/${FIXTURE}/PUB`, token),
+      );
+      assert(
+        res.status !== 409,
+        `unrelated case variant must not be pinned, got ${res.status}`,
+      );
+      await res.body?.cancel();
+    });
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test("`\\` はパス区切りではない — 境界で落とす", async () => {
+  const cleanup = await setupFixture();
+  try {
+    await withTestKv(async (kv) => {
+      await seedUser(kv, {
+        userId: 1,
+        userName: "admin",
+        permissions: [{ path: "/", accessLevel: "admin" }],
+      });
+      const token = (await createAppToken(1, "admin")).raw;
+
+      // `/` で split する検査をすべてすり抜けてから `../` に化ける経路。
+      // 権限が `/` なので認可では止まらない = ここが最後の防壁。
+      //
+      // URL は `\` を `/` と同じ区切りとして正規化してしまうので、テストからは
+      // %5C で送る (Hono の c.req.path は percent-decode 済みなので、ここに
+      // 届く時点では `\` に戻っている = 実サーバが生のリクエストで受けるのと同じ)。
+      const res = await app.fetch(
+        authReq(
+          "GET",
+          `http://localhost/content/${FIXTURE}/docs%5C..%5Cprivate/secret.txt`,
+          token,
+        ),
+      );
+      assertEquals(res.status, 400);
+      await res.body?.cancel();
+    });
+  } finally {
+    await cleanup();
+  }
+});

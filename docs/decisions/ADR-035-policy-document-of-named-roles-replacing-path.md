@@ -119,9 +119,17 @@ One composition hazard survives and is accepted: a `deny` in role A does not pro
 
 A rule covers its path and everything beneath it. There is no `**` and no wildcards in v1.
 
-Matching is **case-insensitive**, folding ASCII `A-Z`/`a-z` only. Unicode case folding is excluded deliberately: its tables change between Unicode versions, and a changing table silently changes which rules match — that is, silently removes protection. NTFS freezes an uppercase table into the volume at format time and ext4 records a Unicode version in its superblock for the same reason. The folding rules therefore carry a **version**, and widening them is an explicit migration rather than a runtime upgrade.
+Matching is **byte-exact**. The authorization layer's notion of path identity must equal the data root filesystem's, because every divergence between them is an authorization hole: a path that authorization judges as one object while the filesystem opens another.
 
-A pre-existing defect is recorded but **not fixed here**: the client declares the volume case-insensitive (`CaseSensitiveSearch = false`) while the server resolves paths case-sensitively against a Linux filesystem. Unicode normalization (NFC vs NFD) has the same shape. Both belong to the file service, not to authorization.
+> **Amended.** This originally read "case-insensitive, folding ASCII `A-Z`/`a-z` only", with the folding carrying a **version** so that widening it was an explicit migration rather than a runtime upgrade. The reasoning about Unicode folding tables was sound and is retained below, but the premise underneath it was not: the data root is a case-**sensitive** POSIX filesystem, so folding made `/pub` and `/PUB` the same object to authorization while remaining two directories on disk. A grant on `/pub` therefore reached `/PUB`, and one `read` grant on any single path reached every file under the data root. The same folding leaked in the opposite direction through pinning, refusing rename and delete on case variants no rule had named.
+>
+> Unicode case folding stays excluded, now for a second reason on top of the original one: folding at all — ASCII or Unicode — re-creates the divergence. `foldAscii` survives, but only for **role names**, which are identifiers rather than protected resources.
+>
+> This carries a cost, stated plainly: a `deny` no longer covers case variants of the path it names. Two sibling directories differing only in case are two objects and need two rules. The dangling-rule check already surfaces the mis-authoring case (see below); it does not surface the case where both siblings exist and only one is named.
+
+The **assumption this creates is explicit**: the data root must be case-sensitive and must not normalize names. On a filesystem that folds or normalizes on its own (APFS/HFS+, a case-insensitive NTFS volume), path identity diverges again and the same class of hole reopens.
+
+Two related defects in the file service were recorded here and are now fixed at the request boundary rather than in authorization: `.`/`..` segments and `\` are rejected before authentication, because authorization and filesystem resolution each normalized them differently. Unicode normalization (NFC vs NFD) has the same shape and remains **unaddressed** — on a byte-exact filesystem both layers agree today, so it is latent rather than live. The client still declares the volume case-insensitive (`CaseSensitiveSearch = false`); that is now purely a presentation choice, and the client canonicalizes through its tree before it reaches the server.
 
 ### Rule-bearing paths are pinned
 
@@ -243,7 +251,9 @@ Two additions were made during implementation and are part of the design:
 
 ### Open questions
 
-None outstanding. Two known follow-ups live outside this ADR: the case-sensitivity mismatch in the file service (recorded above, belongs to that layer), and the tray-notification channel that would let a pinned-path refusal reach the user with its reason instead of a bare NTSTATUS.
+Two follow-ups live outside this ADR: Unicode normalization form (NFC vs NFD) as a latent path-identity divergence, and the tray-notification channel that would let a pinned-path refusal reach the user with its reason instead of a bare NTSTATUS.
+
+One question is now open that was not before: **whether path-keying should be revisited**, given that the third defect predicted in the closing note arrived as an authorization bypass rather than the fail-closed nuisance the original reckoning assumed. See that note.
 
 ### Relationship to other ADRs
 
@@ -254,3 +264,9 @@ None outstanding. Two known follow-ups live outside this ADR: the case-sensitivi
 ### Note
 
 Two independent defects — rename orphaning a rule, and case mismatch orphaning a rule — arise from one root: **a rule keyed by a path string that the filesystem is free to reinterpret**. NTFS avoids both with a single decision, by attaching ACLs to objects. This ADR accepts path-keying with both holes mitigated rather than closed. A third defect from the same root should be read as a signal to revisit the decision rather than to patch again.
+
+> **That third defect arrived**, and it was worse in kind than the two that were predicted. Both originals merely orphaned a rule — they failed *closed*, leaving a path with no rules and therefore invisible. The third failed *open*: path strings that authorization and the filesystem resolved to different objects (`..` segments, `\`, and ASCII case folding), turning one ordinary grant into read/write/delete over the whole data root.
+>
+> The immediate holes are closed by making the two layers agree — reject at the request boundary, match byte-exactly — and the prediction above says this is the point to revisit path-keying rather than patch a fourth time. **It is deliberately not revisited here.** The fix had to land as a security fix, and object-keyed rules are the decision this ADR weighed and rejected on grounds (§ *Anchoring rules to a per-object ID*) that the new evidence does not by itself overturn: the argument against IDs was about authoring before data exists and about restore-from-backup failing open, neither of which this defect touches.
+>
+> What the evidence does change is the *cost* side of that trade. The earlier reckoning counted path-keying's failures as fail-closed nuisances. One of them was not. A future revisit should start there, and should note that the remaining latent divergences (Unicode form, and any filesystem that folds or normalizes) are the same defect waiting on a different deployment.

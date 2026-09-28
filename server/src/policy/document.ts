@@ -336,8 +336,9 @@ function parseRuleLine(
   }
 
   // 同じ role 内の同じパスは「解決できない引き分け」なので構文エラー。
-  const folded = foldAscii(path);
-  const prev = seenPaths.get(folded);
+  // 比較はバイト厳密 — `/pub` と `/PUB` は case-sensitive な data root では
+  // 別のディレクトリなので、両方に別々のルールを書くのは正当。
+  const prev = seenPaths.get(path);
   if (prev !== undefined) {
     errors.push({
       line: lineNo,
@@ -345,7 +346,7 @@ function parseRuleLine(
     });
     return;
   }
-  seenPaths.set(folded, lineNo);
+  seenPaths.set(path, lineNo);
   out.push({ path, level, line: lineNo });
 }
 

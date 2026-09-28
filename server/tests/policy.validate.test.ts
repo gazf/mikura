@@ -184,12 +184,18 @@ test r {
   assertEquals(dangling.map((d) => d.path), ["/gone"]);
 });
 
-Deno.test("findDanglingRules: 大小文字違いも孤立として拾う…が畳んで一致すれば生存", () => {
+Deno.test("findDanglingRules: 大小文字違いは孤立として拾う", () => {
+  // 照合がバイト厳密になったので、`/Shared` と書いたのに実体が `/shared` なら
+  // そのルールは何も守っていない。ADR-035 が「タイプミス / 大小文字違い /
+  // 削除 / 外部 mv」の 4 原因を 1 つの signal で拾う設計にしてあるので、
+  // 畳むのをやめた副作用はこの検査が受け止める。
   const v = validatePolicy(`
 role r {
   allow read /Shared
 }
 `);
-  assertEquals(findDanglingRules(v.compiled, ["/shared"]).length, 0);
-  assertEquals(findDanglingRules(v.compiled, ["/sharedd"]).length, 1);
+  assertEquals(findDanglingRules(v.compiled, ["/shared"]).map((d) => d.path), [
+    "/Shared",
+  ]);
+  assertEquals(findDanglingRules(v.compiled, ["/Shared"]).length, 0);
 });

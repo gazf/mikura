@@ -23,13 +23,19 @@ function resolveAndValidate(relativePath: string): string {
     if (seg === "..") throw new FileServiceError("Invalid path", 400);
   }
 
+  // `\` はパス区切りではない。以前は `path.normalize` の**後**に `\`→`/` へ
+  // 置換していたため、`pub\..\victim` は上の `..` 検査 (`/` で split) を
+  // 素通りしてから `../` に化け、別のファイルへ到達していた。置換をやめて
+  // 拒否する — 変換それ自体が別名を作るので。
+  if (relativePath.includes("\\")) {
+    throw new FileServiceError("Invalid path", 400);
+  }
+
   // Strip leading slashes so path.join doesn't treat it as absolute
   const stripped = relativePath.replace(/^\/+/, "");
 
   // Normalize and resolve
-  const normalized = stripped
-    ? path.normalize(stripped).replace(/\\/g, "/")
-    : ".";
+  const normalized = stripped ? path.normalize(stripped) : ".";
 
   const fullPath = path.join(DATA_ROOT, normalized);
   const resolved = path.resolve(fullPath);

@@ -1,16 +1,31 @@
 /**
- * ADR-035: ポリシー文書が扱うパスの正規化と照合。
+ * パスの照合はバイト厳密。**畳まない。**
  *
- * 照合は **ASCII の A-Z / a-z だけを畳む** case-insensitive。Unicode の
- * case folding を使わないのは、テーブルが Unicode 版で変わる = 「どのルールが
- * 一致するか」が黙って変わる = 保護が黙って外れる、から。NTFS が format 時の
- * 大文字テーブルを volume に焼き込み、ext4 が superblock に Unicode 版を
- * 記録しているのと同じ理由。畳み方を広げるのは runtime の upgrade ではなく
- * 明示的な migration として扱うので、版を持たせる。
+ * 以前は ASCII の A-Z を畳んで case-insensitive に照合していた (ADR-035)。
+ * しかし data root は case-sensitive な POSIX ファイルシステムなので、
+ * `/pub` への grant が `/PUB` という**別のディレクトリ**まで許可してしまい、
+ * 1 パスへの read 権限でデータルート配下の任意のファイルに到達できた。
+ * 逆向きにも漏れていて、`/pub` を名指すルールが `/PUB` まで pin していた。
+ *
+ * 認可のパス同一性は、data root のファイルシステムのパス同一性と**一致して
+ * いなければならない**。ずれ (大文字小文字・Unicode 正規化形・区切り文字) は
+ * すべて認可の穴になる。したがって照合は畳まず、ファイルシステムと同じ
+ * バイト比較にする。
+ *
+ * 前提: data root は case-sensitive かつ正規化しない (バイト厳密) FS である
+ * こと。macOS の APFS/HFS+ のように FS 側が正規化・畳み込みを行う環境に
+ * data root を置く場合、この前提が崩れるので同じクラスの穴が再び開く。
+ *
+ * 大文字小文字の違いでルールが宙に浮く件は、ADR-035 が既に用意している
+ * 「ルールのパスがツリーに存在しない」検査 (findDanglingRules) が拾う。
  */
-export const POLICY_CASE_FOLDING_VERSION = 1;
 
-/** ASCII のみを畳む。String.toLowerCase() は Unicode 依存なので使わない。 */
+/**
+ * ASCII のみを畳む。String.toLowerCase() は Unicode 依存なので使わない。
+ *
+ * **パスには使わない** (上記参照)。用途はロール名の照合だけ — ロール名は
+ * 識別子であって保護対象のリソースではないので、畳んでも認可の穴にならない。
+ */
 export function foldAscii(s: string): string {
   let out = "";
   for (let i = 0; i < s.length; i++) {
@@ -65,7 +80,7 @@ export function normalizeForMatch(path: string): string {
     parts.push(seg);
   }
   if (parts.length === 0) return "/";
-  return "/" + foldAscii(parts.join("/"));
+  return "/" + parts.join("/");
 }
 
 /**
@@ -83,6 +98,24 @@ export function hasDotSegment(path: string): boolean {
     if (seg === "." || seg === "..") return true;
   }
   return false;
+}
+
+/**
+ * リクエストのパスに `\` が含まれるか。
+ *
+ * mikura のパス区切りは `/` だけで、ルール側の `validatePolicyPath` も `\` を
+ * 拒否している。ところがリクエスト側は素通しで、`resolveAndValidate` が
+ * `path.normalize` の**後**に `\`→`/` を置換していたため、`/pub\..\victim` は
+ * どの `..` 検査にも引っかからないまま (どれも `/` で split する) 最終的に
+ * `../` として畳まれ、別のファイルに到達していた。
+ *
+ * 変換ではなく拒否にするのは、変換それ自体が別名 (aliasing) を作るから。
+ * POSIX では `\` は正当なファイル名文字なので、変換するとルールで名指せない
+ * ファイルにリクエストだけが到達できる経路が生まれる。ルール側と同じく
+ * 「`\` は使えない」で揃える。
+ */
+export function hasBackslash(path: string): boolean {
+  return path.includes("\\");
 }
 
 /**

@@ -71,16 +71,28 @@ role r {
   assert(errors[0].message.includes("レベルを取りません"));
 });
 
-Deno.test("parsePolicy: role 内のパス重複は構文エラー (大小文字を畳んで判定)", () => {
+Deno.test("parsePolicy: role 内のパス重複は構文エラー (バイト厳密で判定)", () => {
+  const { errors } = parsePolicy(`
+role r {
+  allow read /a
+  allow write /a
+}
+`);
+  assertEquals(errors.length, 1);
+  assertEquals(errors[0].line, 4);
+  assert(errors[0].message.includes("重複"));
+});
+
+Deno.test("parsePolicy: 大小文字だけ違うパスは重複ではない", () => {
+  // case-sensitive な data root では別オブジェクト。畳んで判定していた頃は、
+  // 両方を別々に統治する正当なポリシーを書けなかった。
   const { errors } = parsePolicy(`
 role r {
   allow read /a
   allow write /A
 }
 `);
-  assertEquals(errors.length, 1);
-  assertEquals(errors[0].line, 4);
-  assert(errors[0].message.includes("重複"));
+  assertEquals(errors, []);
 });
 
 Deno.test("parsePolicy: admin は / 以外に書けない", () => {

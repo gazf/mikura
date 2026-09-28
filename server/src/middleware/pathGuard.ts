@@ -1,5 +1,5 @@
 import { createMiddleware } from "@hono/hono/factory";
-import { hasDotSegment } from "../policy/paths.ts";
+import { hasBackslash, hasDotSegment } from "../policy/paths.ts";
 
 /**
  * リクエストパスに `.` / `..` セグメントを含む要求を入口で落とす。
@@ -16,7 +16,10 @@ import { hasDotSegment } from "../policy/paths.ts";
  * ここで捕まる。
  */
 export const pathGuard = createMiddleware(async (c, next) => {
-  if (hasDotSegment(c.req.path)) {
+  const p = c.req.path;
+  // `\` はパス区切りではない (ルール側の validatePolicyPath も拒否する)。
+  // 変換すると別名を作るので、ここで落とす。
+  if (hasDotSegment(p) || hasBackslash(p)) {
     return c.json({ message: "Invalid path" }, 400);
   }
   await next();

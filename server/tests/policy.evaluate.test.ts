@@ -123,14 +123,31 @@ role r {
   assertEquals(effectiveLevel(p, [], "/a"), null);
 });
 
-Deno.test("effectiveLevel: 照合は ASCII だけを畳む", () => {
+Deno.test("effectiveLevel: 照合はバイト厳密 — 大小文字違いは別のパス", () => {
+  // 以前はここが「ASCII を畳んで照合する」を仕様として固定していた。しかし
+  // data root は case-sensitive な POSIX FS なので、`/Projects` への grant が
+  // `/projects` という**別のディレクトリ**まで許可してしまい、1 パスへの
+  // read 権限でデータルート配下の任意のファイルに到達できた。
   const p = compile(`
 role r {
   allow read /Projects
 }
 `);
-  assertEquals(effectiveLevel(p, ["r"], "/projects/a.txt"), "read");
-  assertEquals(effectiveLevel(p, ["r"], "/PROJECTS"), "read");
+  assertEquals(effectiveLevel(p, ["r"], "/Projects/a.txt"), "read");
+  assertEquals(effectiveLevel(p, ["r"], "/projects/a.txt"), null);
+  assertEquals(effectiveLevel(p, ["r"], "/PROJECTS"), null);
+});
+
+Deno.test("effectiveLevel: 大小文字だけ違う兄弟には別々のルールを書ける", () => {
+  // case-sensitive な FS では別オブジェクトなので、別々に統治できるのが正しい。
+  const p = compile(`
+role r {
+  allow write /pub
+  deny        /PUB
+}
+`);
+  assertEquals(effectiveLevel(p, ["r"], "/pub/x"), "write");
+  assertEquals(effectiveLevel(p, ["r"], "/PUB/secret"), null);
 });
 
 Deno.test("effectiveLevel: 末尾スラッシュや重複スラッシュを吸収する", () => {
@@ -163,7 +180,10 @@ role r {
 `);
   assertEquals(isPinnedPath(p, "/shared/sales"), true);
   assertEquals(isPinnedPath(p, "/shared"), true);
-  assertEquals(isPinnedPath(p, "/SHARED/Sales"), true);
+  // 大小文字違いは別のパスなので pin しない。畳んでいた頃は、ルールに無関係な
+  // `/SHARED` の rename / delete まで 409 で拒否していた。
+  assertEquals(isPinnedPath(p, "/SHARED/Sales"), false);
+  assertEquals(isPinnedPath(p, "/SHARED"), false);
   // 配下には伝播しない (伝播させると allow read / 一本で木全体が凍る)
   assertEquals(isPinnedPath(p, "/shared/sales/2026"), false);
   assertEquals(isPinnedPath(p, "/other"), false);
