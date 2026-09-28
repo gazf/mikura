@@ -185,6 +185,11 @@ public class HttpServerApi(HttpClient http, string baseUrl) : IServerApi, IDispo
     {
         var url = $"{_baseUrl}/locks{NormalizePath(path)}";
         using var response = await _http.DeleteAsync(url, ct).ConfigureAwait(false);
+        // lock は TTL を持つので日常的に失効する (heartbeat 途絶、admin の強制解除、
+        // 他経路で既に解放済み)。release は「無ければ成功でよい」冪等操作なので、
+        // 404 で throw すると Cleanup 経路に想定外の例外を持ち込む。
+        // DeleteFileAsync / AbortUploadAsync の 404 扱いと対称にする。
+        if ((int)response.StatusCode == 404) return;
         await EnsureSuccess(response, ct).ConfigureAwait(false);
     }
 
