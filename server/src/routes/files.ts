@@ -277,7 +277,13 @@ export function registerFileRoutes(app: Hono<Env>) {
         if (match) {
           offset = parseInt(match[1], 10);
           if (match[2]) {
-            length = parseInt(match[2], 10) - offset + 1;
+            const end = parseInt(match[2], 10);
+            // reversed range (end < offset) は length を負にする。readFile が
+            // 416 で弾くが、負長を計算経路に流さないようここでも見ておく。
+            if (end < offset) {
+              return c.json({ message: "Range not satisfiable" }, 416);
+            }
+            length = end - offset + 1;
           }
         }
       }

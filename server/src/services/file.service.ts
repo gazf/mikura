@@ -208,6 +208,20 @@ export async function readFile(
 
   const totalSize = stat.size;
   const startOffset = offset ?? 0;
+
+  // Range の健全性はここで一元的に見る (呼び出し側の parse ミスを最後に受ける)。
+  // reversed range は files.ts が length を負にして渡してくるので、負長を
+  // new Uint8Array(負) に到達させず 416 相当で弾く (旧実装は RangeError → 500)。
+  if (length !== undefined && length < 0) {
+    file.close();
+    throw new FileServiceError("Range not satisfiable", 416);
+  }
+  // offset が EOF を越えている (空ファイルの 0 は許容)。RFC 7233 の 416。
+  if (startOffset > totalSize || (startOffset === totalSize && totalSize > 0)) {
+    file.close();
+    throw new FileServiceError("Range not satisfiable", 416);
+  }
+
   const remainingFromOffset = Math.max(0, totalSize - startOffset);
   const requestedLength = length ?? remainingFromOffset;
   const actualLength = Math.min(requestedLength, remainingFromOffset);

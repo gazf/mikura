@@ -203,3 +203,101 @@ Deno.test("/volume: storage が乗っている FS の totalSize / freeSize を�
     }
   });
 });
+
+// ───────── GET /content の Range: 不正な範囲は 500 ではなく 416 ─────────
+//
+// reversed range (end < start) は length を負にし、readFile の
+// new Uint8Array(負) が RangeError を投げて 500 になっていた。RangeError は
+// FileServiceError ではないので errorHandler まで抜け、認証ユーザーが任意の
+// read 可能ファイルに対してログを溢れさせられた (robustness/DoS)。
+// multipart upload parser は同じ入力を 400 で弾いていたのに、単一 range の
+// read 経路だけ検査が無かった。
+
+Deno.test("GET /content: 正常な Range は 206", async () => {
+  const fx = await setupFixture();
+  try {
+    await withTestKv(async (kv) => {
+      const tokens = await setupUsers(kv);
+      const full = await app.fetch(
+        authReq(
+          "GET",
+          `http://localhost/content/${FIXTURE_DIR}/shared.txt`,
+          tokens.alice,
+          "dev-alice-pc",
+        ),
+      );
+      assertEquals(full.status, 200);
+      assertEquals(await full.text(), "shared content");
+
+      const ranged = await app.fetch(
+        new Request(
+          `http://localhost/content/${FIXTURE_DIR}/shared.txt`,
+          {
+            headers: {
+              Authorization: `Bearer ${tokens.alice}`,
+              "X-Device-Id": "dev-alice-pc",
+              Range: "bytes=0-3",
+            },
+          },
+        ),
+      );
+      assertEquals(ranged.status, 206);
+      assertEquals(ranged.headers.get("Content-Range"), "bytes 0-3/14");
+      assertEquals(await ranged.text(), "shar");
+    });
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+Deno.test("GET /content: 逆転した Range は 416 (500 ではない)", async () => {
+  const fx = await setupFixture();
+  try {
+    await withTestKv(async (kv) => {
+      const tokens = await setupUsers(kv);
+      for (const r of ["bytes=100-50", "bytes=10-5"]) {
+        const res = await app.fetch(
+          new Request(
+            `http://localhost/content/${FIXTURE_DIR}/shared.txt`,
+            {
+              headers: {
+                Authorization: `Bearer ${tokens.alice}`,
+                "X-Device-Id": "dev-alice-pc",
+                Range: r,
+              },
+            },
+          ),
+        );
+        assertEquals(res.status, 416, `Range: ${r} should be 416`);
+        await res.body?.cancel();
+      }
+    });
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+Deno.test("GET /content: EOF を越えた offset は 416", async () => {
+  const fx = await setupFixture();
+  try {
+    await withTestKv(async (kv) => {
+      const tokens = await setupUsers(kv);
+      const res = await app.fetch(
+        new Request(
+          `http://localhost/content/${FIXTURE_DIR}/shared.txt`,
+          {
+            headers: {
+              Authorization: `Bearer ${tokens.alice}`,
+              "X-Device-Id": "dev-alice-pc",
+              Range: "bytes=1000-1010",
+            },
+          },
+        ),
+      );
+      assertEquals(res.status, 416);
+      await res.body?.cancel();
+    });
+  } finally {
+    await fx.cleanup();
+  }
+});
