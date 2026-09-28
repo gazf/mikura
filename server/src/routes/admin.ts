@@ -21,6 +21,7 @@ import { Hono } from "hono";
 import {
   type AuthUser,
   checkPermission,
+  invalidateToken,
   revokeToken,
 } from "../services/auth.service.ts";
 import {
@@ -346,10 +347,16 @@ export function registerAdminRoutes(app: Hono<Env>) {
       .delete(Keys.user(id))
       .delete(Keys.userByName(target.value.name));
 
+    // KV から消すだけでは足りない。validateToken は有効トークンを 60 秒
+    // インメモリキャッシュするので、直近に使われたトークンは KV 削除後も
+    // 最大 60 秒間そのまま通ってしまう (= 削除したユーザーがアクセスし
+    // 続けられる)。commit 成功後にキャッシュからも追い出す。
+    const revokedHashes: string[] = [];
     for await (
       const e of kv.list<true>({ prefix: Keys.tokensByUserPrefix(id) })
     ) {
       const hash = e.key[2] as string;
+      revokedHashes.push(hash);
       tx.delete(Keys.token(hash));
       tx.delete(Keys.tokenByUser(id, hash));
     }
@@ -370,6 +377,7 @@ export function registerAdminRoutes(app: Hono<Env>) {
 
     const res = await tx.commit();
     if (!res.ok) return c.json({ message: "Race: try again" }, 409);
+    for (const hash of revokedHashes) invalidateToken(hash);
     return c.json({ deleted: id }, 200);
   });
 

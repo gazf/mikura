@@ -155,6 +155,35 @@ Deno.test("DELETE /admin/users/:id: cascade で tokens / ロール割り当て�
   });
 });
 
+Deno.test("DELETE /admin/users/:id: 削除した user の token が即座に無効になる", async () => {
+  // validateToken は有効 token を 60 秒インメモリキャッシュする。cascade は KV を
+  // 直接 delete するので revokeToken の経路を通らず、キャッシュを掃除しないと
+  // **削除後も最大 60 秒アクセスし続けられる**。「不正 user を即締め出す」という
+  // 削除操作の意図に反するので、commit 後にキャッシュからも追い出す。
+  await withTestKv(async (kv) => {
+    const { adminToken, nonAdminToken } = await setup(kv);
+
+    // 403 でも validateToken は通るので、これでキャッシュが温まる。
+    const warm = await app.fetch(
+      req("GET", "/admin/users", nonAdminToken, NON_ADMIN_DEVICE),
+    );
+    assertEquals(warm.status, 403);
+
+    assertEquals(
+      (await app.fetch(
+        req("DELETE", "/admin/users/2", adminToken, ADMIN_DEVICE),
+      )).status,
+      200,
+    );
+
+    // 403 (token は有効だが権限なし) ではなく 401 (token 自体が無効) になること。
+    const after = await app.fetch(
+      req("GET", "/admin/users", nonAdminToken, NON_ADMIN_DEVICE),
+    );
+    assertEquals(after.status, 401);
+  });
+});
+
 Deno.test("DELETE /admin/users/:id: 自分自身は削除不可 (400)", async () => {
   await withTestKv(async (kv) => {
     const { adminToken } = await setup(kv);

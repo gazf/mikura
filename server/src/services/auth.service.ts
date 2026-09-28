@@ -130,6 +130,7 @@ export function _resetAuthCachesForTesting(): void {
   tokenCache.clear();
   deviceUpsertCache.clear();
   tokenLastUsedCache.clear();
+  mismatchLogState.clear();
 }
 
 export async function upsertDevice(
@@ -270,18 +271,52 @@ export async function validateToken(
   return identity;
 }
 
+/**
+ * mismatch ログの throttle 状態。同じ (hash, got) の組に対して
+ * MISMATCH_LOG_INTERVAL_MS に 1 回だけ出す。
+ *
+ * 認証自体は正しく拒否しているので実害は無いが、盗難トークンを連投されると
+ * ログが洪水になり、**他の signal が埋もれる**。抑制した回数は次回の 1 行に
+ * まとめて出すので、連投の事実そのものは失わない。
+ */
+const MISMATCH_LOG_INTERVAL_MS = 60 * 1000;
+const MISMATCH_LOG_MAX = 256;
+const mismatchLogState = new Map<
+  string,
+  { nextLogAtMs: number; suppressed: number }
+>();
+
 function logDeviceMismatch(
   hash: string,
   bound: string,
   got: string | undefined,
   ip?: string,
 ): void {
+  const key = `${hash}\u0000${got ?? ""}`;
+  const now = Date.now();
+  const state = mismatchLogState.get(key);
+  if (state !== undefined && now < state.nextLogAtMs) {
+    state.suppressed++;
+    return;
+  }
+
+  // Map が無制限に育たないように、上限に達したら丸ごと捨てる。throttle は
+  // ログ抑制のためだけの状態なので、失っても認証の判断には影響しない。
+  if (mismatchLogState.size >= MISMATCH_LOG_MAX) mismatchLogState.clear();
+  mismatchLogState.set(key, {
+    nextLogAtMs: now + MISMATCH_LOG_INTERVAL_MS,
+    suppressed: 0,
+  });
+
   // hash と deviceId の先頭だけ出して PII / 完全な token leak を避ける。
   // 「盗難 secret を別端末で使った」signal なので WARN レベル + audit 連携余地。
+  const repeated = state !== undefined && state.suppressed > 0
+    ? ` (suppressed ${state.suppressed} since last)`
+    : "";
   console.warn(
     `[auth] token deviceId mismatch hash=${hash.slice(0, 8)} bound=${
       bound.slice(0, 8)
-    } got=${got?.slice(0, 8) ?? "<none>"} ip=${ip ?? "<unknown>"}`,
+    } got=${got?.slice(0, 8) ?? "<none>"} ip=${ip ?? "<unknown>"}${repeated}`,
   );
 }
 
