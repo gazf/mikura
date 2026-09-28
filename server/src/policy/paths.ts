@@ -51,9 +51,38 @@ export function validatePolicyPath(path: string): string | null {
  * ここでは弾かずに畳む (弾くのは `validatePolicyPath` = 書き手向けの検査)。
  */
 export function normalizeForMatch(path: string): string {
-  const parts = path.split("/").filter((p) => p.length > 0);
+  const parts: string[] = [];
+  for (const seg of path.split("/")) {
+    if (seg.length === 0 || seg === ".") continue;
+    if (seg === "..") {
+      // ルートを越える `..` はルートに張り付ける。ここで例外を投げないのは、
+      // 本関数が「比較用の正規形を返す純関数」であり、入力の妥当性判定は
+      // 呼び出し側 (リクエスト境界の rejectDotSegments / 書き手向けの
+      // validatePolicyPath) の責務だから。
+      parts.pop();
+      continue;
+    }
+    parts.push(seg);
+  }
   if (parts.length === 0) return "/";
   return "/" + foldAscii(parts.join("/"));
+}
+
+/**
+ * リクエストのパスに `.` / `..` セグメントが含まれるか。
+ *
+ * 認可判定と実 I/O が別々に正規化する構造だと、どちらかが `..` を畳み
+ * どちらかが畳まないだけでポリシーを丸ごと迂回できる
+ * (`<許可パス>/../<被害者パス>` が「祖先鎖に許可パスを含む」かつ
+ * 「実ファイルは別物」を同時に満たす)。両者を一致させるより、**境界で入力を
+ * 落とす**方が構造的に安全なので、リクエスト経路では畳まずに 400 で弾く。
+ * 正規クライアントはツリーから組んだパスしか送らないので `..` は現れない。
+ */
+export function hasDotSegment(path: string): boolean {
+  for (const seg of path.split("/")) {
+    if (seg === "." || seg === "..") return true;
+  }
+  return false;
 }
 
 /**

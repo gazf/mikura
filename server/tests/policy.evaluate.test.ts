@@ -16,6 +16,11 @@ import {
   isPinnedPath,
   rulesAnchoredAt,
 } from "../src/policy/evaluate.ts";
+import {
+  hasDotSegment,
+  normalizeForMatch,
+  selfAndAncestors,
+} from "../src/policy/paths.ts";
 
 function compile(text: string) {
   const { document, errors } = parsePolicy(text);
@@ -176,4 +181,44 @@ role b {
   const hits = rulesAnchoredAt(p, "/shared/secret");
   assertEquals(hits.map((h) => h.role), ["a", "b"]);
   assertEquals(rulesAnchoredAt(p, "/shared"), []);
+});
+
+// ───────────── `..` / `.` を含むパスの正規形 (path confusion 回帰) ─────────────
+//
+// 認可判定の正規化が `..` をリテラルのセグメントとして残すと、
+// `/pub/../private/x` の祖先鎖に `/pub` が現れ、`allow read /pub` だけを持つ
+// ロールが `/private/x` へ到達できてしまう。実 I/O 側は `path.normalize` で
+// 畳むので、両者が別のファイルについて判断していた。
+
+Deno.test("normalizeForMatch: .. を畳んで祖先鎖に許可パスを残さない", () => {
+  assertEquals(normalizeForMatch("/pub/../private/x"), "/private/x");
+  assertEquals(
+    selfAndAncestors(normalizeForMatch("/pub/../private/x")).includes("/pub"),
+    false,
+  );
+});
+
+Deno.test("normalizeForMatch: . と重複スラッシュと末尾 .. を畳む", () => {
+  assertEquals(normalizeForMatch("/a/./b"), "/a/b");
+  assertEquals(normalizeForMatch("/a//b"), "/a/b");
+  assertEquals(normalizeForMatch("/a/b/.."), "/a");
+  assertEquals(normalizeForMatch("/a/b/../../c"), "/c");
+});
+
+Deno.test("normalizeForMatch: ルートを越える .. はルートに張り付く", () => {
+  // 仕様として固定する (投げずに clamp)。入力の妥当性判定は境界の責務。
+  assertEquals(normalizeForMatch("/../../etc/passwd"), "/etc/passwd");
+  assertEquals(normalizeForMatch("/.."), "/");
+  assertEquals(normalizeForMatch("/a/../.."), "/");
+});
+
+Deno.test("hasDotSegment: リクエスト境界で落とすべき入力を見分ける", () => {
+  assertEquals(hasDotSegment("/a/../b"), true);
+  assertEquals(hasDotSegment("/a/./b"), true);
+  assertEquals(hasDotSegment("/a/b/.."), true);
+  assertEquals(hasDotSegment("/.."), true);
+  // ドットで始まるだけの名前は正当なファイル名なので通す。
+  assertEquals(hasDotSegment("/a/..b"), false);
+  assertEquals(hasDotSegment("/a/.hidden"), false);
+  assertEquals(hasDotSegment("/a/b.txt"), false);
 });

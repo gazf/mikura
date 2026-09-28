@@ -44,9 +44,14 @@ try {
 
 console.log(`mikura server starting on port ${port} (data=${getDataRoot()})`);
 
-// hostname に "::" を指定して IPv6 で listen する。Linux/Windows いずれも
-// IPV6_V6ONLY=0 が既定なので、IPv4-mapped IPv6 経由で IPv4 も受け付ける。
-// 既定 (= "0.0.0.0") のままだと IPv4 のみ bind し、client 側で `localhost`
-// を解決して `::1` を先に試した場合に TCP SYN リトライで ~21 秒の接続遅延
-// になる (Happy Eyeballs fallback)。dev/local の体感を悪化させる主犯だった。
-Deno.serve({ port, hostname: "::" }, app.fetch);
+// hostname は既定で "::"。Linux/Windows いずれも IPV6_V6ONLY=0 が既定なので、
+// IPv4-mapped IPv6 経由で IPv4 も受け付ける。Deno の既定 (= "0.0.0.0") のままだと
+// IPv4 のみ bind し、client 側で `localhost` を解決して `::1` を先に試した場合に
+// TCP SYN リトライで ~21 秒の接続遅延になる (Happy Eyeballs fallback)。
+//
+// 公開範囲は Deno の既定と同じ「全インタフェース」。mikura は他ホストの client
+// から到達されるサーバなので、これが既定として正しい (loopback 限定が正しいのは
+// KV も data root も開かない console 側)。reverse proxy の後ろに置く配備では
+// MIKURA_HOST=::1 のように絞る。
+const hostname = Deno.env.get("MIKURA_HOST")?.trim() || "::";
+Deno.serve({ port, hostname }, app.fetch);

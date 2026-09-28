@@ -12,6 +12,17 @@ function resolveAndValidate(relativePath: string): string {
     throw new FileServiceError("Invalid path", 400);
   }
 
+  // Reject path traversal **before** normalization.
+  //
+  // 以前はここが `path.normalize` の**後**にあった。normalize は `a/../b` を
+  // `b` に畳むので、畳んだ結果から `..` を探しても見つからず素通りする。
+  // 実 I/O は畳んだパスを開く一方、認可判定は別経路で正規化するため、
+  // `<許可パス>/../<被害者パス>` でポリシーを迂回できていた。
+  // upload.service の validateRelativePath と同じ「生文字列で弾く」順序に揃える。
+  for (const seg of relativePath.split("/")) {
+    if (seg === "..") throw new FileServiceError("Invalid path", 400);
+  }
+
   // Strip leading slashes so path.join doesn't treat it as absolute
   const stripped = relativePath.replace(/^\/+/, "");
 
@@ -19,14 +30,6 @@ function resolveAndValidate(relativePath: string): string {
   const normalized = stripped
     ? path.normalize(stripped).replace(/\\/g, "/")
     : ".";
-
-  // Reject path traversal
-  if (
-    normalized.startsWith("..") || normalized.includes("/../") ||
-    normalized.endsWith("/..")
-  ) {
-    throw new FileServiceError("Invalid path", 400);
-  }
 
   const fullPath = path.join(DATA_ROOT, normalized);
   const resolved = path.resolve(fullPath);

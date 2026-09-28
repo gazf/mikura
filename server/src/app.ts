@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { authMiddleware } from "./middleware/auth.ts";
 import { errorHandler } from "./middleware/errors.ts";
+import { pathGuard } from "./middleware/pathGuard.ts";
 import { registerFileRoutes } from "./routes/files.ts";
 import { registerLockRoutes } from "./routes/locks.ts";
 import { registerEventRoutes } from "./routes/events.ts";
@@ -20,6 +21,9 @@ const app = new Hono<Env>();
 
 // Global middleware
 app.use("*", errorHandler);
+// 認可判定と実 I/O の正規化が食い違う余地を入口で潰す (認証の前に置く —
+// 不正なパスは誰が送っても不正)。
+app.use("*", pathGuard);
 
 // Health check (no auth)
 app.get("/health", (c) => c.json({ status: "ok" }));

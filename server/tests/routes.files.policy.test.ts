@@ -266,3 +266,122 @@ Deno.test("read だけのロールでは書き込み系が全経路で 403", asy
     await cleanup();
   }
 });
+
+// ───────────────────── `..` によるポリシー回避 (path confusion) ─────────────────────
+//
+// 認可判定 (normalizeForMatch) と実 I/O (resolveAndValidate) が `..` の扱いで
+// 食い違うと、`<許可されたパス>/../<被害者のパス>` の形で
+// 「祖先鎖に許可パスが現れる」+「実ファイルは別物を開く」が同時に成立する。
+// 1 アカウントの侵害がデータ全体の侵害になるため、全エンドポイントで閉じる。
+//
+// 注意: リクエストは Request を直接組んで app.fetch に渡す。curl 等の HTTP
+// クライアントは `/../` を送信前に畳んでしまい、この経路を隠す。
+
+Deno.test("`..` でポリシーを迂回できない (読み取り系)", async () => {
+  const cleanup = await setupFixture();
+  try {
+    await withTestKv(async (kv) => {
+      await seedUser(kv, {
+        userId: 1,
+        userName: "alice",
+        permissions: [{ path: `/${FIXTURE}/docs`, accessLevel: "read" }],
+      });
+      const token = (await createAppToken(1, "alice")).raw;
+
+      const victim = `${FIXTURE}/private/secret.txt`;
+      const bypass = `${FIXTURE}/docs/../private/secret.txt`;
+
+      // 直接は当然拒否される (対照)
+      assertEquals(
+        (await app.fetch(
+          authReq("GET", `http://localhost/content/${victim}`, token),
+        )).status,
+        403,
+      );
+
+      for (const mount of ["content", "files"]) {
+        const res = await app.fetch(
+          authReq("GET", `http://localhost/${mount}/${bypass}`, token),
+        );
+        // 400 (パス拒否) でも 403 (認可拒否) でもよいが、中身は渡さない。
+        assert(
+          res.status === 400 || res.status === 403,
+          `GET /${mount} with .. must not succeed, got ${res.status}`,
+        );
+        await res.body?.cancel();
+      }
+    });
+  } finally {
+    await cleanup();
+  }
+});
+
+Deno.test("`..` でポリシーを迂回できない (書き込み・削除・rename・lock・upload)", async () => {
+  const cleanup = await setupFixture();
+  try {
+    await withTestKv(async (kv) => {
+      await seedUser(kv, {
+        userId: 1,
+        userName: "alice",
+        // write を持っていても、持っているのは /docs だけ。
+        permissions: [{ path: `/${FIXTURE}/docs`, accessLevel: "write" }],
+      });
+      const token = (await createAppToken(1, "alice")).raw;
+
+      const bypass = `${FIXTURE}/docs/../private/secret.txt`;
+      const bypassDir = `${FIXTURE}/docs/../private/newdir`;
+
+      const cases: Array<[string, Request]> = [
+        [
+          "DELETE /files",
+          authReq("DELETE", `http://localhost/files/${bypass}`, token),
+        ],
+        [
+          "PATCH /files (newPath)",
+          authReq(
+            "PATCH",
+            `http://localhost/files/${FIXTURE}/docs/note.txt`,
+            token,
+            {
+              newPath: `/${bypass}`,
+            },
+          ),
+        ],
+        [
+          "POST /folders",
+          authReq("POST", `http://localhost/folders/${bypassDir}`, token),
+        ],
+        [
+          "POST /locks",
+          authReq("POST", `http://localhost/locks/${bypass}`, token),
+        ],
+        [
+          "POST /uploads",
+          authReq("POST", "http://localhost/uploads", token, {
+            path: `/${bypass}`,
+            baseFromExisting: false,
+          }),
+        ],
+      ];
+
+      for (const [label, req] of cases) {
+        const res = await app.fetch(req);
+        // 400 (パス拒否) / 403 (認可拒否) / 409 (pin 等の別の拒否) のいずれでも
+        // よいが、2xx で通ってはいけない。
+        assert(
+          res.status >= 400,
+          `${label} with .. must not succeed, got ${res.status}`,
+        );
+        await res.body?.cancel();
+      }
+
+      // 実ファイルが無傷であること (= 迂回が「成功しかけて」いない)
+      const still = await Deno.readTextFile(
+        path.join(Deno.cwd(), "data", FIXTURE, "private", "secret.txt"),
+      );
+      assertEquals(still, "secret");
+    });
+  } finally {
+    await cleanup();
+  }
+});

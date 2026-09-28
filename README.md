@@ -145,6 +145,10 @@ deno task seed --policy <file>         # ポリシー文書そのものを差し
 | `MIKURA_CONSOLE_SESSION_IDLE_MINUTES` | `30` | 無操作でセッション破棄 |
 | `MIKURA_CONSOLE_SESSION_MAX_HOURS` | `8` | セッションの絶対寿命 |
 
+API サーバは既定で全インタフェースに bind します (他ホストの client から
+到達されるサーバなので)。reverse proxy の後ろに置く場合は `MIKURA_HOST=::1`
+で loopback に絞ってください。
+
 招待リンクを発行するには、**API サーバ側**に `MIKURA_PUBLIC_URL`
 (クライアントから到達できる URL) を設定してください。
 
