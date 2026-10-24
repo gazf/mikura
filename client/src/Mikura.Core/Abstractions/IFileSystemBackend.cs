@@ -71,6 +71,20 @@ public interface IFileSystemBackend
     Task<bool> CanDeleteAsync(IFileHandle handle, CancellationToken ct = default);
 
     /// <summary>
+    /// Persist everything written through this handle so far, and **surface any
+    /// failure**. Maps IRP_MJ_FLUSH_BUFFERS.
+    /// <para>Writes complete optimistically (the coalescer buffers and returns
+    /// success before the PATCH lands), and Cleanup cannot report a failure —
+    /// IRP_MJ_CLEANUP's status never reaches the application, so <c>CloseHandle</c>
+    /// always succeeds. That makes Flush the only path through which a failed
+    /// upload can reach the application, which is what lets Office show
+    /// "could not save" instead of silently losing the edit session.</para>
+    /// <para>Implementations must throw if any queued write failed. A handle with
+    /// no upload session is a no-op.</para>
+    /// </summary>
+    Task FlushAsync(IFileHandle handle, CancellationToken ct = default);
+
+    /// <summary>
     /// Per ADR-020: write-back if <see cref="CleanupFlags.Modified"/>, release the
     /// ADR-016 lock acquired in <see cref="OpenAsync"/>. Always called before <see cref="CloseAsync"/>.
     /// </summary>

@@ -518,6 +518,157 @@ public class FileSystemBackendTests
         Assert.Equal(1, server.ReleaseLockCalls);
     }
 
+    // ───────────────────────── session lost = ロックの失効を handle に伝える ────
+    //
+    // 切断中にサーバ側の lock が生きている保証は無い (TTL 30 秒 に対し再接続は
+    // 5 秒間隔 × 失敗回数)。「切れたら全部失った」とみなさないと、復帰した handle が
+    // HasLock=true のまま黙って書き続け、finalize で初めて弾かれる。
+
+    [Fact]
+    public async Task InvalidateAllServerLocks_WritesOnStaleHandleFailImmediately()
+    {
+        var server = new FakeServerApi();
+        server.SeedFile("/a.txt", new byte[] { 1, 2, 3 });
+        var backend = await NewInitializedBackendAsync(server);
+        using var handle = await backend.OpenAsync("/a.txt", FileAccessIntent.Write);
+
+        Assert.Equal(1, backend.InvalidateAllServerLocks());
+
+        await Assert.ThrowsAsync<UnauthorizedAccessException>(() =>
+            backend.WriteAsync(handle!, 0, new byte[] { 9 }, appendToEnd: false, constrainedIo: false));
+    }
+
+    [Fact]
+    public async Task InvalidateAllServerLocks_NextOpenReAcquiresFromServer()
+    {
+        // slot を据え置くと、次の open が「既に持っている」と誤認して
+        // サーバに取り直しに行かない。
+        var server = new FakeServerApi();
+        server.SeedFile("/a.txt", new byte[] { 1, 2, 3 });
+        var backend = await NewInitializedBackendAsync(server);
+        using var stale = await backend.OpenAsync("/a.txt", FileAccessIntent.Write);
+        backend.InvalidateAllServerLocks();
+
+        using var fresh = await backend.OpenAsync("/a.txt", FileAccessIntent.Write);
+
+        Assert.Equal(2, server.AcquireLockCalls);
+    }
+
+    [Fact]
+    public async Task InvalidateAllServerLocks_StaleHandleCleanupDoesNotReleaseOrUpload()
+    {
+        // 失った lock を DELETE しに行かない (他端末が取り直した lock を剥がさない)。
+        var server = new FakeServerApi();
+        server.SeedFile("/a.txt", new byte[] { 1, 2, 3 });
+        var backend = await NewInitializedBackendAsync(server);
+        var handle = await backend.OpenAsync("/a.txt", FileAccessIntent.Write);
+        backend.InvalidateAllServerLocks();
+
+        await backend.CleanupAsync(handle!, CleanupFlags.Modified);
+        handle!.Dispose();
+
+        Assert.Equal(0, server.ReleaseLockCalls);
+        Assert.Equal(0, server.StartUploadCalls);
+        Assert.Equal(new byte[] { 1, 2, 3 }, server.Files["/a.txt"]);
+    }
+
+    [Fact]
+    public async Task InvalidateServerLock_OnlyAffectsTheNamedPath()
+    {
+        var server = new FakeServerApi();
+        server.SeedFile("/a.txt", new byte[] { 1 });
+        server.SeedFile("/b.txt", new byte[] { 2 });
+        var backend = await NewInitializedBackendAsync(server);
+        using var a = await backend.OpenAsync("/a.txt", FileAccessIntent.Write);
+        using var b = await backend.OpenAsync("/b.txt", FileAccessIntent.Write);
+
+        Assert.True(backend.InvalidateServerLock("/a.txt"));
+
+        await Assert.ThrowsAsync<UnauthorizedAccessException>(() =>
+            backend.WriteAsync(a!, 0, new byte[] { 9 }, appendToEnd: false, constrainedIo: false));
+        await backend.WriteAsync(b!, 0, new byte[] { 9 }, appendToEnd: false, constrainedIo: false);
+    }
+
+    // ─────────────────────────────────── Flush = 保存失敗の唯一の露出経路 ────
+    //
+    // Write は楽観完了 (coalescer が buffer に積んで即成功、PATCH は背景) し、
+    // Cleanup は Windows の仕様上ステータスをアプリに返せない。したがって
+    // FlushFileBuffers が失敗を返せないと、PATCH の失敗はどこからもアプリに届かず、
+    // ユーザーは「保存できた」と信じたまま編集内容を失う。
+
+    [Fact]
+    public async Task Flush_PatchFailed_Throws()
+    {
+        var server = new FakeServerApi();
+        var backend = await NewInitializedBackendAsync(server);
+
+        using var handle = await backend.CreateAsync("/doc.bin", isDirectory: false);
+        // 「ネットワークは健全だがサーバ側で書けない」= gate は online のまま。
+        server.UploadChunkFailure = new IOException("staging is not writable");
+        await backend.WriteAsync(handle!, 0, new byte[] { 1, 2, 3, 4 }, appendToEnd: false, constrainedIo: false);
+
+        await Assert.ThrowsAsync<IOException>(() => backend.FlushAsync(handle!));
+    }
+
+    [Fact]
+    public async Task Flush_NoWrites_IsNoOp()
+    {
+        // 読み取り専用 handle や書く前の Flush で余分な往復を生まないこと
+        // (Flush は Office の保存手順で必ず通るので、空振りが重いと全体が遅くなる)。
+        var server = new FakeServerApi();
+        server.SeedFile("/a.txt", new byte[] { 1, 2, 3 });
+        var backend = await NewInitializedBackendAsync(server);
+
+        using var handle = await backend.OpenAsync("/a.txt", FileAccessIntent.Read);
+        await backend.FlushAsync(handle!);
+
+        Assert.Empty(server.SessionsByUploadId);
+    }
+
+    [Fact]
+    public async Task Flush_ThenMoreWrites_StillPersistedByCleanup()
+    {
+        // Flush は handle の生存中に何度でも来る。in-flight I/O の待ち合わせが
+        // 再武装されないと、Flush 後に積んだ write が Cleanup の drain をすり抜け、
+        // finalize が取り残した内容で確定してしまう (回帰テスト)。
+        var server = new FakeServerApi();
+        var backend = await NewInitializedBackendAsync(server);
+
+        using var handle = await backend.CreateAsync("/doc.bin", isDirectory: false);
+        await backend.WriteAsync(handle!, 0, new byte[] { 1, 2 }, appendToEnd: false, constrainedIo: false);
+        await backend.FlushAsync(handle!);
+        await backend.WriteAsync(handle!, 2, new byte[] { 3, 4 }, appendToEnd: false, constrainedIo: false);
+        await backend.FlushAsync(handle!);
+        await backend.CleanupAsync(handle!, CleanupFlags.Modified);
+        handle!.Dispose();
+
+        Assert.Equal(new byte[] { 1, 2, 3, 4 }, server.Files["/doc.bin"]);
+    }
+
+    [Fact]
+    public async Task DrainInFlight_ReArms_SoASecondDrainStillWaits()
+    {
+        // Flush が in-flight I/O を待つようになった結果、drain は handle の生存中に
+        // 複数回呼ばれる。完了した待ち合わせを使い回すと 2 回目が即 return し、
+        // その後に async dispatch された Write を Cleanup が取り残す。
+        var server = new FakeServerApi();
+        var backend = await NewInitializedBackendAsync(server);
+        using var handle = await backend.CreateAsync("/doc.bin", isDirectory: false);
+
+        var io1 = handle!.EnterIo();
+        var first = handle.DrainInFlightAsync();
+        Assert.False(first.IsCompleted);
+        io1.Dispose();
+        await first;
+
+        // 2 回目 (Flush → Cleanup の順で来る想定)。新しい in-flight を待つこと。
+        var io2 = handle.EnterIo();
+        var second = handle.DrainInFlightAsync();
+        Assert.False(second.IsCompleted);
+        io2.Dispose();
+        await second;
+    }
+
     [Fact]
     public async Task FreshWrite_PassesThroughChunkedSession_NoBaseCopy()
     {

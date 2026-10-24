@@ -28,6 +28,9 @@ mikura server (Deno + Hono + Deno KV)
   ├─ Range PATCH ベースの chunked upload セッション (ADR-025)
   ├─ ファイルロック管理 (ADR-018: TTL 30s + WSS heartbeat 10s)
   └─ イベント配信 (API-driven broadcast)
+
+mikura console (Deno + Hono、別プロセス / 既定は起動しない)
+  └─ 管理画面。KV には触れず `/admin/*` を HTTP で叩く BFF (ADR-033)
 ```
 
 - **読み取り**: per-IRP byte-range fetch (`GET /content` + `Range:` ヘッダ)
@@ -60,6 +63,108 @@ deno task test   # テスト
 - `data/` — 確定済みファイルツリー (`MIKURA_DATA_ROOT`)
 - `staging/` — chunked upload セッションの中間置き場 (`MIKURA_STAGING_ROOT`)、finalize で `data/` に rename(2)
 
+### 管理コンソール (任意 / 管理作業をするときだけ起動)
+
+```bash
+cd console
+MIKURA_API_URL=http://127.0.0.1:8700 deno task dev
+# → http://127.0.0.1:8701/console/
+```
+
+ユーザー・ロール・診断・招待・端末・監査ログをブラウザから操作できます。
+ログインには管理トークンを貼り付けます (`cd server && deno task seed` の出力、
+または `deno run --allow-all --unstable-kv issue-token.ts` で再発行)。
+
+### アクセス制御 (ADR-035)
+
+権限は **ロール** で表します。コンソールの「ロール」タブに 1 行 = 1 ロールの
+テーブルがあり、行の「編集」でルールとテストを、「無効にする」で権限だけを
+一時停止できます。無効にしても定義と割り当ては残ります。
+
+保存するたびにそのロールの**世代**が 1 つ積まれ (直近 10 世代)、編集画面から
+前の世代に切り替えられます。切り替えと有効・無効の切り替えでは世代は増えません。
+
+テキストで書くとこうなります (書き出し・取り込みの形式):
+
+```
+role projects-editor {
+  allow  write  /projects
+  allow  read   /shared
+  deny          /projects/secret
+}
+
+test projects-editor {
+  writable   /projects/spec.md
+  readable   /shared/notes.md
+  invisible  /projects/secret/inner.txt
+}
+```
+
+- ユーザーにはロールを直接割り当てます。グループはありません。
+- 実効水準は **割り当てられたロール全体の最大値**。ロールごとには、対象パスに
+  一番近い祖先のルール 1 本だけが効きます。したがって**行の順番は結果に影響せず、
+  ロールを足して権限が減ることもありません**。
+- ルールの無いパスは**見えません** (拒否ではなく不可視)。許可したパスの祖先は、
+  そこへ辿り着けるように名前だけ見えます。
+- パスの照合は**大文字小文字を区別します**。`/pub` と `/PUB` はデータルートの
+  ファイルシステム上で別のディレクトリなので、権限も別々に書いてください
+  (実体と違う大小文字で書いたルールは「診断」タブで⚠として出ます)。
+- `test` ブロックはそのロール単体の単体テストです。1 つでも落ちると保存できません。
+- ルールが名前を挙げているフォルダは**改名・削除できません** (ルールが宙に浮くのを
+  防ぐため)。中身は通常どおり操作できます。
+- 「診断」タブで「このユーザーは何ができるか」と「このパスに届くのは誰か」を
+  両方向から確認できます。後者は監査で実際に問われる問いです。
+
+管理者から締め出された場合 (ポリシー未投入、割り当ての消失など) は、サーバーを
+止めて次を実行してください。HTTP 経由の復旧は admin 権限を要求するので、
+この 2 つだけが KV を直接触ります。
+
+```bash
+cd server
+deno task seed --grant-admin           # admin ユーザーに管理ロールを割り当て直す
+deno task seed --policy <file>         # ポリシー文書そのものを差し戻す
+```
+
+ロール名は「何を与えるか」で付けてください (`projects-editor` は良い名前、
+`sales-department` は悪い名前)。1 人だけの例外は `alice-docs-readonly` のような
+ロールを 1 人に割り当てる形で表します。
+
+設計上の性質 (ADR-033):
+
+- API サーバとは**別プロセス**。既定で loopback にしか bind しないので、
+  外から見えるポートには一切現れません。リモートから使うときは SSH
+  ポートフォワード等を経由してください。
+- Deno KV もデータルートも開きません。パーミッション (`--unstable-kv` なし、
+  書き込み権限なし) でそれが強制されています。
+- 管理トークンは console プロセスのメモリにしか置かれず、ブラウザにも
+  ディスクにも出ません。console を止めれば攻撃面はゼロになります。
+
+| 環境変数 | 既定 | 意味 |
+| --- | --- | --- |
+| `MIKURA_API_URL` | `http://127.0.0.1:8700` | API サーバの内部アドレス |
+| `MIKURA_CONSOLE_HOST` | `127.0.0.1` | bind 先 |
+| `MIKURA_CONSOLE_PORT` | `8701` | listen ポート |
+| `MIKURA_CONSOLE_COOKIE_SECURE` | `false` | TLS の後ろに置くなら `true` |
+| `MIKURA_CONSOLE_SESSION_IDLE_MINUTES` | `30` | 無操作でセッション破棄 |
+| `MIKURA_CONSOLE_SESSION_MAX_HOURS` | `8` | セッションの絶対寿命 |
+
+API サーバは既定で全インタフェースに bind します (他ホストの client から
+到達されるサーバなので)。reverse proxy の後ろに置く場合は `MIKURA_HOST=::1`
+で loopback に絞ってください。
+
+招待リンクを発行するには、**API サーバ側**に `MIKURA_PUBLIC_URL`
+(クライアントから到達できる URL) を設定してください。
+
+```bash
+cd server
+MIKURA_PUBLIC_URL=http://localhost:8700 deno task dev
+```
+
+未設定でも招待は発行できますが、リンクのホスト名を組み立てられないため
+`mikura://enroll?u=http%3A%2F%2FHOST%3A8700&s=...` という**雛形**が表示されます。
+`HOST` をクライアントから到達できるホスト名か IP に置き換えてから渡してください。
+置き換え忘れたリンクはクライアント側で弾かれます (ADR-034)。
+
 ### クライアント (Windows)
 
 ```bash
@@ -68,8 +173,17 @@ dotnet build
 dotnet run --project src/Mikura.App
 ```
 
-設定で `Sync Root` にドライブ文字 (例 `Z:`) を入れると、その文字でマウントされます。
+初回はタスクトレイの「プロファイルを追加」から、管理者に発行してもらった
+招待リンク (`mikura://enroll?...`) を貼り付けます。クリップボードにリンクが
+入っていれば自動で埋まります。マウント先のドライブ文字は空いているものから
+選べます。
+
+`mikura://` はクライアント起動時に現在のユーザーへ関連付けられるので、
+チャット等で送られたリンクをクリックするだけでも追加できます (管理者権限不要)。
 Device ID は `device.json` に永続化されます (実行ファイル隣)。
+
+多数の端末に一括展開する場合は、`inits/` に `*.init.json` を置く従来の経路も
+そのまま使えます。
 
 ## ドキュメント
 

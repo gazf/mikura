@@ -46,14 +46,18 @@ Deno.test("path validation: rejects deeper escape '/../../etc/passwd'", async ()
   );
 });
 
-Deno.test("path normalization: in-bounds '..' is collapsed (no escape)", async () => {
-  // /safe/../etc → 正規化で /etc に潰れる。escape ではないので
-  // 「Invalid path」ではなく実体が無いので NotFound として返る。
-  // = 正規化が正しく働き、ルート外へは出ていない、ことの確認。
+Deno.test("path validation: rejects in-bounds '..' too (認可層との食い違いを作らない)", async () => {
+  // 以前はここが「ルート内に収まる `..` は畳んで通す (= 実体が無いので
+  // Not found)」を仕様として固定していた。しかしそれは**認可層との食い違い**を
+  // 作る: 認可判定は別経路で正規化するので、`<許可パス>/../<被害者パス>` は
+  // 「祖先鎖に許可パスを含む」かつ「実ファイルは別物」を同時に満たし、
+  // read 権限 1 つでデータ全体に到達できていた。
+  //
+  // ルート外に出るかどうかは判断基準にしない。`..` を含むパスは一律で弾く。
   await assertRejects(
     () => listDirectory("/safe/../etc"),
     FileServiceError,
-    "Not found",
+    "Invalid path",
   );
 });
 

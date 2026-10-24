@@ -382,11 +382,16 @@ export async function abortSession(
  */
 export async function refreshDeviceSessions(
   deviceId: string,
+  userId: number,
 ): Promise<number> {
   const kv = await getEphemeralKv();
   let refreshed = 0;
   const iter = kv.list({ prefix: Keys.uploadsByDevicePrefix(deviceId) });
   for await (const entry of iter) {
+    const uploadId = entry.key[2] as string;
+    const sessionEntry = await kv.get<UploadSession>(Keys.upload(uploadId));
+    // deviceId は名乗るだけで衝突しうるので、所有は (userId, deviceId) で見る。
+    if (sessionEntry.value?.userId !== userId) continue;
     // alive marker を無条件で set し直すだけ(value は null、競合不可)。
     await kv.set(entry.key, null, { expireIn: SESSION_ALIVE_TTL_MS });
     refreshed++;
@@ -395,11 +400,15 @@ export async function refreshDeviceSessions(
 }
 
 /**
- * 切断時等: 当該 device の全セッションを abort する。
+ * 切断時等: 当該 **ユーザーの** device の全セッションを abort する。
  * lock service の releaseDeviceLocks と一緒に呼ぶ前提。
+ *
+ * `userId` は必須。deviceId はクライアントが名乗るだけで一意性の検査が無いので、
+ * deviceId だけを鍵にすると他人の進行中アップロードを中断できてしまう。
  */
 export async function abortDeviceSessions(
   deviceId: string,
+  userId: number,
 ): Promise<number> {
   const kv = await getEphemeralKv();
   let aborted = 0;
@@ -407,6 +416,8 @@ export async function abortDeviceSessions(
   for await (const entry of iter) {
     const uploadId = entry.key[2] as string;
     const sessionEntry = await kv.get<UploadSession>(Keys.upload(uploadId));
+    // 別ユーザーのセッション = deviceId の衝突。逆引きも含めて触らない。
+    if (sessionEntry.value && sessionEntry.value.userId !== userId) continue;
     if (sessionEntry.value) {
       await Deno.remove(sessionEntry.value.tempPath).catch(() => {});
     }

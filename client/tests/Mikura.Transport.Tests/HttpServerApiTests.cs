@@ -168,6 +168,15 @@ public class HttpServerApiTests
         await Assert.ThrowsAsync<ApiException>(() => server.ReleaseLockAsync("/foo.txt"));
     }
 
+    [Fact]
+    public async Task ReleaseLockAsync_404_DoesNotThrow()
+    {
+        // lock は TTL で日常的に失効する (heartbeat 途絶、admin の強制解除)。
+        // 「無ければ成功でよい」冪等操作なので、Cleanup 経路に例外を持ち込まない。
+        var (server, _) = NewServer(_ => Json(HttpStatusCode.NotFound, "{\"message\":\"Lock not found\"}"));
+        await server.ReleaseLockAsync("/foo.txt");
+    }
+
     // ---------- DeleteFileAsync ----------
 
     [Fact]

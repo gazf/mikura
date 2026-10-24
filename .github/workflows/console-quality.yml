@@ -1,0 +1,49 @@
+name: console-quality
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "console/**"
+      - ".github/workflows/console-quality.yml"
+  pull_request:
+    paths:
+      - "console/**"
+      - ".github/workflows/console-quality.yml"
+
+defaults:
+  run:
+    working-directory: console
+
+jobs:
+  fmt:
+    name: deno fmt
+    runs-on: ubuntu-latest
+    container: denoland/deno:2.7.1
+    steps:
+      - uses: actions/checkout@v4
+      - run: deno fmt --check
+
+  lint:
+    name: deno lint
+    runs-on: ubuntu-latest
+    container: denoland/deno:2.7.1
+    steps:
+      - uses: actions/checkout@v4
+      - run: deno lint
+
+  check:
+    name: deno check
+    runs-on: ubuntu-latest
+    container: denoland/deno:2.7.1
+    steps:
+      - uses: actions/checkout@v4
+      - run: deno task check
+
+  test:
+    name: deno test
+    runs-on: ubuntu-latest
+    container: denoland/deno:2.7.1
+    steps:
+      - uses: actions/checkout@v4
+      - run: deno task test

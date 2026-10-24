@@ -24,6 +24,12 @@ public sealed partial class FileSystemBackend
         private readonly long _originalServerSize;
         private bool _hasLock;
 
+        /// <summary>
+        /// write-intent open で取得した共有ロックの slot (read open は null)。
+        /// 「サーバ側の lock が自分の手を離れた」ことは slot 経由で伝わる。
+        /// </summary>
+        private readonly LockSlot? _lockSlot;
+
         // ADR-025: path 単位で共有される chunked upload session の slot。
         // 同一 path に対して複数 handle が開いていても _slot は同じインスタンス
         // (refcount は backend 側で管理)。<see cref="WriteCoalescer"/> も slot 経由で共有され、
@@ -36,12 +42,13 @@ public sealed partial class FileSystemBackend
         /// </summary>
         public PrefetchCache Prefetch { get; } = new();
 
-        public FileHandle(FileSystemBackend backend, string path, FileEntry entry, bool hasLock)
+        public FileHandle(FileSystemBackend backend, string path, FileEntry entry, LockSlot? lockSlot)
         {
             _backend = backend;
             Path = path;
             _entry = entry;
-            _hasLock = hasLock;
+            _lockSlot = lockSlot;
+            _hasLock = lockSlot is not null;
             _length = entry.Size;
             _originalServerSize = entry.Size;
         }
@@ -49,7 +56,13 @@ public sealed partial class FileSystemBackend
         public string Path { get; }
         public bool IsDirectory => _entry.IsDirectory;
         public bool FreshlyCreated { get; init; }
-        public bool HasLock => _hasLock;
+        /// <summary>
+        /// サーバ側のロックを今も保持しているか。
+        /// <para>切断・TTL 失効・他者による強制解除で slot が Lost になった場合は
+        /// false に落ちる。これが無いと、切断から復帰した handle が「まだ持っている」
+        /// と信じて書き続け、finalize で初めて弾かれる (= 失敗の露出が遅れる)。</para>
+        /// </summary>
+        public bool HasLock => _hasLock && !(_lockSlot?.Lost ?? false);
 
         public long Length => _length;
         public FileEntry Entry => _entry;
@@ -122,6 +135,22 @@ public sealed partial class FileSystemBackend
         }
 
         /// <summary>
+        /// 現バッファを送出して背景 PATCH を完走まで待ち、1 つでも失敗していれば throw
+        /// する。session を持たない handle は no-op。
+        /// </summary>
+        /// <remarks>
+        /// coalescer は path 単位で共有されているので、同じ path の他 handle の write も
+        /// 一緒に送出される。FlushFileBuffers の意味 (「このファイルを永続化する」) と
+        /// 一致するので、これは仕様として正しい。
+        /// </remarks>
+        public async Task FlushSessionAsync(CancellationToken ct)
+        {
+            var coalescer = _slot?.Coalescer;
+            if (coalescer is null) return;
+            await coalescer.FlushAsync(ct).ConfigureAwait(false);
+        }
+
+        /// <summary>
         /// 自分の handle 分の refcount を返す。自分が最後の handle なら実 finalize 経路へ。
         /// 戻り値が null なら他 handle がまだ生きているので caller は _tree 更新をスキップ。
         /// </summary>
@@ -166,7 +195,7 @@ public sealed partial class FileSystemBackend
             return new IoReleaser(this);
         }
 
-        public Task DrainInFlightAsync(CancellationToken ct = default)
+        public async Task DrainInFlightAsync(CancellationToken ct = default)
         {
             var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             // 最初に Drain を呼んだ caller の TCS を採用(2 回呼ばれた場合は最初の TCS を共有)。
@@ -176,7 +205,20 @@ public sealed partial class FileSystemBackend
             // 走り終えていて _drainTcs を取り損ねている可能性がある → ここで補填。
             if (Volatile.Read(ref _inFlight) == 0)
                 actual.TrySetResult();
-            return ct.CanBeCanceled ? actual.Task.WaitAsync(ct) : actual.Task;
+            try
+            {
+                await (ct.CanBeCanceled ? actual.Task.WaitAsync(ct) : actual.Task).ConfigureAwait(false);
+            }
+            finally
+            {
+                // drain は **再武装できなければならない**。Flush は handle の生存中に
+                // 何度も来るので、完了した TCS を残すと次の drain (Cleanup の待ち合わせ)
+                // が即 return し、その後に積まれた Write を取り残す。
+                // 完走した場合だけ外す — cancel で抜けた場合は、同じ TCS を待っている
+                // 別 caller への通知経路 (ExitIo が読む _drainTcs) を壊さないため。
+                if (actual.Task.IsCompletedSuccessfully)
+                    Interlocked.CompareExchange(ref _drainTcs, null, actual);
+            }
         }
 
         private void ExitIo()

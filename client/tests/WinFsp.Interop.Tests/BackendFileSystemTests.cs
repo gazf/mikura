@@ -44,6 +44,70 @@ public class BackendFileSystemTests
         return (fs, backend, gate);
     }
 
+    // ─────────────────────────────────────────────── Flush ────
+    //
+    // Flush の責務 = 「成功を返す前に、書いた内容が本当に届いたことを確認する」。
+    // Write は楽観完了し、Cleanup は Windows の仕様上ステータスをアプリに返せない
+    // ので、**Flush が保存失敗を伝える唯一の経路**。ここが常に成功を返していると、
+    // PATCH の失敗 (サーバの disk full、5xx) が「保存できた」という表示のまま
+    // 編集内容を失わせる。
+
+    [Fact]
+    public void Flush_DelegatesToBackend()
+    {
+        var (fs, backend, _) = NewFs();
+        backend.SeedFile("/foo.txt");
+        fs.Open("\\foo.txt", 0, FILE_WRITE_DATA, out var ctx, out _);
+
+        var status = fs.Flush(ctx, out _);
+
+        Assert.Equal(NtStatus.Success, status);
+        Assert.Equal(1, backend.FlushCalls);
+    }
+
+    [Fact]
+    public void Flush_BackendThrows_ReturnsUnsuccessful()
+    {
+        // gate は online のまま = WSS は生きていて HTTP だけ失敗したケース
+        // (サーバの disk full、5xx、staging の権限エラー)。
+        var (fs, backend, _) = NewFs();
+        backend.SeedFile("/foo.txt");
+        fs.Open("\\foo.txt", 0, FILE_WRITE_DATA, out var ctx, out _);
+        backend.FlushFailure = new IOException("write cache flush failed");
+
+        var status = fs.Flush(ctx, out _);
+
+        Assert.Equal(NtStatus.Unsuccessful, status);
+    }
+
+    [Fact]
+    public void Flush_BackendThrowsWhileOffline_ReturnsNetworkUnreachable()
+    {
+        var (fs, backend, gate) = NewFs();
+        backend.SeedFile("/foo.txt");
+        fs.Open("\\foo.txt", 0, FILE_WRITE_DATA, out var ctx, out _);
+        backend.FlushFailure = new IOException("connection closed");
+        // Flush 開始後に切断した状況 (入口の gate チェックは通っている)。
+        gate.Set(false);
+
+        var status = fs.Flush(ctx, out _);
+
+        Assert.Equal(NtStatus.NetworkUnreachable, status);
+    }
+
+    [Fact]
+    public void Flush_NullFileContext_IsVolumeFlushAndSucceeds()
+    {
+        // fileContext==null は volume 全体の flush。handle 単位の upload session しか
+        // 持たないので待つものは無く、backend も呼ばない。
+        var (fs, backend, _) = NewFs();
+
+        var status = fs.Flush(null, out _);
+
+        Assert.Equal(NtStatus.Success, status);
+        Assert.Equal(0, backend.FlushCalls);
+    }
+
     // ───────────────────────────────────────── OnlineGate ────
 
     [Fact]

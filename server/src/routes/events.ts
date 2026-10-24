@@ -1,4 +1,4 @@
-import { Hono } from "hono";
+import { Hono } from "@hono/hono";
 import {
   refreshDeviceLocks,
   releaseDeviceLocks,
@@ -8,21 +8,30 @@ import {
   refreshDeviceSessions,
 } from "../services/upload.service.ts";
 import {
+  isRegisteredPeer,
+  type Peer,
   registerSocket,
+  touchPeer,
   unregisterSocket,
 } from "../services/wsBroadcast.service.ts";
-import type { AuthUser, PermissionContext } from "../services/auth.service.ts";
+import { logAudit } from "../services/audit.service.ts";
+import type { AuthUser } from "../services/auth.service.ts";
 
 type Env = {
   Variables: {
     user: AuthUser;
-    permCtx: PermissionContext;
   };
 };
 
 interface IncomingMessage {
   type?: string;
   deviceId?: string;
+}
+
+/** audit 用の直近 IP。判定には使わない付随情報 (auth ミドルウェアと同じ導出)。 */
+function clientIp(c: { req: { header(name: string): string | undefined } }) {
+  return c.req.header("X-Forwarded-For")?.split(",")[0]?.trim() ??
+    c.req.header("X-Real-IP") ?? "unknown";
 }
 
 export function registerEventRoutes(app: Hono<Env>) {
@@ -35,14 +44,29 @@ export function registerEventRoutes(app: Hono<Env>) {
     const user = c.get("user");
     const { socket, response } = Deno.upgradeWebSocket(c.req.raw);
 
-    const peer = {
+    const peer: Peer = {
       socket,
       userId: user.id,
       deviceId: user.deviceId,
     };
 
     socket.onopen = () => {
-      registerSocket(peer);
+      const result = registerSocket(peer);
+      if (result.ok) return;
+
+      // 同じ deviceId の WSS が既に生きている。正規クライアントは単一
+      // インスタンス mutex で 2 本張らないので、これは token + deviceId が
+      // 複製された signal。1 本目は触らず 2 本目だけ閉じ、admin が revoke を
+      // 判断できるように監査ログへ残す (IP は付随情報。判定には使わない)。
+      logAudit(
+        user.id,
+        "wss_duplicate_device",
+        `device:${user.deviceId.slice(0, 8)}`,
+        clientIp(c),
+      ).catch((err) => console.error("logAudit failed:", err));
+      try {
+        socket.close(4409, "duplicate device");
+      } catch { /* 既に閉じている */ }
     };
 
     // ADR-018 Step 2/3: WSS heartbeat / terminate。deviceId は接続時に検証済みの
@@ -55,6 +79,11 @@ export function registerEventRoutes(app: Hono<Env>) {
         return;
       }
 
+      // deviceId 単位の副作用 (lock 延長 / 解放、session abort) を持つので、
+      // **登録済みの peer からのメッセージだけ**受理する。拒否された 2 本目や
+      // 置き換えられた zombie が、生きている 1 本目の lock を道連れにしない。
+      if (!isRegisteredPeer(peer)) return;
+
       if (msg.deviceId !== user.deviceId) {
         console.log(
           `[wss] message rejected (deviceId mismatch): expected=${
@@ -65,10 +94,11 @@ export function registerEventRoutes(app: Hono<Env>) {
       }
 
       if (msg.type === "heartbeat") {
+        touchPeer(peer);
         console.log(
           `[wss] heartbeat from deviceId=${user.deviceId.slice(0, 8)}`,
         );
-        refreshDeviceLocks(user.deviceId).then((n) => {
+        refreshDeviceLocks(user.deviceId, user.id).then((n) => {
           if (n > 0) {
             console.log(
               `[wss] refreshed ${n} lock(s) for ${user.deviceId.slice(0, 8)}`,
@@ -78,7 +108,7 @@ export function registerEventRoutes(app: Hono<Env>) {
           console.error("refreshDeviceLocks failed:", err);
         });
         // ADR-025: upload session の TTL も lock と一緒に延長する。
-        refreshDeviceSessions(user.deviceId).then((n) => {
+        refreshDeviceSessions(user.deviceId, user.id).then((n) => {
           if (n > 0) {
             console.log(
               `[wss] refreshed ${n} upload session(s) for ${
@@ -93,7 +123,7 @@ export function registerEventRoutes(app: Hono<Env>) {
         console.log(
           `[wss] terminate from deviceId=${user.deviceId.slice(0, 8)}`,
         );
-        releaseDeviceLocks(user.deviceId).then((n) => {
+        releaseDeviceLocks(user.deviceId, user.id).then((n) => {
           console.log(
             `[wss] terminate released ${n} lock(s) for ${
               user.deviceId.slice(0, 8)
@@ -103,7 +133,7 @@ export function registerEventRoutes(app: Hono<Env>) {
           console.error("releaseDeviceLocks failed:", err);
         });
         // ADR-025: 終了に合わせて未 finalize の upload session も abort。
-        abortDeviceSessions(user.deviceId).then((n) => {
+        abortDeviceSessions(user.deviceId, user.id).then((n) => {
           if (n > 0) {
             console.log(
               `[wss] terminate aborted ${n} upload session(s) for ${

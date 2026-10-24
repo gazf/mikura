@@ -3,12 +3,14 @@ import {
   checkPermission,
   createAppToken,
   hashToken,
+  revokeToken,
   upsertDevice,
   validateToken,
 } from "../src/services/auth.service.ts";
 import { Keys } from "../src/kv/keys.ts";
 import type { DeviceData, TokenData } from "../src/types.ts";
-import { seedUser, withTestKv } from "./_helpers.ts";
+import { assignRole } from "../src/services/policy.service.ts";
+import { seedRole, seedUser, withTestKv } from "./_helpers.ts";
 
 // ----- validateToken / createAppToken -----
 
@@ -17,8 +19,6 @@ Deno.test("createAppToken: stores token hash and forward index", async () => {
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-group",
     });
     const { raw, hash } = await createAppToken(1, "alice");
     assert(raw.length > 0);
@@ -36,8 +36,6 @@ Deno.test("validateToken: returns identity for valid token", async () => {
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-group",
     });
     const { raw } = await createAppToken(1, "alice");
     const identity = await validateToken(raw);
@@ -57,8 +55,6 @@ Deno.test("validateToken: returns null for expired token", async () => {
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-group",
     });
     const { raw, hash } = await createAppToken(1, "alice");
     // 期限切れに書き換え
@@ -79,8 +75,6 @@ Deno.test("validateToken: returns null when user record gone", async () => {
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-group",
     });
     const { raw } = await createAppToken(1, "alice");
     await kv.delete(Keys.user(1));
@@ -93,8 +87,6 @@ Deno.test("validateToken: cached hit still rejects expired tokenExpiresAt", asyn
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-group",
     });
     const { raw, hash } = await createAppToken(1, "alice");
     // 1 度目: KV を見て identity 取得 & キャッシュ
@@ -155,9 +147,144 @@ Deno.test("upsertDevice: changed ip bypasses throttle and writes immediately", a
   });
 });
 
+// ----- validateToken deviceId binding -----
+
+async function makeBoundToken(
+  kv: Deno.Kv,
+  userId: number,
+  boundDeviceId: string,
+): Promise<{ raw: string; hash: string }> {
+  // createAppToken は boundDeviceId を設定しないので、直接 KV に書き込む。
+  // enrollment.service.consumeEnrollment と同じ shape を作る。
+  const raw = crypto.randomUUID();
+  const hash = await hashToken(raw);
+  const data: TokenData = {
+    userId,
+    name: "bound-test",
+    expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString(),
+    createdAt: new Date().toISOString(),
+    boundDeviceId,
+  };
+  await kv
+    .atomic()
+    .set(Keys.token(hash), data)
+    .set(Keys.tokenByUser(userId, hash), true)
+    .commit();
+  return { raw, hash };
+}
+
+Deno.test("validateToken: bound token は同 deviceId なら通る", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "alice",
+    });
+    const deviceId = "dev-bound-alice-0001-zzzz";
+    const { raw } = await makeBoundToken(kv, 1, deviceId);
+    assertEquals(await validateToken(raw, { deviceId }), {
+      id: 1,
+      name: "alice",
+    });
+  });
+});
+
+Deno.test("validateToken: bound token は別 deviceId だと null", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "alice",
+    });
+    const { raw } = await makeBoundToken(kv, 1, "dev-real-pc-0000000001zz");
+    const identity = await validateToken(raw, {
+      deviceId: "dev-attacker-0001-zzzzzzzz",
+    });
+    assertEquals(identity, null);
+  });
+});
+
+Deno.test("validateToken: bound token は deviceId 未指定だと null", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "alice",
+    });
+    const { raw } = await makeBoundToken(kv, 1, "dev-real-pc-0000000001zz");
+    // opts 未指定 = deviceId undefined。bound 値 !== undefined なので null。
+    assertEquals(await validateToken(raw), null);
+  });
+});
+
+Deno.test("validateToken: cache hit 経路でも deviceId binding を enforce", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "alice",
+    });
+    const realDevice = "dev-cache-alice-0001zzzzz";
+    const { raw } = await makeBoundToken(kv, 1, realDevice);
+    // 1 回目: cache 投入
+    assertEquals(await validateToken(raw, { deviceId: realDevice }), {
+      id: 1,
+      name: "alice",
+    });
+    // 2 回目: cache hit 経路、別 deviceId は弾かれる
+    assertEquals(
+      await validateToken(raw, { deviceId: "dev-other-pc-zzzzzzzzzzzz" }),
+      null,
+    );
+  });
+});
+
+Deno.test("validateToken: unbound (boundDeviceId 未設定) は deviceId 不問で通る", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "alice",
+    });
+    // createAppToken は boundDeviceId を設定しない (= 旧 seed 由来 token と等価)
+    const { raw } = await createAppToken(1, "alice");
+    assertEquals(
+      await validateToken(raw, { deviceId: "dev-any-zzzzzzzzzzzzzzzz" }),
+      { id: 1, name: "alice" },
+    );
+    assertEquals(await validateToken(raw), { id: 1, name: "alice" });
+  });
+});
+
+// ----- revokeToken -----
+
+Deno.test("revokeToken: 既存 token を消去 + cache invalidate", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "alice",
+    });
+    const { raw, hash } = await createAppToken(1, "alice");
+    // warm cache
+    assertEquals(await validateToken(raw), { id: 1, name: "alice" });
+
+    const ok = await revokeToken(hash);
+    assert(ok);
+    // KV からも消えている
+    const got = await kv.get<TokenData>(Keys.token(hash));
+    assertEquals(got.value, null);
+    const fwd = await kv.get(Keys.tokenByUser(1, hash));
+    assertEquals(fwd.value, null);
+    // cache も invalidate されてる
+    assertEquals(await validateToken(raw), null);
+  });
+});
+
+Deno.test("revokeToken: 存在しない hash は false", async () => {
+  await withTestKv(async (_kv) => {
+    const ok = await revokeToken("0".repeat(64));
+    assertFalse(ok);
+  });
+});
+
 // ----- checkPermission -----
 
-Deno.test("checkPermission: returns false for user with no group", async () => {
+Deno.test("checkPermission: ロールが 1 つも無いユーザーは全部拒否", async () => {
   await withTestKv(async () => {
     assertFalse(await checkPermission(999, "/foo", "read"));
   });
@@ -168,8 +295,6 @@ Deno.test("checkPermission: exact path read permission", async () => {
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-group",
       permissions: [{ path: "/foo", accessLevel: "read" }],
     });
     assert(await checkPermission(1, "/foo", "read"));
@@ -182,8 +307,6 @@ Deno.test("checkPermission: write permission allows read", async () => {
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-group",
       permissions: [{ path: "/foo", accessLevel: "write" }],
     });
     assert(await checkPermission(1, "/foo", "read"));
@@ -191,17 +314,16 @@ Deno.test("checkPermission: write permission allows read", async () => {
   });
 });
 
-Deno.test("checkPermission: admin grants both read and write", async () => {
+Deno.test("checkPermission: admin は read と write を兼ねる (admin は / のみ)", async () => {
   await withTestKv(async (kv) => {
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-group",
-      permissions: [{ path: "/foo", accessLevel: "admin" }],
+      permissions: [{ path: "/", accessLevel: "admin" }],
     });
     assert(await checkPermission(1, "/foo", "read"));
     assert(await checkPermission(1, "/foo", "write"));
+    assert(await checkPermission(1, "/", "admin"));
   });
 });
 
@@ -210,8 +332,6 @@ Deno.test("checkPermission: walks up the path hierarchy", async () => {
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-group",
       permissions: [{ path: "/projects", accessLevel: "write" }],
     });
     assert(await checkPermission(1, "/projects/sub/file.txt", "write"));
@@ -224,8 +344,6 @@ Deno.test("checkPermission: most specific permission wins (deny by closer ancest
     await seedUser(kv, {
       userId: 1,
       userName: "alice",
-      groupId: 10,
-      groupName: "alice-group",
       permissions: [
         { path: "/", accessLevel: "write" },
         { path: "/secret", accessLevel: "read" },
@@ -266,5 +384,37 @@ Deno.test("upsertDevice: existing device keeps firstSeenAt, updates lastSeenAt",
     assertEquals(second.value?.firstSeenAt, firstSeen);
     assertEquals(second.value?.ipAddress, "10.0.0.1");
     assert(second.value!.lastSeenAt >= firstSeen);
+  });
+});
+
+// ----- ADR-035: 派生可視性と deny -----
+
+Deno.test("checkPermission: grant した path の祖先は visible で通り read では通らない", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "alice",
+      permissions: [{ path: "/alice/docs", accessLevel: "read" }],
+    });
+    assert(await checkPermission(1, "/alice", "visible"));
+    assertFalse(await checkPermission(1, "/alice", "read"));
+    assert(await checkPermission(1, "/alice/docs/a.txt", "read"));
+    assertFalse(await checkPermission(1, "/bob", "visible"));
+  });
+});
+
+Deno.test("checkPermission: ロールを足すと必ず増える方向にしか動かない", async () => {
+  await withTestKv(async (kv) => {
+    await seedUser(kv, {
+      userId: 1,
+      userName: "alice",
+      permissions: [{ path: "/projects", accessLevel: "write" }],
+    });
+    // 旧モデルはここで「より緩いグループが先に並ぶと admin が隠れる」順序依存が
+    // あった。ロールは max で合成するので、弱いロールを足しても下がらない。
+    await seedRole("weak", [{ path: "/projects", accessLevel: "read" }]);
+    const assigned = await assignRole(1, "weak");
+    assert(assigned.ok);
+    assert(await checkPermission(1, "/projects/a.txt", "write"));
   });
 });

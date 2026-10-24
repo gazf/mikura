@@ -12,21 +12,30 @@ function resolveAndValidate(relativePath: string): string {
     throw new FileServiceError("Invalid path", 400);
   }
 
+  // Reject path traversal **before** normalization.
+  //
+  // 以前はここが `path.normalize` の**後**にあった。normalize は `a/../b` を
+  // `b` に畳むので、畳んだ結果から `..` を探しても見つからず素通りする。
+  // 実 I/O は畳んだパスを開く一方、認可判定は別経路で正規化するため、
+  // `<許可パス>/../<被害者パス>` でポリシーを迂回できていた。
+  // upload.service の validateRelativePath と同じ「生文字列で弾く」順序に揃える。
+  for (const seg of relativePath.split("/")) {
+    if (seg === "..") throw new FileServiceError("Invalid path", 400);
+  }
+
+  // `\` はパス区切りではない。以前は `path.normalize` の**後**に `\`→`/` へ
+  // 置換していたため、`pub\..\victim` は上の `..` 検査 (`/` で split) を
+  // 素通りしてから `../` に化け、別のファイルへ到達していた。置換をやめて
+  // 拒否する — 変換それ自体が別名を作るので。
+  if (relativePath.includes("\\")) {
+    throw new FileServiceError("Invalid path", 400);
+  }
+
   // Strip leading slashes so path.join doesn't treat it as absolute
   const stripped = relativePath.replace(/^\/+/, "");
 
   // Normalize and resolve
-  const normalized = stripped
-    ? path.normalize(stripped).replace(/\\/g, "/")
-    : ".";
-
-  // Reject path traversal
-  if (
-    normalized.startsWith("..") || normalized.includes("/../") ||
-    normalized.endsWith("/..")
-  ) {
-    throw new FileServiceError("Invalid path", 400);
-  }
+  const normalized = stripped ? path.normalize(stripped) : ".";
 
   const fullPath = path.join(DATA_ROOT, normalized);
   const resolved = path.resolve(fullPath);
@@ -199,6 +208,20 @@ export async function readFile(
 
   const totalSize = stat.size;
   const startOffset = offset ?? 0;
+
+  // Range の健全性はここで一元的に見る (呼び出し側の parse ミスを最後に受ける)。
+  // reversed range は files.ts が length を負にして渡してくるので、負長を
+  // new Uint8Array(負) に到達させず 416 相当で弾く (旧実装は RangeError → 500)。
+  if (length !== undefined && length < 0) {
+    file.close();
+    throw new FileServiceError("Range not satisfiable", 416);
+  }
+  // offset が EOF を越えている (空ファイルの 0 は許容)。RFC 7233 の 416。
+  if (startOffset > totalSize || (startOffset === totalSize && totalSize > 0)) {
+    file.close();
+    throw new FileServiceError("Range not satisfiable", 416);
+  }
+
   const remainingFromOffset = Math.max(0, totalSize - startOffset);
   const requestedLength = length ?? remainingFromOffset;
   const actualLength = Math.min(requestedLength, remainingFromOffset);

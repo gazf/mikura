@@ -2,13 +2,13 @@ import { crypto as stdCrypto } from "@std/crypto";
 import { encodeHex } from "@std/encoding/hex";
 import { getKv } from "../kv/store.ts";
 import { Keys } from "../kv/keys.ts";
-import type {
-  AccessLevel,
-  DeviceData,
-  Permission,
-  TokenData,
-  User,
-} from "../types.ts";
+import {
+  type EffectiveLevel,
+  effectiveLevel,
+  hasAccess,
+} from "../policy/evaluate.ts";
+import { getActivePolicy, getUserRoles } from "./policy.service.ts";
+import type { AccessLevel, DeviceData, TokenData, User } from "../types.ts";
 
 // TextEncoder は stateless なので module-level で 1 個を共有 (validateToken は
 // 全 request の hot path で sha256 を経由する)。
@@ -65,6 +65,11 @@ interface CachedToken {
   identity: TokenIdentity;
   tokenExpiresAtMs: number;
   cacheUntilMs: number;
+  /**
+   * Token に紐付いた device ID。新仕様 (enrollment 経由) の token は必ず値、
+   * 旧 seed 由来 / 既存 token は undefined (= 任意 device で valid)。
+   */
+  boundDeviceId?: string;
 }
 
 const tokenCache = new Map<string, CachedToken>();
@@ -106,6 +111,17 @@ interface DeviceUpsertCacheEntry {
 
 const deviceUpsertCache = new Map<string, DeviceUpsertCacheEntry>();
 
+// Token の lastUsedIp / lastUsedAt update は audit 情報。同じく 30 秒 throttle。
+// (tokenHash, ip) が変わったら throttle を破って即書き込む (= 異 IP は即記録)。
+const TOKEN_LAST_USED_THROTTLE_MS = 30 * 1000;
+
+interface TokenLastUsedCacheEntry {
+  ip?: string;
+  atMs: number;
+}
+
+const tokenLastUsedCache = new Map<string, TokenLastUsedCacheEntry>();
+
 /**
  * テスト間でモジュールレベル cache を漏らさないためのリセット。
  * `_helpers.ts` の withTestKv から呼ばれる。
@@ -113,6 +129,8 @@ const deviceUpsertCache = new Map<string, DeviceUpsertCacheEntry>();
 export function _resetAuthCachesForTesting(): void {
   tokenCache.clear();
   deviceUpsertCache.clear();
+  tokenLastUsedCache.clear();
+  mismatchLogState.clear();
 }
 
 export async function upsertDevice(
@@ -134,6 +152,18 @@ export async function upsertDevice(
   const kv = await getKv();
   const nowIso = new Date(now).toISOString();
   const existing = await kv.get<DeviceData>(Keys.device(deviceId));
+
+  // 既存レコードが別ユーザーのものなら、**持ち主を書き換えない**。
+  // deviceId は enrollment が 1 ユーザーに確保する。ここで黙って付け替えると
+  // その確保が無意味になり、device 単位の監査も追跡不能になる。
+  if (existing.value && existing.value.userId !== userId) {
+    console.warn(
+      `[auth] device owner mismatch deviceId=${
+        deviceId.slice(0, 8)
+      } owner=${existing.value.userId} got=${userId} (not reassigned)`,
+    );
+    return;
+  }
 
   const device: DeviceData = existing.value
     ? {
@@ -159,8 +189,25 @@ export async function upsertDevice(
   deviceUpsertCache.set(deviceId, { userId, ipAddress, atMs: now });
 }
 
+export interface ValidateOptions {
+  /**
+   * Request の X-Device-Id header 値。指定された場合、token に紐付いた
+   * `boundDeviceId` と完全一致しないと null 返却 (= 盗難 secret.bin を別端末で
+   * 使う攻撃を防ぐ defense layer)。
+   *
+   * 後方互換: `boundDeviceId` が undefined な token (= 旧 seed admin token) は
+   * device check を skip する。新規 enrollment 由来の token は必ず bound 値を
+   * 持つので、deviceId の指定がないと弾かれる (= production では middleware が
+   * 必ず deviceId を渡す前提)。
+   */
+  deviceId?: string;
+  /** lastUsedIp の throttled update に使う。未指定なら update スキップ。 */
+  ip?: string;
+}
+
 export async function validateToken(
   rawToken: string,
+  opts: ValidateOptions = {},
 ): Promise<TokenIdentity | null> {
   const hash = await hashToken(rawToken);
   const now = Date.now();
@@ -173,6 +220,18 @@ export async function validateToken(
       return null;
     }
     if (cached.cacheUntilMs > now) {
+      // cache hit 経路でも deviceId binding は必ず enforce する (cache の寿命内に
+      // attacker が別 device から叩いてきた場合に素通しさせない)。
+      if (
+        cached.boundDeviceId !== undefined &&
+        cached.boundDeviceId !== opts.deviceId
+      ) {
+        logDeviceMismatch(hash, cached.boundDeviceId, opts.deviceId, opts.ip);
+        return null;
+      }
+      // lastUsedIp/At を背後で throttled update (return は待たない、cache hit 経路の
+      // latency を増やさない)。
+      void maybeUpdateLastUsed(hash, opts.ip, now);
       return cached.identity;
     }
     // 寿命切れ: KV で再検証 (cache は下で put し直す)
@@ -194,6 +253,16 @@ export async function validateToken(
     return null;
   }
 
+  // Device binding check (cache miss 経路)
+  if (
+    tokenData.boundDeviceId !== undefined &&
+    tokenData.boundDeviceId !== opts.deviceId
+  ) {
+    logDeviceMismatch(hash, tokenData.boundDeviceId, opts.deviceId, opts.ip);
+    // cache には put しない (= attacker の hash で cache を warm させない)
+    return null;
+  }
+
   const user = await kv.get<User>(Keys.user(tokenData.userId));
   if (!user.value) {
     tokenCache.delete(hash);
@@ -208,8 +277,124 @@ export async function validateToken(
     identity,
     tokenExpiresAtMs,
     cacheUntilMs: now + TOKEN_CACHE_TTL_MS,
+    boundDeviceId: tokenData.boundDeviceId,
   });
+  void maybeUpdateLastUsed(hash, opts.ip, now);
   return identity;
+}
+
+/**
+ * mismatch ログの throttle 状態。同じ (hash, got) の組に対して
+ * MISMATCH_LOG_INTERVAL_MS に 1 回だけ出す。
+ *
+ * 認証自体は正しく拒否しているので実害は無いが、盗難トークンを連投されると
+ * ログが洪水になり、**他の signal が埋もれる**。抑制した回数は次回の 1 行に
+ * まとめて出すので、連投の事実そのものは失わない。
+ */
+const MISMATCH_LOG_INTERVAL_MS = 60 * 1000;
+const MISMATCH_LOG_MAX = 256;
+const mismatchLogState = new Map<
+  string,
+  { nextLogAtMs: number; suppressed: number }
+>();
+
+function logDeviceMismatch(
+  hash: string,
+  bound: string,
+  got: string | undefined,
+  ip?: string,
+): void {
+  const key = `${hash}\u0000${got ?? ""}`;
+  const now = Date.now();
+  const state = mismatchLogState.get(key);
+  if (state !== undefined && now < state.nextLogAtMs) {
+    state.suppressed++;
+    return;
+  }
+
+  // Map が無制限に育たないように、上限に達したら丸ごと捨てる。throttle は
+  // ログ抑制のためだけの状態なので、失っても認証の判断には影響しない。
+  if (mismatchLogState.size >= MISMATCH_LOG_MAX) mismatchLogState.clear();
+  mismatchLogState.set(key, {
+    nextLogAtMs: now + MISMATCH_LOG_INTERVAL_MS,
+    suppressed: 0,
+  });
+
+  // hash と deviceId の先頭だけ出して PII / 完全な token leak を避ける。
+  // 「盗難 secret を別端末で使った」signal なので WARN レベル + audit 連携余地。
+  const repeated = state !== undefined && state.suppressed > 0
+    ? ` (suppressed ${state.suppressed} since last)`
+    : "";
+  console.warn(
+    `[auth] token deviceId mismatch hash=${hash.slice(0, 8)} bound=${
+      bound.slice(0, 8)
+    } got=${got?.slice(0, 8) ?? "<none>"} ip=${ip ?? "<unknown>"}${repeated}`,
+  );
+}
+
+/**
+ * tokenHash, ip ごとに throttled で KV の lastUsedIp / lastUsedAt を更新。
+ * 同 (hash, ip) は 30 秒に 1 回、ip が変わったら即書き込む (= 異常検知の input)。
+ * write 失敗は audit 情報なので silently 握りつぶす (request 全体を落とさない)。
+ *
+ * 注意: atomic.check で versionstamp 一致時のみ書き込む (= 並列 request や
+ * 外部 KV 操作 (revoke, expire 設定変更等) を上書きしない)。失敗時は次回 throttle
+ * 期間外でリトライする機会がある。
+ */
+async function maybeUpdateLastUsed(
+  tokenHash: string,
+  ip: string | undefined,
+  nowMs: number,
+): Promise<void> {
+  const last = tokenLastUsedCache.get(tokenHash);
+  if (
+    last !== undefined &&
+    last.ip === ip &&
+    nowMs - last.atMs < TOKEN_LAST_USED_THROTTLE_MS
+  ) {
+    return;
+  }
+  tokenLastUsedCache.set(tokenHash, { ip, atMs: nowMs });
+
+  try {
+    const kv = await getKv();
+    const entry = await kv.get<TokenData>(Keys.token(tokenHash));
+    if (!entry.value) return; // race で消えた、無視
+    const updated: TokenData = {
+      ...entry.value,
+      lastUsedIp: ip,
+      lastUsedAt: new Date(nowMs).toISOString(),
+    };
+    await kv
+      .atomic()
+      .check({ key: Keys.token(tokenHash), versionstamp: entry.versionstamp })
+      .set(Keys.token(tokenHash), updated)
+      .commit();
+    // commit fail は他経路 (revoke / 直接書換) が先勝、無視で OK。
+  } catch (err) {
+    console.error("maybeUpdateLastUsed failed:", err);
+  }
+}
+
+/**
+ * Token revoke の hook。memory cache を invalidate + KV から削除。
+ * 戻り値: KV に entry があり削除したなら true、そもそも無かったら false。
+ */
+export async function revokeToken(tokenHash: string): Promise<boolean> {
+  const kv = await getKv();
+  const entry = await kv.get<TokenData>(Keys.token(tokenHash));
+  if (!entry.value) {
+    invalidateToken(tokenHash);
+    return false;
+  }
+  await kv
+    .atomic()
+    .delete(Keys.token(tokenHash))
+    .delete(Keys.tokenByUser(entry.value.userId, tokenHash))
+    .commit();
+  invalidateToken(tokenHash);
+  tokenLastUsedCache.delete(tokenHash);
+  return true;
 }
 
 export async function createAppToken(
@@ -239,111 +424,31 @@ export async function createAppToken(
   return { raw, hash };
 }
 
-async function fetchUserGroupIds(userId: number): Promise<number[]> {
-  const kv = await getKv();
-  const groupIds: number[] = [];
-  const iter = kv.list<boolean>({ prefix: Keys.userGroupsPrefix(userId) });
-  for await (const entry of iter) {
-    // Key is ["user_groups", userId, groupId]
-    const groupId = entry.key[2] as number;
-    groupIds.push(groupId);
-  }
-  return groupIds;
-}
-
-async function fetchPermission(
-  path: string,
-  groupId: number,
-): Promise<Permission | null> {
-  const kv = await getKv();
-  const got = await kv.get<Permission>(Keys.permission(path, groupId));
-  return got.value ?? null;
-}
-
 /**
- * request スコープの permission 走査 cache。
+ * ADR-035: 実効水準の判定。
  *
- * 課題: checkPermission は 1 request 内で何度も呼ばれる
- *   - GET /tree: entry 数 × (group 数 × depth) KV read = 数千 op / 1 req になりうる
- *   - WSS broadcast: peer 数 × (同上)
- *   - PATCH /files: src + dst で 2 回
- *
- * 共有可能性:
- *   - groupIds(userId): 1 request 内では同じ userId 何度叩いても 1 fetch で十分
- *   - permission(path, groupId): tree 走査で **parent path が大量に重複** する
- *     (例: /a/b/c と /a/b/d は /, /a, /a/b の lookup を共有)
- *
- * Promise を cache に格納することで Promise.all による concurrent walk でも
- * 1 (userId, path, groupId) 当たり 1 fetch に収束する (in-flight 共有)。
- *
- * ライフタイム: 1 request 中だけ生存。middleware が new し、req 終了で参照が
- * 切れて GC される (in-memory のみ、KV 書込みなし)。
+ * 旧実装は 1 判定ごとに (階層の深さ × 所属 group 数) の KV read を撃っていて、
+ * `GET /tree` では entry 数を掛けた数千 op になりえた。request スコープの
+ * `PermissionContext` はその重複を潰すためだけに存在していたが、コンパイル済み
+ * ポリシーがメモリに乗った今、判定は純粋な計算になったので不要になった。
+ * KV に触るのは「userId → ロール名」の初回解決だけで、それもモジュール
+ * レベルで cache される (policy.service.ts)。
  */
-export class PermissionContext {
-  private _groupIds = new Map<number, Promise<number[]>>();
-  private _perm = new Map<string, Promise<Permission | null>>();
-
-  groupIds(userId: number): Promise<number[]> {
-    let p = this._groupIds.get(userId);
-    if (!p) {
-      p = fetchUserGroupIds(userId);
-      this._groupIds.set(userId, p);
-    }
-    return p;
-  }
-
-  permission(path: string, groupId: number): Promise<Permission | null> {
-    // key separator に null byte を使うのは、path validation で null byte を
-    // 既に弾いているため衝突が起こりえないから。
-    const key = `${path}\0${groupId}`;
-    let p = this._perm.get(key);
-    if (!p) {
-      p = fetchPermission(path, groupId);
-      this._perm.set(key, p);
-    }
-    return p;
-  }
+export async function effectiveAccess(
+  userId: number,
+  path: string,
+): Promise<EffectiveLevel> {
+  const [policy, roles] = await Promise.all([
+    getActivePolicy(),
+    getUserRoles(userId),
+  ]);
+  return effectiveLevel(policy, roles, path);
 }
 
 export async function checkPermission(
   userId: number,
   path: string,
-  requiredLevel: "read" | "write",
-  ctx?: PermissionContext,
+  requiredLevel: AccessLevel | "visible",
 ): Promise<boolean> {
-  // ctx 無しの呼び出しは「1 回限りの check」として one-shot context を生成する
-  // (test や CLI から呼ぶケース、または middleware を通らない経路)。
-  const context = ctx ?? new PermissionContext();
-
-  const groupIds = await context.groupIds(userId);
-  if (groupIds.length === 0) return false;
-
-  // Walk up the path hierarchy to find the most specific permission
-  const pathParts = path.split("/").filter(Boolean);
-  const pathsToCheck = ["/"];
-  let current = "";
-  for (const part of pathParts) {
-    current += "/" + part;
-    pathsToCheck.push(current);
-  }
-
-  // Check from most specific to least specific
-  for (let i = pathsToCheck.length - 1; i >= 0; i--) {
-    const checkPath = pathsToCheck[i];
-    for (const groupId of groupIds) {
-      const perm = await context.permission(checkPath, groupId);
-      if (perm) {
-        return hasAccess(perm.accessLevel, requiredLevel);
-      }
-    }
-  }
-
-  return false;
-}
-
-function hasAccess(granted: AccessLevel, required: "read" | "write"): boolean {
-  if (granted === "admin") return true;
-  if (granted === "write") return true;
-  if (granted === "read" && required === "read") return true;
-  return false;
+  return hasAccess(await effectiveAccess(userId, path), requiredLevel);
 }

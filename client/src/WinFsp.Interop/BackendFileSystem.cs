@@ -265,11 +265,42 @@ public sealed class BackendFileSystem : IFileSystem, IAsyncFileIo
         }
     }
 
+    /// <summary>
+    /// IRP_MJ_FLUSH_BUFFERS。**成功を返す前に、書いた内容が本当にサーバへ届いた
+    /// ことを確認する。**
+    /// </summary>
+    /// <remarks>
+    /// <para>Write は楽観完了 (coalescer が buffer に積んで即成功、PATCH は背景) で、
+    /// Cleanup は Windows の仕様上ステータスをアプリに返せない。したがって Flush が
+    /// 失敗を伝える唯一の経路で、ここが無条件に成功を返していた間は PATCH の失敗
+    /// (サーバの disk full、5xx、staging の権限エラー) がアプリに一度も届かず、
+    /// 「保存できた」と信じたまま編集内容が失われていた。</para>
+    /// <para>sync-over-async になるが、Flush は元々永続化を待つ呼び出しなので待つのが
+    /// 正しい。session を持たない handle では backend 側が即 return する。</para>
+    /// </remarks>
     public int Flush(object? fileContext, out NativeFileInfo fileInfo)
     {
         if (!_gate.IsOnline) { fileInfo = default; return NtStatus.NetworkUnreachable; }
+
+        // fileContext が null = volume 全体の flush。mikura は書き込みを handle 単位の
+        // upload session で持つので、volume 単位で待つべきものは無い。
         if (fileContext is null) { fileInfo = default; return NtStatus.Success; }
-        FillFileInfo(((IFileHandle)fileContext).Entry, out fileInfo);
+
+        var handle = (IFileHandle)fileContext;
+        try
+        {
+            _backend.FlushAsync(handle).GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            Trace.WriteLine($"[ERROR] Flush failed: {handle.Path}: {ex.GetType().Name}: {ex.Message}");
+            fileInfo = default;
+            // 切断由来なら NetworkUnreachable。HTTP だけ失敗したケースは gate が
+            // online のままなので Unsuccessful として上げる。
+            return _gate.IsOnline ? NtStatus.Unsuccessful : NtStatus.NetworkUnreachable;
+        }
+
+        FillFileInfo(handle.Entry, out fileInfo);
         return NtStatus.Success;
     }
 

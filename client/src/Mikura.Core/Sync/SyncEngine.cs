@@ -102,9 +102,19 @@ public sealed class SyncEngine
             case "lock_acquired":
             case "lock_released":
             {
-                // Self-issued lock changes do not flip our own RO view.
                 if (evt.Holder is null) break;
-                if (IsSelfDevice(evt.Holder.DeviceId)) break;
+
+                // 「自分が起こした変更か」の判定は Holder ではなく Originator で行う
+                // (= 冒頭の self フィルタ)。ここで Holder が自分なら、**他者が自分の
+                // lock を外した**= 強制解除。以前は Holder で self 判定していたため、
+                // 強制解除が当人の端末に一切届かず、持っていないロックを持っていると
+                // 信じ続けていた。
+                if (IsSelfDevice(evt.Holder.DeviceId))
+                {
+                    if (evt.Event == "lock_released") _backend.InvalidateServerLock(evt.Path);
+                    break;
+                }
+
                 _backend.ApplyLockEvent(evt.Path, locked: evt.Event == "lock_acquired");
                 ShellChangeNotifier.NotifyUpdate(ToLocalPath(evt.Path));
                 break;

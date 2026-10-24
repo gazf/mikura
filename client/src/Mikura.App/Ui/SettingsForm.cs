@@ -3,108 +3,185 @@ using Mikura.App.Config;
 
 namespace Mikura.App.Ui;
 
+/// <summary>
+/// Profile-aware Settings dialog (Phase D)。左に profile 一覧、右に選択 profile の
+/// detail (ServerUrl 表示 + MountLetter 編集可)。Bottom に global settings
+/// (SyncIntervalSeconds)。
+/// </summary>
+/// <remarks>
+/// <para>profile 自体の追加 / 削除は Tray menu の「Add Profile...」「Remove」経由。
+/// 本 form は **既存 profile の metadata 編集** に専念する (= drive letter 変更等)。
+/// 変更を mount に反映するには MIKURA 再起動 (or per-profile Remount) が必要、
+/// 旨を user に balloon で案内する。</para>
+///
+/// <para>Phase D minimum: list 選択 + drive letter 編集 + Save。複数 profile を
+/// 切り替えながら編集可能だが、編集中は in-memory 保持で OK 時に store へ flush。</para>
+/// </remarks>
 public class SettingsForm : Form
 {
-    private readonly AppSettings _settings;
+    private readonly ProfileStore _store;
+    private readonly GlobalSettings _globalSettings;
 
-    private readonly TextBox _serverUrl = new() { Width = 320 };
-    private readonly TextBox _bearerToken = new() { Width = 320, UseSystemPasswordChar = true };
-    private readonly TextBox _syncRoot = new() { Width = 260 };
-    private readonly Button _browseBtn = new() { Text = "...", Width = 36 };
-    private readonly NumericUpDown _syncInterval = new() { Minimum = 30, Maximum = 3600, Value = 300, Width = 100 };
-    private readonly Button _okBtn = new() { Text = "OK", DialogResult = DialogResult.OK, Width = 80 };
-    private readonly Button _cancelBtn = new() { Text = "Cancel", DialogResult = DialogResult.Cancel, Width = 80 };
-
-    public SettingsForm(AppSettings settings)
+    private readonly ListBox _profileList = new()
     {
-        _settings = settings;
+        Width = 160,
+        Dock = DockStyle.Left,
+    };
+    private readonly TextBox _serverUrl = new()
+    {
+        Width = 280,
+        ReadOnly = true,
+    };
+    private readonly TextBox _mountLetter = new() { Width = 80 };
+    private readonly NumericUpDown _syncInterval = new()
+    {
+        Minimum = 30,
+        Maximum = 3600,
+        Value = 300,
+        Width = 100,
+    };
+    private readonly Button _saveBtn = new()
+    {
+        Text = "Save",
+        DialogResult = DialogResult.OK,
+        Width = 80,
+    };
+    private readonly Button _cancelBtn = new()
+    {
+        Text = "Cancel",
+        DialogResult = DialogResult.Cancel,
+        Width = 80,
+    };
+
+    private readonly Dictionary<string, Profile> _edited = new();
+
+    public SettingsForm(ProfileStore store, GlobalSettings globalSettings)
+    {
+        _store = store;
+        _globalSettings = globalSettings;
+
         Text = "MIKURA Settings";
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MinimizeBox = false;
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(440, 220);
-        AcceptButton = _okBtn;
+        ClientSize = new Size(560, 320);
+        AcceptButton = _saveBtn;
         CancelButton = _cancelBtn;
 
-        _serverUrl.Text = settings.ServerUrl;
-        _bearerToken.Text = settings.BearerToken;
-        _syncRoot.Text = settings.SyncRootPath;
-        _syncInterval.Value = Math.Clamp(settings.SyncIntervalSeconds, (int)_syncInterval.Minimum, (int)_syncInterval.Maximum);
+        _syncInterval.Value = Math.Clamp(
+            _globalSettings.SyncIntervalSeconds,
+            (int)_syncInterval.Minimum,
+            (int)_syncInterval.Maximum);
 
-        var layout = new TableLayoutPanel
+        // Profile list (left panel)
+        var profiles = _store.LoadProfiles();
+        foreach (var p in profiles)
+        {
+            _edited[p.Name] = p;
+            _profileList.Items.Add(p.Name);
+        }
+        _profileList.SelectedIndexChanged += OnSelectProfile;
+
+        // Detail panel (right)
+        var detail = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
             Padding = new Padding(12),
             ColumnCount = 2,
-            RowCount = 5,
-            AutoSize = true
+            RowCount = 4,
+            AutoSize = false,
         };
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110));
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        detail.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110));
+        detail.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
 
-        layout.Controls.Add(new Label { Text = "Server URL:", Anchor = AnchorStyles.Left, AutoSize = true }, 0, 0);
-        layout.Controls.Add(_serverUrl, 1, 0);
-
-        layout.Controls.Add(new Label { Text = "Bearer Token:", Anchor = AnchorStyles.Left, AutoSize = true }, 0, 1);
-        layout.Controls.Add(_bearerToken, 1, 1);
-
-        var syncRootPanel = new FlowLayoutPanel { FlowDirection = FlowDirection.LeftToRight, AutoSize = true, Margin = Padding.Empty };
-        syncRootPanel.Controls.Add(_syncRoot);
-        syncRootPanel.Controls.Add(_browseBtn);
-        _browseBtn.Click += OnBrowse;
-
-        layout.Controls.Add(new Label { Text = "Sync Root:", Anchor = AnchorStyles.Left, AutoSize = true }, 0, 2);
-        layout.Controls.Add(syncRootPanel, 1, 2);
-
-        layout.Controls.Add(new Label { Text = "Sync Interval (s):", Anchor = AnchorStyles.Left, AutoSize = true }, 0, 3);
-        layout.Controls.Add(_syncInterval, 1, 3);
-
-        var buttons = new FlowLayoutPanel
+        detail.Controls.Add(new Label
         {
-            FlowDirection = FlowDirection.RightToLeft,
+            Text = "Server URL:",
+            Anchor = AnchorStyles.Left,
+            AutoSize = true,
+        }, 0, 0);
+        detail.Controls.Add(_serverUrl, 1, 0);
+
+        detail.Controls.Add(new Label
+        {
+            Text = "Mount Letter:",
+            Anchor = AnchorStyles.Left,
+            AutoSize = true,
+        }, 0, 1);
+        detail.Controls.Add(_mountLetter, 1, 1);
+
+        detail.Controls.Add(new Label
+        {
+            Text = "Sync Interval (s):",
+            Anchor = AnchorStyles.Left,
+            AutoSize = true,
+        }, 0, 2);
+        detail.Controls.Add(_syncInterval, 1, 2);
+
+        _mountLetter.TextChanged += OnMountLetterChanged;
+
+        // Bottom button row
+        var btnRow = new FlowLayoutPanel
+        {
             Dock = DockStyle.Bottom,
-            Height = 44,
-            Padding = new Padding(0, 8, 12, 8)
+            FlowDirection = FlowDirection.RightToLeft,
+            Height = 40,
+            Padding = new Padding(8),
         };
-        buttons.Controls.Add(_cancelBtn);
-        buttons.Controls.Add(_okBtn);
+        btnRow.Controls.Add(_cancelBtn);
+        btnRow.Controls.Add(_saveBtn);
 
-        Controls.Add(layout);
-        Controls.Add(buttons);
+        Controls.Add(detail);
+        Controls.Add(_profileList);
+        Controls.Add(btnRow);
 
-        _okBtn.Click += OnOk;
-    }
-
-    private void OnBrowse(object? sender, EventArgs e)
-    {
-        using var dlg = new FolderBrowserDialog
+        // 初期選択
+        if (_profileList.Items.Count > 0)
         {
-            Description = "Select MIKURA sync root folder",
-            SelectedPath = string.IsNullOrWhiteSpace(_syncRoot.Text)
-                ? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
-                : _syncRoot.Text
-        };
-        if (dlg.ShowDialog(this) == DialogResult.OK)
-            _syncRoot.Text = dlg.SelectedPath;
+            _profileList.SelectedIndex = 0;
+        }
+        else
+        {
+            _serverUrl.Text = "(no profile)";
+            _mountLetter.Enabled = false;
+        }
+
+        _saveBtn.Click += OnSave;
     }
 
-    private void OnOk(object? sender, EventArgs e)
-    {
-        if (string.IsNullOrWhiteSpace(_serverUrl.Text)) { Warn("Server URL is required."); return; }
-        if (string.IsNullOrWhiteSpace(_bearerToken.Text)) { Warn("Bearer token is required."); return; }
-        if (string.IsNullOrWhiteSpace(_syncRoot.Text)) { Warn("Sync root is required."); return; }
+    private string? _currentName;
 
-        _settings.ServerUrl = _serverUrl.Text.Trim();
-        _settings.BearerToken = _bearerToken.Text.Trim();
-        _settings.SyncRootPath = _syncRoot.Text.Trim();
-        _settings.SyncIntervalSeconds = (int)_syncInterval.Value;
-        _settings.Save();
+    private void OnSelectProfile(object? sender, EventArgs e)
+    {
+        if (_profileList.SelectedItem is not string name) return;
+        if (!_edited.TryGetValue(name, out var p)) return;
+        _currentName = name;
+        _serverUrl.Text = p.ServerUrl;
+        _mountLetter.Text = p.MountLetter;
     }
 
-    private void Warn(string message)
+    private void OnMountLetterChanged(object? sender, EventArgs e)
     {
-        MessageBox.Show(this, message, "MIKURA", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-        DialogResult = DialogResult.None;
+        if (_currentName is null) return;
+        if (!_edited.TryGetValue(_currentName, out var p)) return;
+        _edited[_currentName] = p with { MountLetter = _mountLetter.Text.Trim() };
+    }
+
+    private void OnSave(object? sender, EventArgs e)
+    {
+        // 全 edited を flush
+        foreach (var p in _edited.Values)
+        {
+            _store.SaveProfile(p);
+        }
+        _globalSettings.SyncIntervalSeconds = (int)_syncInterval.Value;
+        _globalSettings.Save();
+
+        MessageBox.Show(
+            "Settings saved. Drive letter changes require restart or Remount of the affected profile.",
+            "MIKURA Settings",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Information);
     }
 }

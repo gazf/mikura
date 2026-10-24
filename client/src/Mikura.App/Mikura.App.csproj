@@ -10,6 +10,13 @@
     <LangVersion>latest</LangVersion>
     <UseWindowsForms>true</UseWindowsForms>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!--
+      WinFsp.Native / WinFsp.Interop は x64 固定 (winfsp-x64.dll に依存)。参照側の
+      Mikura.App が MSIL (AnyCPU) だと MSBuild が MSB3270 warning を出し、runtime
+      で BadImageFormatException のリスクがある。x64 に固定して整合させる。
+    -->
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
   </PropertyGroup>
 
   <ItemGroup>

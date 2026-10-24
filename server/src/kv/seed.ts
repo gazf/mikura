@@ -1,6 +1,37 @@
 import { closeKv, getKv } from "./store.ts";
 import { Keys } from "./keys.ts";
-import type { Group, Permission, TokenData, User } from "../types.ts";
+import {
+  assignRole,
+  findAdminRoleNames,
+  importPolicyText,
+  listRoles,
+} from "../services/policy.service.ts";
+import type { TokenData, User } from "../types.ts";
+
+/**
+ * ADR-035 のブートストラップポリシー。空のポリシーは既定 deny なので、
+ * 管理操作を含めて何もできない状態になる。最初の 1 本はここが書く。
+ *
+ * `admins` は「何を与えるか」で名付けられていないただ 1 つのロールだが、
+ * admin `/` の意味そのものなので例外扱いでよい。ユーザーが増えたら
+ * `projects-editor` のような purpose 名で足していく。
+ */
+const BOOTSTRAP_POLICY = `# mikura のアクセス制御ポリシー (ADR-035)
+#
+# role <名前> { allow <read|write|admin> <パス> / deny <パス> }
+# test <名前> { readable|writable|invisible|visible|admin <パス> }
+#
+# ルールは書いた順に関係なく、パスの具体度で決まる。ロールを足すと必ず
+# 増える方向にしか動かない。何も割り当てられていないパスは不可視。
+
+role admins {
+  allow admin /
+}
+
+test admins {
+  admin /
+}
+`;
 
 async function hashPassword(password: string): Promise<string> {
   const encoder = new TextEncoder();
@@ -45,22 +76,12 @@ export async function seedIfEmpty(rawToken?: string): Promise<void> {
   }
 
   const adminId = await nextId(kv, "users");
-  const groupId = await nextId(kv, "groups");
 
   const adminUser: User = {
     id: adminId,
     name: "admin",
     passwordHash: await hashPassword("admin"),
     createdAt: new Date().toISOString(),
-  };
-
-  const adminsGroup: Group = {
-    id: groupId,
-    name: "admins",
-  };
-
-  const rootPermission: Permission = {
-    accessLevel: "admin",
   };
 
   const token = rawToken ?? crypto.randomUUID();
@@ -76,15 +97,19 @@ export async function seedIfEmpty(rawToken?: string): Promise<void> {
     .atomic()
     .set(Keys.user(adminId), adminUser)
     .set(Keys.userByName("admin"), adminId)
-    .set(Keys.group(groupId), adminsGroup)
-    .set(Keys.userGroup(adminId, groupId), true)
-    .set(Keys.permission("/", groupId), rootPermission)
     .set(Keys.token(tokenHash), tokenData)
     .set(Keys.tokenByUser(adminId, tokenHash), true)
     .commit();
 
   if (!result.ok) {
     throw new Error("Failed to seed database");
+  }
+
+  // ロール投入 → 割り当ての順。逆にすると「未定義のロール」で弾かれる。
+  await importPolicyText(BOOTSTRAP_POLICY, adminId, { skipGuards: true });
+  const assigned = await assignRole(adminId, "admins");
+  if (!assigned.ok) {
+    throw new Error(`Failed to assign bootstrap role: ${assigned.error}`);
   }
 
   console.log("Database seeded.");
@@ -191,13 +216,108 @@ async function printExistingSeed(kv: Deno.Kv, adminId: number): Promise<void> {
   );
 }
 
+/**
+ * ポリシーを KV に直接書き戻す break-glass (ADR-035)。
+ *
+ * 保存済みポリシーが解釈できないと server は起動しないので、HTTP 経由の
+ * `deno task admin set-policy` では復旧できない。token を失った時に
+ * `--renew` で救うのと同じ位置づけで、KV を直接触る経路を 1 本だけ残す。
+ * 検証は通すので、壊れた文書で上書きすることはできない。
+ */
+async function installPolicyFromFile(path: string): Promise<void> {
+  const text = await Deno.readTextFile(path);
+  const result = await importPolicyText(text, 0, { skipGuards: true });
+  if (!result.ok) {
+    for (const e of result.errors) {
+      console.error(`  ${e.line}行目: ${e.message}`);
+    }
+    console.error("取り込めませんでした。");
+    Deno.exit(1);
+  }
+  console.log(`${result.roles} 個のロールを取り込みました。`);
+  console.log("  (既存のロールは置き換えられ、割り当ては変更していません)");
+}
+
+/**
+ * 管理者を復旧する break-glass (ADR-035)。
+ *
+ * `--policy` はポリシー文書を戻すだけで、割り当てには触らない。だが
+ * `user_roles` が空だと誰も `admin /` を持たず、HTTP 経由の復旧経路は
+ * その admin 権限を要求するので堂々巡りになる — 文書を直せても管理画面に
+ * 入れない。ここは KV を直接触れる唯一の側なので、割り当てまで面倒を見る。
+ *
+ * 到達しうる経路は 3 つ: 旧スキーマからの移行、ポリシー投入前の起動、
+ * 最後の admin を持つユーザーを外部から消した場合。
+ */
+async function grantAdmin(kv: Deno.Kv, userName: string): Promise<void> {
+  const userIdEntry = await kv.get<number>(Keys.userByName(userName));
+  if (userIdEntry.value === null) {
+    console.error(`User not found: ${userName}`);
+    console.error(
+      "  `deno task seed` で初期化するか --user <name> を指定してください。",
+    );
+    Deno.exit(1);
+  }
+  const userId = userIdEntry.value;
+
+  // ロールがまだ 1 つも無ければブートストラップを入れる。既にあるなら
+  // **上書きしない** — 運用中の定義を復旧コマンドが書き換えるのは筋が悪い。
+  if ((await listRoles()).length === 0) {
+    const installed = await importPolicyText(BOOTSTRAP_POLICY, userId, {
+      skipGuards: true,
+    });
+    console.log(`Bootstrap roles installed (${installed.roles}).`);
+  }
+
+  const adminRoles = await findAdminRoleNames();
+  if (adminRoles.length === 0) {
+    console.error("現在のポリシーに admin / を与えるロールがありません。");
+    console.error("  `allow admin /` を持つロールを足してから、");
+    console.error("  `deno task seed --policy <file>` で投入してください。");
+    Deno.exit(1);
+  }
+  if (adminRoles.length > 1) {
+    console.error(
+      `admin / を与えるロールが複数あります: ${adminRoles.join(", ")}`,
+    );
+    console.error("  --role <name> でどれを割り当てるか指定してください。");
+    Deno.exit(1);
+  }
+
+  const role = adminRoles[0];
+  const res = await assignRole(userId, role);
+  if (!res.ok) {
+    console.error(`Failed to assign role: ${res.error}`);
+    Deno.exit(1);
+  }
+  console.log(`Granted: ${userName} (id=${userId}) → role ${role}`);
+  console.log("  server を再起動すると反映されます。");
+}
+
 // CLI 実行時のみ最後に close する。プロセス常駐の main.ts から呼ぶ時は close しない。
-// `deno task seed`         : 未 seed なら seed、既 seed なら情報ダンプ
-// `deno task seed --renew` : admin の token を全失効して新 raw token を発行
+// `deno task seed`                  : 未 seed なら seed、既 seed なら情報ダンプ
+// `deno task seed --renew`          : admin の token を全失効して新 raw token を発行
+// `deno task seed --policy <file>`  : ポリシーを直接書き戻す (起動できない時の復旧)
+// `deno task seed --grant-admin`    : 管理者を復旧する (割り当てまで面倒を見る)
 if (import.meta.main) {
   const renew = Deno.args.includes("--renew");
+  const policyIdx = Deno.args.indexOf("--policy");
+  const grantAdminFlag = Deno.args.includes("--grant-admin");
+  const userIdx = Deno.args.indexOf("--user");
   const kv = await getKv();
-  if (renew) {
+  if (grantAdminFlag) {
+    await grantAdmin(
+      kv,
+      userIdx >= 0 ? Deno.args[userIdx + 1] ?? "admin" : "admin",
+    );
+  } else if (policyIdx >= 0) {
+    const file = Deno.args[policyIdx + 1];
+    if (!file) {
+      console.error("--policy requires a file path");
+      Deno.exit(1);
+    }
+    await installPolicyFromFile(file);
+  } else if (renew) {
     await renewAdminToken(kv);
   } else {
     const existing = await kv.get<number>(Keys.userByName("admin"));

@@ -36,6 +36,12 @@ internal sealed class FakeServerApi : IServerApi
     /// <summary>true にすると AcquireLockAsync が常に null を返す (= 他者ロック中)。</summary>
     public bool DenyAcquireLock { get; set; }
 
+    /// <summary>
+    /// null 以外にすると UploadChunkAsync / UploadChunksMultipartAsync がその例外を
+    /// 投げる (= サーバの disk full、5xx、staging の権限エラー相当)。
+    /// </summary>
+    public Exception? UploadChunkFailure { get; set; }
+
     // ロック call count はカバレッジではなく ADR-022 の責務 (write open N 個に対して
      // POST/DELETE 1 回ずつ) を観測するために保持する。Download も同様 (hydrate は
      // 1 回だけという ADR-023 の no-refetch 責務)。それ以外の責務はすべて
@@ -193,6 +199,7 @@ internal sealed class FakeServerApi : IServerApi
 
     public Task UploadChunkAsync(string uploadId, long offset, ReadOnlyMemory<byte> data, CancellationToken ct = default)
     {
+        if (UploadChunkFailure is not null) throw UploadChunkFailure;
         if (!SessionsByUploadId.TryGetValue(uploadId, out var session))
             throw new InvalidOperationException("session not found");
 
@@ -224,6 +231,7 @@ internal sealed class FakeServerApi : IServerApi
         IReadOnlyList<UploadRange> ranges,
         CancellationToken ct = default)
     {
+        if (UploadChunkFailure is not null) throw UploadChunkFailure;
         if (!SessionsByUploadId.TryGetValue(uploadId, out var session))
             throw new InvalidOperationException("session not found");
 

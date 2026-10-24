@@ -25,6 +25,7 @@ internal sealed class FakeFileSystemBackend : IFileSystemBackend
     public int CreateCalls;
     public int ReadCalls;
     public int WriteCalls;
+    public int FlushCalls;
     public int CleanupCalls;
     public int CloseCalls;
     public int SetSizeCalls;
@@ -39,6 +40,12 @@ internal sealed class FakeFileSystemBackend : IFileSystemBackend
 
     /// <summary>true にすると OpenAsync が null を返す (= ObjectNameNotFound 経路)。</summary>
     public bool DenyOpen { get; set; }
+
+    /// <summary>
+    /// null 以外にすると FlushAsync がその例外を投げる (= 背景 PATCH が失敗していた
+    /// 状況の模擬)。
+    /// </summary>
+    public Exception? FlushFailure { get; set; }
 
     /// <summary>true にすると OpenAsync が UnauthorizedAccessException (= lock 衝突) を投げる。</summary>
     public bool ThrowOpenAsUnauthorized { get; set; }
@@ -155,6 +162,12 @@ internal sealed class FakeFileSystemBackend : IFileSystemBackend
             Tree[to] = entry with { Path = to };
         }
         return Task.CompletedTask;
+    }
+
+    public Task FlushAsync(IFileHandle handle, CancellationToken ct = default)
+    {
+        Interlocked.Increment(ref FlushCalls);
+        return FlushFailure is null ? Task.CompletedTask : Task.FromException(FlushFailure);
     }
 
     public Task CleanupAsync(IFileHandle handle, CleanupFlags flags, CancellationToken ct = default)

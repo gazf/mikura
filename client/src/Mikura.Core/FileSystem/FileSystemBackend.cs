@@ -147,20 +147,25 @@ public sealed partial class FileSystemBackend : IFileSystemBackend
         var canonical = entry.Path;
 
         // ADR-016/022: write-intent open でだけサーバロックを取る。read open は素通し。
-        var hasLock = false;
+        LockSlot? lockSlot = null;
         if (!entry.IsDirectory && intent == FileAccessIntent.Write)
         {
-            hasLock = await AcquireSharedAsync(canonical, ct).ConfigureAwait(false);
-            if (!hasLock)
+            lockSlot = await AcquireSharedAsync(canonical, ct).ConfigureAwait(false);
+            if (lockSlot is null)
             {
                 throw new UnauthorizedAccessException($"file is locked by another holder: {canonical}");
             }
         }
 
-        return new FileHandle(this, canonical, entry, hasLock);
+        return new FileHandle(this, canonical, entry, lockSlot);
     }
 
-    private async Task<bool> AcquireSharedAsync(string path, CancellationToken ct)
+    /// <summary>
+    /// path 単位の共有ロックを取得する。成功した slot を返す (失敗は null)。
+    /// slot を handle に持たせるのは、後から「この lock は失われた」と伝えるため
+    /// (<see cref="InvalidateAllServerLocks"/> / <see cref="InvalidateServerLock"/>)。
+    /// </summary>
+    private async Task<LockSlot?> AcquireSharedAsync(string path, CancellationToken ct)
     {
         LockSlot slot;
         bool isFirst;
@@ -182,7 +187,7 @@ public sealed partial class FileSystemBackend : IFileSystemBackend
 
         if (!isFirst)
         {
-            return await slot.AcquireResult.Task.ConfigureAwait(false);
+            return await slot.AcquireResult.Task.ConfigureAwait(false) ? slot : null;
         }
 
         try
@@ -198,7 +203,7 @@ public sealed partial class FileSystemBackend : IFileSystemBackend
                     if (--slot.Refcount <= 0) _activeLocks.Remove(path);
                 }
             }
-            return success;
+            return success ? slot : null;
         }
         catch (Exception ex)
         {
@@ -208,7 +213,7 @@ public sealed partial class FileSystemBackend : IFileSystemBackend
             {
                 if (--slot.Refcount <= 0) _activeLocks.Remove(path);
             }
-            return false;
+            return null;
         }
     }
 
@@ -390,6 +395,17 @@ public sealed partial class FileSystemBackend : IFileSystemBackend
     {
         public int Refcount = 1;
         public bool HasServerLock;
+
+        /// <summary>
+        /// サーバ側の lock が自分の手を離れたことが分かった状態。TTL 失効 (切断中に
+        /// heartbeat が途絶えた) か、他者による強制解除で立つ。
+        /// <para>この slot を掴んでいる <see cref="FileHandle"/> は
+        /// <see cref="FileHandle.HasLock"/> が false になり、以降の write は即
+        /// <see cref="UnauthorizedAccessException"/> で失敗する。復帰後に黙って
+        /// 書き続けて、finalize で初めて弾かれる (= 沈黙の窓) のを防ぐ。</para>
+        /// </summary>
+        public volatile bool Lost;
+
         public TaskCompletionSource<bool> AcquireResult { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
@@ -441,14 +457,14 @@ public sealed partial class FileSystemBackend : IFileSystemBackend
                 CreationTimeUtc: DateTime.UtcNow,
                 LastWriteTimeUtc: DateTime.UtcNow);
             _tree[p] = dirEntry;
-            return new FileHandle(this, p, dirEntry, hasLock: false);
+            return new FileHandle(this, p, dirEntry, lockSlot: null);
         }
 
         // ADR-016/022 + ADR-025: 新規ファイル作成も write 操作として lock を取る。
         // server 側 upload session (POST /uploads) は lock holder のみ受け付ける
         // ため、ここで lock を取らないと最初の Write で 403 になる。
-        var hasLock = await AcquireSharedAsync(p, ct).ConfigureAwait(false);
-        if (!hasLock)
+        var lockSlot = await AcquireSharedAsync(p, ct).ConfigureAwait(false);
+        if (lockSlot is null)
         {
             // 同名 path を別ユーザーが先に作っている (= レース) → 拒否。
             throw new UnauthorizedAccessException($"file is locked by another holder: {p}");
@@ -461,7 +477,7 @@ public sealed partial class FileSystemBackend : IFileSystemBackend
             CreationTimeUtc: DateTime.UtcNow,
             LastWriteTimeUtc: DateTime.UtcNow);
         _tree[p] = entry;
-        return new FileHandle(this, p, entry, hasLock: true)
+        return new FileHandle(this, p, entry, lockSlot)
         {
             FreshlyCreated = true,
         };
@@ -724,6 +740,32 @@ public sealed partial class FileSystemBackend : IFileSystemBackend
         return Task.FromResult(h.Path != "/");
     }
 
+    /// <summary>
+    /// IRP_MJ_FLUSH_BUFFERS。この handle の write が**本当にサーバに届いたか**を
+    /// 確認し、届いていなければ throw する。
+    /// </summary>
+    /// <remarks>
+    /// <para>Write は楽観完了する (coalescer が buffer に積んで即成功を返し、PATCH は
+    /// 背景で走る)。Cleanup は Windows の仕様上ステータスをアプリに返せないので、
+    /// **Flush がアプリに失敗を伝える唯一の経路**。ここが常に成功を返していた間、
+    /// PATCH の失敗 (サーバの disk full、5xx、staging の権限エラー) は「保存できた」と
+    /// 表示されたまま編集内容が失われていた。</para>
+    /// <para>切断だけの問題ではない: gate が offline になるのは WSS 切断時だけなので、
+    /// HTTP だけが失敗するケースでは gate は online のままになる。</para>
+    /// <para>Flush は sync-over-async になるが、Flush は元々「永続化を待つ」呼び出しな
+    /// ので待つのが正しい。session を持たない handle (読み取り専用等) は即 return する。</para>
+    /// </remarks>
+    public async Task FlushAsync(IFileHandle handle, CancellationToken ct = default)
+    {
+        var h = (FileHandle)handle;
+
+        // async response (STATUS_PENDING) で dispatch された Write の継続が
+        // coalescer に積み終わるまで待つ。これを待たないと「まだ積まれていない
+        // write」を見逃したまま成功を返す。
+        await h.DrainInFlightAsync(ct).ConfigureAwait(false);
+        await h.FlushSessionAsync(ct).ConfigureAwait(false);
+    }
+
     public async Task CleanupAsync(IFileHandle handle, CleanupFlags flags, CancellationToken ct = default)
     {
         var h = (FileHandle)handle;
@@ -866,6 +908,54 @@ public sealed partial class FileSystemBackend : IFileSystemBackend
             default:
                 return false;
         }
+    }
+
+    /// <summary>
+    /// 保持中の全ロックを「失われた」とみなす。WSS 再接続の直後に呼ぶ。
+    /// </summary>
+    /// <remarks>
+    /// <para>切断中にサーバ側の lock が生きている保証は無い (TTL 30 秒 に対し
+    /// 再接続は 5 秒間隔 × 失敗回数)。切れたら全部失ったとみなすのが SMB の
+    /// session-lost に忠実で、これを入れないと <c>HasLock=true</c> のまま復帰した
+    /// handle が黙って書き続け、finalize で初めて弾かれる。</para>
+    /// <para>slot を辞書から外すので、以降の open は改めてサーバへ取得に行く。
+    /// 既存 handle は掴んでいる slot 経由で Lost を見るため、release の二重計上には
+    /// ならない (<c>HasLock=false</c> の handle は release 経路に入らない)。</para>
+    /// </remarks>
+    public int InvalidateAllServerLocks()
+    {
+        LockSlot[] slots;
+        lock (_activeLocksGate)
+        {
+            slots = _activeLocks.Values.ToArray();
+            _activeLocks.Clear();
+        }
+        foreach (var slot in slots)
+        {
+            slot.Lost = true;
+            slot.HasServerLock = false;
+        }
+        if (slots.Length > 0)
+            Trace.WriteLine($"[INFO] session lost: invalidated {slots.Length} lock(s)");
+        return slots.Length;
+    }
+
+    /// <summary>
+    /// 1 path のロックを「失われた」とみなす。自分が保持していた lock が他者に
+    /// 解除されたことを WSS イベントで知ったときに呼ぶ。
+    /// </summary>
+    public bool InvalidateServerLock(string path)
+    {
+        var p = Norm(path);
+        LockSlot? slot;
+        lock (_activeLocksGate)
+        {
+            if (!_activeLocks.Remove(p, out slot)) return false;
+        }
+        slot.Lost = true;
+        slot.HasServerLock = false;
+        Trace.WriteLine($"[INFO] lock force-released by another holder: {p}");
+        return true;
     }
 
     public bool ApplyLockEvent(string path, bool locked)
